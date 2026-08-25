@@ -75,10 +75,22 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscordWebhook {
     client: Client,
     webhook_url: String,
+}
+
+impl std::fmt::Debug for DiscordWebhook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordWebhook")
+            .field("client", &self.client)
+            .field(
+                "webhook_url",
+                &crate::security::redact_sensitive(&self.webhook_url),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -217,9 +229,8 @@ pub struct AllowedMentions {
     pub replied_user: Option<bool>,
 }
 
-#[derive(Debug)]
 pub enum DiscordError {
-    Network(reqwest::Error),
+    Network(crate::security::SafeHttpError),
     Parse(serde_json::Error),
     Http { status: u16, message: String },
     InvalidWebhookUrl,
@@ -231,10 +242,22 @@ impl std::fmt::Display for DiscordError {
             DiscordError::Network(e) => write!(f, "Network error: {e}"),
             DiscordError::Parse(e) => write!(f, "Parse error: {e}"),
             DiscordError::Http { status, message } => {
-                write!(f, "HTTP error {status}: {message}")
+                write!(
+                    f,
+                    "HTTP error {status}: {}",
+                    crate::security::redact_sensitive(message)
+                )
             }
             DiscordError::InvalidWebhookUrl => write!(f, "Invalid webhook URL"),
         }
+    }
+}
+
+impl std::fmt::Debug for DiscordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DiscordError")
+            .field(&self.to_string())
+            .finish()
     }
 }
 
@@ -242,7 +265,7 @@ impl std::error::Error for DiscordError {}
 
 impl From<reqwest::Error> for DiscordError {
     fn from(err: reqwest::Error) -> Self {
-        DiscordError::Network(err)
+        DiscordError::Network(err.into())
     }
 }
 

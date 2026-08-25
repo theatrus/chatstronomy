@@ -113,25 +113,61 @@ pub struct AgentHello {
 
 /// First frame from a client that holds no credential yet: a one-time
 /// pairing token minted on the hub web app plus the client's identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairRequest {
     pub pairing_token: String,
     pub hello: ClientHello,
 }
 
+impl std::fmt::Debug for PairRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairRequest")
+            .field(
+                "pairing_token",
+                &crate::security::secret_marker(&self.pairing_token),
+            )
+            .field("hello", &self.hello)
+            .finish()
+    }
+}
+
 /// Successful pairing: the durable rig credential the client must store and
 /// present on every later connection. This is the only time it is sent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairResult {
     pub credential: String,
     pub agent_hello: AgentHello,
 }
 
+impl std::fmt::Debug for PairResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairResult")
+            .field(
+                "credential",
+                &crate::security::secret_marker(&self.credential),
+            )
+            .field("agent_hello", &self.agent_hello)
+            .finish()
+    }
+}
+
 /// First frame from a client that already holds a rig credential.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthRequest {
     pub credential: String,
     pub hello: ClientHello,
+}
+
+impl std::fmt::Debug for AuthRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthRequest")
+            .field(
+                "credential",
+                &crate::security::secret_marker(&self.credential),
+            )
+            .field("hello", &self.hello)
+            .finish()
+    }
 }
 
 /// A read or command the hub asks the connected rig to perform. The rig
@@ -479,6 +515,7 @@ mod tests {
             pairing_token: "cspt_abc".to_string(),
             hello: sample_client_hello(),
         });
+        assert!(!format!("{pair:?}").contains("cspt_abc"));
         let back: DirectMessage =
             serde_json::from_str(&serde_json::to_string(&pair).unwrap()).unwrap();
         assert_eq!(back, pair);
@@ -487,9 +524,29 @@ mod tests {
             credential: "csrc_def".to_string(),
             hello: sample_client_hello(),
         });
+        assert!(!format!("{auth:?}").contains("csrc_def"));
         let value = serde_json::to_value(&auth).unwrap();
         assert_eq!(value["type"], "auth");
         assert_eq!(value["payload"]["credential"], "csrc_def");
+
+        let result = DirectMessage::PairResult(PairResult {
+            credential: "csrc_durable_private".to_string(),
+            agent_hello: AgentHello {
+                protocol_version: PROTOCOL_VERSION,
+                payload_version: CURRENT_PAYLOAD_VERSION,
+                connection_id: Uuid::new_v4(),
+                rig_id: RigId {
+                    node_id: Uuid::new_v4(),
+                    profile_id: Uuid::new_v4(),
+                },
+            },
+        });
+        assert!(!format!("{result:?}").contains("csrc_durable_private"));
+        assert!(
+            serde_json::to_string(&result)
+                .unwrap()
+                .contains("csrc_durable_private")
+        );
     }
 
     #[test]

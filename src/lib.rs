@@ -21,6 +21,7 @@ pub mod images;
 pub mod mount;
 pub mod plugin_runtime;
 pub mod rotator;
+pub mod security;
 pub mod sequence;
 pub mod serde_helpers;
 pub mod service_wrapper;
