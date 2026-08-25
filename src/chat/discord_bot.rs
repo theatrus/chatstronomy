@@ -524,20 +524,18 @@ async fn status(
     if let Ok(mount) = client.get_mount_info().await {
         let (ra, dec) = mount.get_coordinates();
         let (alt, az) = mount.get_alt_az();
-        embed = embed.field(
-            "Mount",
-            format!(
-                "Connected: {}\nTracking: {}\nParked: {}\nRA: {} Dec: {}\nAlt: {} Az: {}",
-                mount.is_connected(),
-                mount.response.tracking_enabled,
-                mount.response.at_park,
-                ra,
-                dec,
-                alt,
-                az
-            ),
-            false,
+        let mut status = format!(
+            "Connected: {}\nTracking: {}\nParked: {}\nRA: {} Dec: {}",
+            mount.is_connected(),
+            mount.response.tracking_enabled,
+            mount.response.at_park,
+            ra,
+            dec
         );
+        if !alt.is_empty() && !az.is_empty() {
+            status.push_str(&format!("\nAlt: {alt} Az: {az}"));
+        }
+        embed = embed.field("Mount", status, false);
     }
 
     if let Ok(seq) = client.get_sequence().await {
@@ -827,7 +825,7 @@ async fn mount(
     let (alt, az) = mount.get_alt_az();
     let flip = mount.get_time_to_meridian_flip_string();
 
-    let embed = serenity::CreateEmbed::new()
+    let mut embed = serenity::CreateEmbed::new()
         .title(format!("[{name}] Mount"))
         .field(
             "Status",
@@ -837,11 +835,17 @@ async fn mount(
             ),
             false,
         )
-        .field("RA / Dec", format!("RA: {ra}\nDec: {dec}"), true)
-        .field("Alt / Az", format!("Alt: {alt}\nAz: {az}"), true)
-        .field("Pier side", mount.get_side_of_pier().to_string(), true)
-        .field("Sidereal time", &m.sidereal_time_string, true)
-        .field("Time to flip", flip, true);
+        .field("RA / Dec", format!("RA: {ra}\nDec: {dec}"), true);
+    if !alt.is_empty() && !az.is_empty() {
+        embed = embed.field("Alt / Az", format!("Alt: {alt}\nAz: {az}"), true);
+    }
+    embed = embed.field("Pier side", mount.get_side_of_pier().to_string(), true);
+    if !m.location_redacted && !m.sidereal_time_string.is_empty() {
+        embed = embed.field("Sidereal time", &m.sidereal_time_string, true);
+    }
+    if !flip.is_empty() {
+        embed = embed.field("Time to flip", flip, true);
+    }
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }
@@ -1137,6 +1141,10 @@ async fn run_command(
     }
     let result = client.execute_command(command).await;
     let reply = match result {
+        Ok(resp) if resp.is_pending() => poise::CreateReply::default().content(format!(
+            "⏳ [{telescope}] {label}: {} (accepted; completion not yet confirmed)",
+            resp.summary()
+        )),
         Ok(resp) if resp.success => poise::CreateReply::default()
             .content(format!("✅ [{telescope}] {label}: {}", resp.summary())),
         Ok(resp) => poise::CreateReply::default()

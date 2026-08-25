@@ -14,22 +14,33 @@ pub struct MountInfoResponse {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MountInfo {
+    #[serde(default)]
     pub sidereal_time: f64,
     pub right_ascension: f64,
     pub declination: f64,
+    #[serde(default)]
     pub site_latitude: f64,
+    #[serde(default)]
     pub site_longitude: f64,
+    #[serde(default)]
     pub site_elevation: i32,
     pub right_ascension_string: String,
     pub declination_string: String,
     pub coordinates: Coordinates,
+    #[serde(default)]
     pub time_to_meridian_flip: f64,
     pub side_of_pier: String,
+    #[serde(default)]
     pub altitude: f64,
+    #[serde(default)]
     pub altitude_string: String,
+    #[serde(default)]
     pub azimuth: f64,
+    #[serde(default)]
     pub azimuth_string: String,
+    #[serde(default)]
     pub sidereal_time_string: String,
+    #[serde(default)]
     pub hours_to_meridian_string: String,
     pub at_park: bool,
     pub tracking_rate: TrackingRate,
@@ -44,6 +55,7 @@ pub struct MountInfo {
     pub can_set_right_ascension_rate: bool,
     pub equatorial_system: String,
     pub has_unknown_epoch: bool,
+    #[serde(default)]
     pub time_to_meridian_flip_string: String,
     pub slewing: bool,
     pub guide_rate_right_ascension_arcsec_per_sec: f64,
@@ -63,7 +75,10 @@ pub struct MountInfo {
     pub connected: bool,
     pub name: String,
     pub display_name: String,
+    #[serde(default)]
     pub device_id: String,
+    #[serde(default)]
+    pub location_redacted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,12 +137,20 @@ impl MountInfoResponse {
 
     /// Get the time to meridian flip in hours
     pub fn get_time_to_meridian_flip_hours(&self) -> f64 {
-        self.response.time_to_meridian_flip
+        if self.response.location_redacted {
+            0.0
+        } else {
+            self.response.time_to_meridian_flip
+        }
     }
 
     /// Get the formatted time to meridian flip string
     pub fn get_time_to_meridian_flip_string(&self) -> &str {
-        &self.response.time_to_meridian_flip_string
+        if self.response.location_redacted {
+            ""
+        } else {
+            &self.response.time_to_meridian_flip_string
+        }
     }
 
     /// Get current coordinates
@@ -140,10 +163,14 @@ impl MountInfoResponse {
 
     /// Get current altitude and azimuth
     pub fn get_alt_az(&self) -> (&str, &str) {
-        (
-            &self.response.altitude_string,
-            &self.response.azimuth_string,
-        )
+        if self.response.location_redacted {
+            ("", "")
+        } else {
+            (
+                &self.response.altitude_string,
+                &self.response.azimuth_string,
+            )
+        }
     }
 
     /// Get side of pier
@@ -153,11 +180,15 @@ impl MountInfoResponse {
 
     /// Get site information (latitude, longitude, elevation)
     pub fn get_site_info(&self) -> (f64, f64, i32) {
-        (
-            self.response.site_latitude,
-            self.response.site_longitude,
-            self.response.site_elevation,
-        )
+        if self.response.location_redacted {
+            (0.0, 0.0, 0)
+        } else {
+            (
+                self.response.site_latitude,
+                self.response.site_longitude,
+                self.response.site_elevation,
+            )
+        }
     }
 }
 
@@ -306,5 +337,58 @@ mod tests {
         assert!((lat - 38.661).abs() < 0.001);
         assert!((lon - (-121.166)).abs() < 0.001);
         assert_eq!(elev, 100);
+    }
+
+    #[test]
+    fn private_mount_snapshots_may_omit_location_derived_fields() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../example_equipment_mount_info.json")).unwrap();
+        let response = value["Response"].as_object_mut().unwrap();
+        for field in [
+            "SiteLatitude",
+            "SiteLongitude",
+            "SiteElevation",
+            "DeviceId",
+            "SiderealTime",
+            "SiderealTimeString",
+            "Altitude",
+            "AltitudeString",
+            "Azimuth",
+            "AzimuthString",
+            "HoursToMeridianString",
+            "TimeToMeridianFlip",
+            "TimeToMeridianFlipString",
+        ] {
+            response.remove(field);
+        }
+
+        let mount: MountInfoResponse = serde_json::from_value(value)
+            .expect("a position-redacted snapshot remains compatible with Direct v1");
+
+        assert!(mount.is_connected());
+        assert_eq!(mount.get_coordinates().0, "20:02:45");
+        assert_eq!(mount.get_alt_az(), ("", ""));
+        assert_eq!(mount.get_site_info(), (0.0, 0.0, 0));
+        assert_eq!(mount.get_time_to_meridian_flip_string(), "");
+        assert_eq!(mount.response.sidereal_time_string, "");
+        assert_eq!(mount.response.device_id, "");
+        assert!(!mount.response.location_redacted);
+    }
+
+    #[test]
+    fn redaction_marker_hides_location_derived_mount_fields() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../example_equipment_mount_info.json")).unwrap();
+        value["Response"]["LocationRedacted"] = serde_json::Value::Bool(true);
+
+        let mount: MountInfoResponse = serde_json::from_value(value)
+            .expect("legacy mount payloads accept the additive redaction marker");
+
+        assert!(mount.response.location_redacted);
+        assert_eq!(mount.get_coordinates().0, "20:02:45");
+        assert_eq!(mount.get_alt_az(), ("", ""));
+        assert_eq!(mount.get_site_info(), (0.0, 0.0, 0));
+        assert_eq!(mount.get_time_to_meridian_flip_hours(), 0.0);
+        assert_eq!(mount.get_time_to_meridian_flip_string(), "");
     }
 }

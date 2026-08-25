@@ -81,6 +81,9 @@ pub enum RigSourceError {
         capability: &'static str,
     },
 
+    #[error("{kind:?} request was rejected: {reason}")]
+    Rejected { kind: RigSourceKind, reason: String },
+
     #[error("{kind:?} source is unavailable: {reason}")]
     Unavailable { kind: RigSourceKind, reason: String },
 }
@@ -165,5 +168,17 @@ mod tests {
             serde_json::to_value(RigCommand::ParkMount).unwrap(),
             serde_json::json!({"kind": "park_mount"})
         );
+    }
+
+    #[test]
+    fn explicit_plugin_denials_are_not_reported_as_disconnects() {
+        let error = RigSourceError::Rejected {
+            kind: RigSourceKind::NinaDirect,
+            reason: "Parking is disabled in this N.I.N.A. profile".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("request was rejected"));
+        assert!(message.contains("Parking is disabled"));
+        assert!(!message.contains("unavailable"));
     }
 }

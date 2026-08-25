@@ -45,6 +45,15 @@ default to delivery enabled. The server labels unmarked payloads as legacy
 Direct v1; this is Direct protocol compatibility, not a second data-source
 mode.
 
+For compatibility with existing Direct v1 runtimes, position-redacted mount
+snapshots keep their required location-related fields but replace sensitive
+numbers and strings with zero or empty sentinels. The additive
+`LocationRedacted: true` marker lets newer consumers omit those rows entirely.
+The existing `StatusCode: 202` response marks asynchronous commands as accepted
+rather than completed. Hardware-command failures become
+`CHATSTRONOMY-COMMAND-FAILED` events and remain visible even when ordinary
+event-family delivery is disabled.
+
 ## Event delivery and state
 
 The plugin attaches `ChatEnabled` to captured events, images, targets, and
@@ -68,6 +77,21 @@ content.
   in arguments, environment variables, or generated configuration files.
 - Hosted connections are outbound TLS WebSockets.
 - Matrix homeserver URLs must use HTTPS.
+- Hardware control is disabled by default for every profile and delivery mode.
+  A local master switch and individual per-command permissions must both be
+  enabled in the N.I.N.A. plugin; sequence-validation bypass has its own
+  separate opt-in. A connection advertises command support only when at least
+  one operation has local approval.
 - Hub commands are typed, expire, and are authorized against telescope routing
-  and guild policy before reaching N.I.N.A.
+  and guild policy before reaching the plugin's independent local permission
+  check. Hardware commands have only five seconds of clock-skew tolerance
+  beyond their deadline; legacy read queries keep their existing two-minute
+  tolerance. Server policy can narrow local consent but cannot grant it.
+- In local Discord-bot mode, an empty write allowlist permits only managers of
+  the invoking guild. A nonempty allowlist permits only those explicit users;
+  commands must come from their telescope's configured Discord channel. Direct
+  messages, other servers, and commands disabled in N.I.N.A. are always denied.
+- Observatory location and location-derived values are private unless the
+  N.I.N.A. owner explicitly enables sharing. Stable device identifiers are
+  never forwarded.
 - Direct histories are bounded to prevent unbounded plugin memory growth.

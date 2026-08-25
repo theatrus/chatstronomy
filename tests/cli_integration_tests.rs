@@ -35,6 +35,7 @@ mod tests {
     #[test]
     fn test_basic_commands_available() {
         let stdout = help_text();
+        assert!(stdout.contains("licenses"));
 
         // `plugin-runtime` speaks over a Windows named pipe, so the subcommand
         // only exists there. Assert it is absent elsewhere rather than simply
@@ -48,5 +49,18 @@ mod tests {
         assert!(stdout.contains("hub"));
         #[cfg(not(feature = "hub"))]
         assert!(!stdout.contains("\n  hub"));
+    }
+
+    #[test]
+    fn redistributed_executables_include_application_and_font_notices() {
+        let output = chatstronomy()
+            .arg("licenses")
+            .output()
+            .expect("Failed to read embedded license notices");
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("Apache License"));
+        assert!(text.contains("SIL OPEN FONT LICENSE Version 1.1"));
+        assert!(text.contains("Copyright (c) 2012 Red Hat, Inc."));
     }
 }
