@@ -698,7 +698,13 @@ async fn api_my_telescopes(State(state): State<HubState>, headers: HeaderMap) ->
     let mut out = Vec::new();
     for t in &telescopes {
         let mut value = telescope_json(t);
-        value["connected"] = serde_json::Value::from(state.rig_connections.get(t.id).is_some());
+        let connection = state.rig_connections.get(t.id);
+        value["connected"] = serde_json::Value::from(connection.is_some());
+        value["commands_enabled"] = serde_json::Value::from(
+            connection
+                .as_ref()
+                .is_some_and(|connection| connection.capabilities.commands),
+        );
         let attachments = state.db.telescope_attachments(t.id).unwrap_or_default();
         value["attachments"] = serde_json::Value::from(
             attachments
@@ -1044,8 +1050,12 @@ async fn api_guild_attachments(
                     value["owner_name"] = serde_json::Value::from(entry.owner_name.clone());
                     value["owned_by_me"] =
                         serde_json::Value::from(entry.telescope.owner_id == session_user);
-                    value["connected"] = serde_json::Value::from(
-                        state.rig_connections.get(entry.telescope.id).is_some(),
+                    let connection = state.rig_connections.get(entry.telescope.id);
+                    value["connected"] = serde_json::Value::from(connection.is_some());
+                    value["commands_enabled"] = serde_json::Value::from(
+                        connection
+                            .as_ref()
+                            .is_some_and(|connection| connection.capabilities.commands),
                     );
                     value["channels"] = serde_json::Value::from(
                         state
@@ -2073,6 +2083,19 @@ mod tests {
         assert_eq!(entry["can_command"], true);
         assert_eq!(entry["write_policy"], "admins");
         assert_eq!(entry["owned_by_me"], true);
+        assert_eq!(entry["connected"], false);
+        assert_eq!(entry["commands_enabled"], false);
+
+        let mine: serde_json::Value = client
+            .get(format!("{base}/api/telescopes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(mine["telescopes"][0]["connected"], false);
+        assert_eq!(mine["telescopes"][0]["commands_enabled"], false);
 
         // Route a channel, set a role policy on the attachment.
         let route: serde_json::Value = client

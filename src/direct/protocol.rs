@@ -147,10 +147,14 @@ pub struct QueryRequest {
     pub kind: QueryKind,
 }
 
-/// Grace the executing side adds to `expires_at`, absorbing clock skew
-/// between the hub and the rig. A rig whose clock runs a little ahead must
-/// not reject every query as stale; multi-minute staleness is still caught.
+/// Legacy clock-skew tolerance for read-only queries. Preserving this keeps
+/// older Direct peers with imprecise clocks interoperable.
 pub const EXPIRY_CLOCK_SKEW_GRACE_SECONDS: i64 = 120;
+
+/// Hardware commands must never linger behind a stalled transport for two
+/// minutes after the caller has timed out. Keep only enough skew tolerance
+/// for ordinary, synchronized Windows clocks.
+pub const COMMAND_EXPIRY_CLOCK_SKEW_GRACE_SECONDS: i64 = 5;
 
 /// Current unix time in seconds. Both sides of the expiry contract use this
 /// one definition. Returns 0 when the system clock is before the epoch,
@@ -164,11 +168,16 @@ pub fn unix_now() -> i64 {
 
 impl QueryRequest {
     /// True when the query must be rejected rather than executed. `now` is
-    /// the executing side's clock; the skew grace keeps a slightly-fast rig
-    /// clock from rejecting everything.
+    /// the executing side's clock. Reads retain legacy skew tolerance, while
+    /// hardware commands expire promptly after the caller's deadline.
     pub fn expired_at(&self, now: i64) -> bool {
+        let grace = if matches!(&self.kind, QueryKind::Command { .. }) {
+            COMMAND_EXPIRY_CLOCK_SKEW_GRACE_SECONDS
+        } else {
+            EXPIRY_CLOCK_SKEW_GRACE_SECONDS
+        };
         self.expires_at
-            .is_some_and(|deadline| now > deadline + EXPIRY_CLOCK_SKEW_GRACE_SECONDS)
+            .is_some_and(|deadline| now > deadline.saturating_add(grace))
     }
 }
 
@@ -417,6 +426,40 @@ mod tests {
         assert!(!with_deadline.expired_at(100 + EXPIRY_CLOCK_SKEW_GRACE_SECONDS));
         // Past deadline plus grace: rejected.
         assert!(with_deadline.expired_at(101 + EXPIRY_CLOCK_SKEW_GRACE_SECONDS));
+    }
+
+    #[test]
+    fn hardware_commands_expire_promptly_but_reads_keep_legacy_skew_grace() {
+        let command = QueryRequest {
+            id: Uuid::new_v4(),
+            expires_at: Some(100),
+            kind: QueryKind::Command {
+                command: RigCommand::ParkMount,
+            },
+        };
+        assert!(!command.expired_at(100));
+        assert!(!command.expired_at(100 + COMMAND_EXPIRY_CLOCK_SKEW_GRACE_SECONDS));
+        assert!(command.expired_at(101 + COMMAND_EXPIRY_CLOCK_SKEW_GRACE_SECONDS));
+
+        let read = QueryRequest {
+            kind: QueryKind::MountInfo,
+            ..command
+        };
+        assert!(!read.expired_at(101 + COMMAND_EXPIRY_CLOCK_SKEW_GRACE_SECONDS));
+        assert!(!read.expired_at(100 + EXPIRY_CLOCK_SKEW_GRACE_SECONDS));
+        assert!(read.expired_at(101 + EXPIRY_CLOCK_SKEW_GRACE_SECONDS));
+    }
+
+    #[test]
+    fn query_deadlines_cannot_overflow_when_clock_skew_is_added() {
+        let request = QueryRequest {
+            id: Uuid::new_v4(),
+            expires_at: Some(i64::MAX),
+            kind: QueryKind::Command {
+                command: RigCommand::ParkMount,
+            },
+        };
+        assert!(!request.expired_at(i64::MAX));
     }
 
     #[test]

@@ -74,6 +74,15 @@ pub enum EventDetails {
         #[serde(rename = "To")]
         to: f64,
     },
+    /// An asynchronously accepted hardware command later failed in N.I.N.A.
+    /// Both fields are required so the untagged shape cannot swallow another
+    /// event's details.
+    CommandFailed {
+        #[serde(rename = "Command")]
+        command: String,
+        #[serde(rename = "Error")]
+        error: String,
+    },
     NinaNotification {
         #[serde(rename = "Level")]
         level: String,
@@ -208,6 +217,7 @@ pub mod event_types {
     pub const TS_WAITSTART: &str = "TS-WAITSTART";
     pub const NINA_NOTIFICATION: &str = "NINA-NOTIFICATION";
     pub const NINA_LOG: &str = "NINA-LOG";
+    pub const CHATSTRONOMY_COMMAND_FAILED: &str = "CHATSTRONOMY-COMMAND-FAILED";
 }
 
 impl EventHistoryResponse {
@@ -259,6 +269,27 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_failures_preserve_the_operation_and_error_details() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-24T04:00:00Z",
+            "Event": "CHATSTRONOMY-COMMAND-FAILED",
+            "ChatEnabled": true,
+            "Command": "Start sequence",
+            "Error": "Sequence validation failed",
+        }))
+        .unwrap();
+
+        assert_eq!(event.event, event_types::CHATSTRONOMY_COMMAND_FAILED);
+        match event.details {
+            Some(EventDetails::CommandFailed { command, error }) => {
+                assert_eq!(command, "Start sequence");
+                assert_eq!(error, "Sequence validation failed");
+            }
+            details => panic!("command failure was not preserved: {details:?}"),
+        }
+    }
 
     #[test]
     fn test_event_parsing() {

@@ -111,13 +111,26 @@ impl RigResolver for HubRigResolver {
         let attachment = self.invoking_attachment(&row, invocation)?;
         check_write_policy(&attachment, invocation)?;
         let source = self.source_for(&row)?;
+        ensure_locally_enabled(&source)?;
         Ok((row.name, source))
     }
 
     fn write_allowed(&self, invocation: &CommandContext, telescope: &str) -> Result<(), String> {
         let row = self.find_telescope(invocation, Some(telescope))?;
         let attachment = self.invoking_attachment(&row, invocation)?;
-        check_write_policy(&attachment, invocation)
+        check_write_policy(&attachment, invocation)?;
+        let source = self.source_for(&row)?;
+        ensure_locally_enabled(&source)
+    }
+}
+
+/// Guild permissions can narrow access, but only the owner sitting at the
+/// N.I.N.A. profile can grant the plugin permission to actuate hardware.
+fn ensure_locally_enabled(source: &SharedRigSource) -> Result<(), String> {
+    if source.capabilities().commands {
+        Ok(())
+    } else {
+        Err("Telescope control is disabled in N.I.N.A. Its owner must enable remote control and approve at least one individual command in the Chatstronomy plugin.".to_string())
     }
 }
 
@@ -220,6 +233,17 @@ mod tests {
         connections.insert(connection);
     }
 
+    fn connect_read_only(connections: &RigConnections, telescope_id: i64) {
+        let (mut connection, rx) =
+            crate::hub::direct_server::RigConnection::stub(telescope_id, Uuid::new_v4());
+        Arc::get_mut(&mut connection)
+            .expect("the new test connection has a single owner")
+            .capabilities
+            .commands = false;
+        std::mem::forget(rx);
+        connections.insert(connection);
+    }
+
     #[test]
     fn resolves_by_channel_and_attached_name() {
         let (_db, connections, resolver, id) = setup();
@@ -271,6 +295,26 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("server managers"), "got: {err}");
+    }
+
+    #[test]
+    fn local_plugin_lock_overrides_every_guild_write_permission() {
+        let (_db, connections, resolver, id) = setup();
+        connect_read_only(&connections, id);
+        let manager = manager_invocation(100, 42);
+
+        // Monitoring remains available while the physical control boundary is
+        // closed, including to an authorized server manager.
+        assert!(resolver.resolve(&manager, None).is_ok());
+        let error = resolver
+            .resolve_for_write(&manager, None)
+            .err()
+            .expect("local consent is mandatory");
+        assert!(error.contains("disabled in N.I.N.A."), "got: {error}");
+        let error = resolver
+            .write_allowed(&manager, "c925")
+            .expect_err("the alternate authorization path also respects local consent");
+        assert!(error.contains("Chatstronomy plugin"), "got: {error}");
     }
 
     #[test]

@@ -34,6 +34,25 @@ choose which event families produce chat messages. N.I.N.A. popup notifications
 are enabled by default; raw log levels are separately opt-in because logs can be
 frequent and contain local equipment or path details.
 
+Telescope control is **disabled by default in N.I.N.A.** for every delivery
+mode. To allow hardware commands, the telescope owner must enable the plugin's
+local master switch and separately approve each individual operation; sequence
+validation bypass requires an additional explicit permission. Discord server
+permissions can narrow that access but can never enable an operation that the
+N.I.N.A. profile has not approved. Asynchronous operations are reported as
+accepted, not completed, and later hardware failures are delivered to chat.
+In local Discord-bot mode, only managers of the invoking Discord server can
+request approved operations unless an explicit user allowlist is configured;
+requests must come from the telescope's configured channel, and direct messages
+never gain control authority.
+
+The plugin does not share the observatory's geographic location, derived local
+sky coordinates, or stable equipment identifiers by default. An owner can
+explicitly opt in to sharing the observatory location for that N.I.N.A. profile;
+equipment identifiers remain private. Review the hosted service's
+[privacy statement](https://chatstronomy.com/hub-privacy.html) and
+[terms of service](https://chatstronomy.com/hub-terms.html) before pairing.
+
 ## Run the Hub
 
 The production path is [hub.chatstronomy.com](https://hub.chatstronomy.com).
@@ -59,6 +78,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 On Windows the release artifact also contains the plugin-owned local runtime.
 The plugin repository downloads that signed artifact, verifies its checksum and
 signature metadata, and packages it with the N.I.N.A. plugin.
+
+Release archives include the Apache-2.0 application license and the SIL Open
+Font License notice for the embedded Liberation Sans chart font. Standalone
+executables also expose both notices with `chatstronomy licenses`.
 
 ## Architecture
 

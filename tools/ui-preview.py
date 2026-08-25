@@ -4,7 +4,7 @@
 Extracts INDEX_HTML from src/hub/web_ui.rs and injects a fetch() stub
 before the page script, so the real markup/CSS/JS runs against fixture
 data — no server, no login. Variants: full, delivery, needs-server, empty,
-long-name, loggedout, token
+long-name, loggedout, token, control-enabled
 (token = full plus an auto-click on the second telescope's "Connect rig"
 so the pairing box is visible in the screenshot).
 
@@ -61,7 +61,7 @@ guilds = {
 telescopes = {
     "telescopes": [
         {"id": 1, "name": "c925", "owner_id": "1", "image_cooldown_seconds": 60,
-         "connected": True,
+         "connected": True, "commands_enabled": False,
          "attachments": [
              {"attachment_id": 11, "telescope_id": 1, "guild_id": "1000",
               "guild_name": "Backyard Observatory", "can_command": True,
@@ -75,7 +75,7 @@ telescopes = {
                             "channel_name": "alerts", "guild_name": "Astro Club"}]},
          ]},
         {"id": 2, "name": "esprit100", "owner_id": "1", "image_cooldown_seconds": 120,
-         "connected": False, "attachments": []},
+         "connected": False, "commands_enabled": False, "attachments": []},
     ],
 }
 
@@ -84,7 +84,7 @@ attachments_1000 = {
         {"attachment_id": 11, "telescope_id": 1, "guild_id": "1000",
          "telescope_name": "c925", "owner_name": "atrus", "owned_by_me": True,
          "can_command": True, "write_policy": "roles", "allowed_role_ids": ["201"],
-         "connected": True,
+         "connected": True, "commands_enabled": False,
          "channels": [{"route_id": 31, "guild_id": "1000", "channel_id": "101",
                        "channel_name": "astro-images", "guild_name": "Backyard Observatory"},
                       {"route_id": 33, "guild_id": "1000", "channel_id": "102",
@@ -97,7 +97,7 @@ attachments_2000 = {
         {"attachment_id": 12, "telescope_id": 1, "guild_id": "2000",
          "telescope_name": "c925", "owner_name": "somebody-else", "owned_by_me": False,
          "can_command": False, "write_policy": "admins", "allowed_role_ids": [],
-         "connected": True,
+         "connected": True, "commands_enabled": False,
          "channels": [{"route_id": 32, "guild_id": "2000", "channel_id": "104",
                        "channel_name": "alerts", "guild_name": "Astro Club"}]},
     ],
@@ -121,6 +121,9 @@ elif variant == "long-name":
     session["user"]["username"] = "observatory-operator-with-a-long-discord-name"
 elif variant == "loggedout":
     session = {"authenticated": False}
+elif variant == "control-enabled":
+    telescopes["telescopes"][0]["commands_enabled"] = True
+    attachments_1000["attachments"][0]["commands_enabled"] = True
 
 fixtures = {
     "/api/session": session,

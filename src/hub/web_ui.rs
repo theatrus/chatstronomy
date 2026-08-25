@@ -214,6 +214,12 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
   }
   .footer-links a { color: var(--muted); font-size: .78rem; }
   .footer-links a:hover { color: var(--bad); text-decoration: none; }
+  .legal-links {
+    display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;
+    margin-top: 1.1rem; padding-top: .8rem; border-top: 1px solid var(--border);
+  }
+  .legal-links a { color: var(--muted); font-size: .8rem; }
+  .legal-links a:hover { color: var(--accent); }
   details.redeem { margin-top: .9rem; }
   details.redeem summary {
     cursor: pointer; color: var(--muted); font-size: .82rem; list-style: none;
@@ -256,6 +262,10 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     <span id="whoami"></span>
   </header>
   <div id="app"><p class="hint">Loading…</p></div>
+  <footer class="legal-links" aria-label="Hosted-service policies">
+    <a href="https://chatstronomy.com/hub-privacy.html" target="_blank" rel="noopener noreferrer">Hosted privacy</a>
+    <a href="https://chatstronomy.com/hub-terms.html" target="_blank" rel="noopener noreferrer">Hosted terms</a>
+  </footer>
 </div>
 <div id="toast"></div>
 <div id="announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -266,10 +276,18 @@ let GUILDS = [];
 let ACTIVE_TAB = "telescopes";
 let RENDER_GENERATION = 0;
 const TAB_ORDER = ["telescopes", "delivery"];
+const HOSTED_PRIVACY_URL = "https://chatstronomy.com/hub-privacy.html";
+const HOSTED_TERMS_URL = "https://chatstronomy.com/hub-terms.html";
 
 const app = document.getElementById("app");
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function hostedPolicyLinks() {
+  return '<a href="' + HOSTED_PRIVACY_URL + '" target="_blank" rel="noopener noreferrer">' +
+    'hosted privacy statement</a> and <a href="' + HOSTED_TERMS_URL +
+    '" target="_blank" rel="noopener noreferrer">hosted terms</a>';
+}
 
 function toast(msg) {
   const el = document.getElementById("toast");
@@ -305,8 +323,9 @@ async function boot() {
       '<div class="card"><h2 style="margin-top:0">Bring your observatory into Discord</h2>' +
       '<p>Add your telescopes, attach them to your servers, and let everyone ' +
       "watch sessions unfold — images, autofocus runs, guiding graphs, and " +
-      "slash commands to drive the mount.</p>" +
-      '<p><a href="/login"><button class="primary">Log in with Discord</button></a></p></div>';
+      "optional remote commands only when you individually approve them in N.I.N.A.</p>" +
+      '<p><a href="/login"><button class="primary">Log in with Discord</button></a></p>' +
+      '<p class="hint">Read the ' + hostedPolicyLinks() + ' before signing in.</p></div>';
     return;
   }
   CSRF = session.csrf_token;
@@ -461,6 +480,13 @@ function rigBadge(connected) {
     : '<span class="badge warn">rig offline</span>';
 }
 
+function controlBadge(connected, commandsEnabled) {
+  if (!connected) return "";
+  return commandsEnabled
+    ? '<span class="badge good">N.I.N.A. commands approved</span>'
+    : '<span class="badge warn">commands locked in N.I.N.A.</span>';
+}
+
 function renderMyTelescopes(telescopes, target) {
   const card = document.createElement("div");
   card.className = "card";
@@ -489,7 +515,7 @@ function renderMyTelescopes(telescopes, target) {
     html +=
       '<div class="sub telescope" data-id="' + t.id + '">' +
       '<div class="head"><b>' + ico("telescope") + esc(t.name) + "</b>" + '' +
-      '<div class="badges">' + rigBadge(t.connected) +
+      '<div class="badges">' + rigBadge(t.connected) + controlBadge(t.connected, t.commands_enabled) +
       '<button class="' + (t.connected ? "subtle " : "") + 'b-token">' + ico("key") + "Connect rig…</button>" + '' +
       '<button class="subtle b-share">' + ico("share") + "Share…</button></div></div>" + '' +
       nextStep(t, targets) +
@@ -551,7 +577,8 @@ function renderMyTelescopes(telescopes, target) {
         showToken(row, "key", "Pairing token — shown once, valid " +
           Math.round(out.expires_in_seconds / 60) + " minutes", out.token,
           "Paste into the N.I.N.A. plugin, then connect. " +
-          "Issuing a new token cancels this one.");
+          "Issuing a new token cancels this one. Review the " +
+          hostedPolicyLinks() + " before pairing.");
       } catch (e) { toast(e.message); }
     };
     row.querySelector(".b-share").onclick = async () => {
@@ -716,10 +743,13 @@ async function renderAttachments(g, el) {
     const canAddChannel = options.channels.some((c) => !usedChannels.includes(c.id));
     const badges =
       rigBadge(a.connected) +
-      (a.can_command ? '<span class="badge good">can command</span>'
+      (a.can_command ? controlBadge(a.connected, a.commands_enabled)
                      : '<span class="badge">feed only</span>');
     const owner = a.owned_by_me ? "" :
       '<span class="sub-note">shared by ' + esc(a.owner_name) + "</span>";
+    const consentHint = a.connected && !a.commands_enabled
+      ? "Remote control is off in N.I.N.A. The telescope owner must enable the master switch and approve each command individually."
+      : "Only commands individually approved in N.I.N.A. are available; server permissions cannot grant additional access.";
     const commands = a.can_command
       ? '<div class="section"><label>' + ico("zap") + "Commands — who may drive this telescope here</label>" + '' +
         '<div class="controls"><select class="pick f-policy">' +
@@ -729,7 +759,8 @@ async function renderAttachments(g, el) {
         '</select><span class="hint">Applies on change.</span></div>' +
         '<div class="roles-field" style="margin-top:.5rem' +
         (a.write_policy === "roles" ? "" : ";display:none") + '">' +
-        roleChips(options, a.allowed_role_ids) + "</div></div>"
+        roleChips(options, a.allowed_role_ids) + "</div>" +
+        '<p class="hint">' + consentHint + "</p></div>"
       : '<div class="section"><label>' + ico("zap") + "Commands</label>" + '' +
         '<span class="hint">This server receives the feed and read commands only.</span></div>';
     html +=
@@ -868,11 +899,35 @@ mod tests {
             "My telescopes",
             "Attach to server",
             "feed only",
-            "can command",
+            "N.I.N.A. commands approved",
             "Detach",
         ] {
             assert!(INDEX_HTML.contains(needle), "missing {needle}");
         }
+    }
+
+    #[test]
+    fn page_makes_the_local_control_boundary_visible() {
+        for needle in [
+            "function controlBadge(connected, commandsEnabled)",
+            "t.commands_enabled",
+            "a.commands_enabled",
+            "commands locked in N.I.N.A.",
+            "enable the master switch and approve each command individually",
+            "Only commands individually approved in N.I.N.A. are available",
+        ] {
+            assert!(INDEX_HTML.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn hosted_policies_are_visible_before_login_and_pairing() {
+        assert!(INDEX_HTML.contains("https://chatstronomy.com/hub-privacy.html"));
+        assert!(INDEX_HTML.contains("https://chatstronomy.com/hub-terms.html"));
+        assert!(INDEX_HTML.contains("aria-label=\"Hosted-service policies\""));
+        assert!(INDEX_HTML.contains("before signing in"));
+        assert!(INDEX_HTML.contains("before pairing"));
+        assert!(INDEX_HTML.matches("hostedPolicyLinks()").count() >= 3);
     }
 
     #[test]

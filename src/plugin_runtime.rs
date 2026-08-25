@@ -411,9 +411,11 @@ mod tests {
             .into_config()
             .unwrap();
         assert_eq!(config.telescopes[0].chat.discord_channel_id, Some(456));
-        assert_eq!(
-            config.chat.discord_bot.unwrap().default_channel_id,
-            Some(456)
+        let bot = config.chat.discord_bot.unwrap();
+        assert_eq!(bot.default_channel_id, Some(456));
+        assert!(
+            bot.write_acl.is_empty(),
+            "the local bot's secure fallback permits guild managers only"
         );
     }
 

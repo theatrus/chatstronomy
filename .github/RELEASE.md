@@ -14,15 +14,23 @@
 Create and push a signed or annotated `vX.Y.Z` tag only after CI is green. The
 release workflow publishes:
 
-- `chatstronomy-linux-x86_64`
-- `chatstronomy-linux-aarch64`
+- `chatstronomy-linux-x64.tar.gz`
+- `chatstronomy-linux-arm64.tar.gz`
 - signed `chatstronomy-windows-x64.exe`
+- `chatstronomy-windows-x64.zip`
 - signed `chatstronomy-plugin-runtime-windows-x64.exe`
+- `chatstronomy-plugin-runtime-windows-x64.zip`
 - `chatstronomy-plugin-contracts-v1.zip`
 - `chatstronomy-runtime-manifest.json`
 
 The runtime manifest records the release identity, Direct protocol versions,
 artifact names, sizes, and SHA-256 hashes after signing.
+
+Every Linux archive, Windows ZIP, and plugin-contract archive includes both the
+Apache-2.0 `LICENSE` and the `LiberationSans-LICENSE` notice for the embedded
+chart font. The standalone signed Windows executables remain available for
+existing plugin runtime locks and expose the same embedded notices through
+`chatstronomy licenses`.
 
 ## Plugin follow-up
 

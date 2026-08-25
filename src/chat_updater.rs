@@ -2414,6 +2414,10 @@ impl ChatUpdater {
 
     async fn send_generic_event_notification(&self, event: &Event) {
         let (color, title) = match &event.details {
+            Some(EventDetails::CommandFailed { command, .. }) => (
+                colors::RED,
+                format!("❌ Command failed · {}", truncate_chat_title(command)),
+            ),
             Some(EventDetails::NinaNotification { level, header, .. }) => (
                 nina_level_color(level),
                 if header.trim().is_empty() {
@@ -2468,6 +2472,11 @@ impl ChatUpdater {
                         .field("From", &format!("{from:.2}°"), true)
                         .field("To", &format!("{to:.2}°"), true)
                         .field("Δ", &format!("{:+.2}°", to - from), true);
+                }
+                EventDetails::CommandFailed { command, error } => {
+                    message = message
+                        .field("Command", &truncate_chat_value(command), true)
+                        .field("Error", &truncate_chat_value(error), false);
                 }
                 EventDetails::NinaNotification {
                     level,
@@ -2644,11 +2653,13 @@ impl ChatUpdater {
                 value: format!("RA: {ra}\nDec: {dec}"),
                 inline: true,
             });
-            message.fields.push(ChatField {
-                name: "Alt/Az".to_string(),
-                value: format!("Alt: {alt}\nAz: {az}"),
-                inline: true,
-            });
+            if !alt.is_empty() && !az.is_empty() {
+                message.fields.push(ChatField {
+                    name: "Alt/Az".to_string(),
+                    value: format!("Alt: {alt}\nAz: {az}"),
+                    inline: true,
+                });
+            }
             message.fields.push(ChatField {
                 name: "Pier Side".to_string(),
                 value: mount_info.get_side_of_pier().to_string(),
@@ -2715,6 +2726,7 @@ fn get_event_color(event: &str) -> u32 {
         event_types::SEQUENCE_STARTING => colors::CYAN,
         event_types::SEQUENCE_FINISHED => colors::GREEN,
         event_types::SEQUENCE_ENTITY_FAILED => colors::RED,
+        event_types::CHATSTRONOMY_COMMAND_FAILED => colors::RED,
 
         // System events
         event_types::FLAT_DISCONNECTED
@@ -2804,6 +2816,7 @@ fn get_event_title(event: &str) -> String {
         event_types::ROTATOR_MOVED_MECHANICAL => "🧭 Rotator Moved (Mech.)".to_string(),
         event_types::NINA_NOTIFICATION => "🔔 N.I.N.A. notification".to_string(),
         event_types::NINA_LOG => "📝 N.I.N.A. log".to_string(),
+        event_types::CHATSTRONOMY_COMMAND_FAILED => "❌ Telescope command failed".to_string(),
         // The event name comes from the plugin, so it is not length-bounded.
         _ => format!("📡 {}", truncate_chat_title(event)),
     }
@@ -2841,6 +2854,18 @@ mod tests {
         // the caller still prepends "[telescope] ".
         assert!(title.chars().count() < 256);
         assert!(get_event_title(&"X".repeat(4_000)).chars().count() < 256);
+    }
+
+    #[test]
+    fn hardware_command_failures_have_visible_error_presentation() {
+        assert_eq!(
+            get_event_color(event_types::CHATSTRONOMY_COMMAND_FAILED),
+            colors::RED
+        );
+        assert_eq!(
+            get_event_title(event_types::CHATSTRONOMY_COMMAND_FAILED),
+            "❌ Telescope command failed"
+        );
     }
 
     #[test]

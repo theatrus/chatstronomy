@@ -83,12 +83,12 @@ impl DirectPipeRigSource {
         kind: QueryKind,
     ) -> RigSourceResult<T> {
         let id = Uuid::new_v4();
-        // The local current-user pipe is synchronous and cannot queue work
-        // across reconnects, so it does not need the remote hub's expiry
-        // deadline. Remote Direct queries set this field at the hub boundary.
+        // Pipe writes may still sit behind a stalled N.I.N.A. dispatcher after
+        // our caller times out. Give hardware commands the same bounded
+        // lifetime as the local exchange; preserve legacy deadline-free reads.
         let request = DirectMessage::Query(QueryRequest {
             id,
-            expires_at: None,
+            expires_at: query_deadline(&kind),
             kind,
         });
         let mut frame = serde_json::to_vec(&request)
@@ -130,13 +130,19 @@ impl DirectPipeRigSource {
             return Err(Self::unavailable("plugin returned a mismatched query ID"));
         }
         if !result.ok {
-            return Err(Self::unavailable(
-                result.error.unwrap_or_else(|| "query failed".to_string()),
-            ));
+            return Err(RigSourceError::Rejected {
+                kind: RigSourceKind::NinaDirect,
+                reason: result.error.unwrap_or_else(|| "query failed".to_string()),
+            });
         }
         serde_json::from_value(result.payload)
             .map_err(|error| Self::unavailable(format!("invalid payload from plugin: {error}")))
     }
+}
+
+fn query_deadline(kind: &QueryKind) -> Option<i64> {
+    matches!(kind, QueryKind::Command { .. })
+        .then(|| crate::direct::protocol::unix_now().saturating_add(QUERY_TIMEOUT.as_secs() as i64))
 }
 
 #[async_trait]
@@ -238,5 +244,25 @@ impl RigSource for DirectPipeRigSource {
             return Err(Self::unsupported("commands"));
         }
         self.query_as(QueryKind::Command { command }).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_hardware_commands_have_deadlines_but_legacy_reads_do_not() {
+        let before = crate::direct::protocol::unix_now();
+        let command = QueryKind::Command {
+            command: RigCommand::ParkMount,
+        };
+        let deadline = query_deadline(&command).expect("local commands must expire");
+        let after = crate::direct::protocol::unix_now();
+
+        assert!(deadline >= before + QUERY_TIMEOUT.as_secs() as i64);
+        assert!(deadline <= after + QUERY_TIMEOUT.as_secs() as i64);
+        assert_eq!(query_deadline(&QueryKind::MountInfo), None);
+        assert_eq!(query_deadline(&QueryKind::EventHistory), None);
     }
 }

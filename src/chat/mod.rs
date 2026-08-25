@@ -196,7 +196,9 @@ pub struct DiscordBotConfig {
     /// `live_status` is true).
     #[serde(default = "default_state_file")]
     pub state_file: String,
-    /// Discord user IDs allowed to invoke write commands (Phase 3).
+    /// Explicit Discord user IDs allowed to invoke write commands. An empty
+    /// list grants only managers of the invoking guild; direct messages and
+    /// operations not locally approved in N.I.N.A. are always rejected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub write_acl: Vec<u64>,
 }

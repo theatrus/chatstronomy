@@ -50,9 +50,10 @@ impl DirectRigSource {
             .await
             .map_err(Self::unavailable)?;
         if !result.ok {
-            return Err(Self::unavailable(
-                result.error.unwrap_or_else(|| "query failed".to_string()),
-            ));
+            return Err(RigSourceError::Rejected {
+                kind: RigSourceKind::NinaDirect,
+                reason: result.error.unwrap_or_else(|| "query failed".to_string()),
+            });
         }
         serde_json::from_value(result.payload)
             .map_err(|e| Self::unavailable(format!("invalid payload from rig: {e}")))
@@ -118,6 +119,46 @@ impl RigSource for DirectRigSource {
     }
 
     async fn execute_command(&self, command: RigCommand) -> RigSourceResult<CommandResponse> {
+        // The N.I.N.A. plugin owns the hardware trust boundary. Never put a
+        // command on the wire when its authenticated hello says local control
+        // is disabled, even if a caller bypassed the Discord resolver.
+        if !self.connection.capabilities.commands {
+            return Err(RigSourceError::Unsupported {
+                kind: RigSourceKind::NinaDirect,
+                capability: "commands",
+            });
+        }
         self.query_as(QueryKind::Command { command }).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::error::TryRecvError;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn locally_disabled_commands_never_reach_the_rig() {
+        let (mut connection, mut outgoing) = RigConnection::stub(1, Uuid::new_v4());
+        Arc::get_mut(&mut connection)
+            .expect("the new test connection has a single owner")
+            .capabilities
+            .commands = false;
+        let source = DirectRigSource::new(connection);
+
+        let error = source
+            .execute_command(RigCommand::ParkMount)
+            .await
+            .expect_err("a read-only rig must reject commands");
+
+        assert!(matches!(
+            error,
+            RigSourceError::Unsupported {
+                kind: RigSourceKind::NinaDirect,
+                capability: "commands",
+            }
+        ));
+        assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
     }
 }

@@ -51,8 +51,12 @@ jobs:
           restore-keys: linux-${{ matrix.arch }}-cargo-
       - run: cargo test --all-features --locked
       - run: cargo build --release --all-features --locked
-      - name: Package
-        run: tar -czf chatstronomy-linux-${{ matrix.arch }}.tar.gz -C target/release chatstronomy
+      - name: Package executable and redistribution notices
+        run: |
+          tar -czf "chatstronomy-linux-${{ matrix.arch }}.tar.gz" \
+            -C "$GITHUB_WORKSPACE/target/release" chatstronomy \
+            -C "$GITHUB_WORKSPACE" LICENSE \
+            -C "$GITHUB_WORKSPACE/assets" LiberationSans-LICENSE
       - name: Upload release asset
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v3
@@ -144,7 +148,10 @@ jobs:
       - shell: pwsh
         run: |
           Copy-Item target/release/chatstronomy.exe chatstronomy-plugin-runtime-windows-x64.exe
-          Compress-Archive -Path contracts -DestinationPath chatstronomy-plugin-contracts-v1.zip
+          $notices = @('LICENSE', 'assets/LiberationSans-LICENSE')
+          Compress-Archive -Path (@('contracts') + $notices) -DestinationPath chatstronomy-plugin-contracts-v1.zip
+          Compress-Archive -Path (@('chatstronomy-windows-x64.exe') + $notices) -DestinationPath chatstronomy-windows-x64.zip
+          Compress-Archive -Path (@('chatstronomy-plugin-runtime-windows-x64.exe') + $notices) -DestinationPath chatstronomy-plugin-runtime-windows-x64.zip
           ./tools/New-ChatstronomyRuntimeManifest.ps1 `
             -PluginRuntimePath ./chatstronomy-plugin-runtime-windows-x64.exe `
             -FullRuntimePath ./chatstronomy-windows-x64.exe `
@@ -164,7 +171,9 @@ jobs:
         with:
           files: |
             chatstronomy-windows-x64.exe
+            chatstronomy-windows-x64.zip
             chatstronomy-plugin-runtime-windows-x64.exe
+            chatstronomy-plugin-runtime-windows-x64.zip
             chatstronomy-plugin-contracts-v1.zip
             chatstronomy-runtime-manifest.json
       - name: Upload dispatch artifacts
@@ -174,6 +183,8 @@ jobs:
           name: signed-windows-${{ env.VERSION }}
           path: |
             chatstronomy-windows-x64.exe
+            chatstronomy-windows-x64.zip
             chatstronomy-plugin-runtime-windows-x64.exe
+            chatstronomy-plugin-runtime-windows-x64.zip
             chatstronomy-plugin-contracts-v1.zip
             chatstronomy-runtime-manifest.json
