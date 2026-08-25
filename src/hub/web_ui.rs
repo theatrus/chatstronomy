@@ -289,6 +289,18 @@ function hostedPolicyLinks() {
     '" target="_blank" rel="noopener noreferrer">hosted terms</a>';
 }
 
+function localPrivacyNotice() {
+  return '<p class="hint">Ordinary event categories, images, and popup ' +
+    'notifications start on by default. Review your N.I.N.A. event selections ' +
+    'before pairing: disabled categories never reach this Hub, even for state ' +
+    'reconstruction or command-failure reporting. Turning off images also blocks ' +
+    'existing image history and thumbnails. Allowed equipment and status ' +
+    'snapshots remain available, but Hub state may be incomplete. N.I.N.A. log ' +
+    'forwarding, observatory location sharing, and hardware control start off. ' +
+    'Hardware control requires the N.I.N.A. master switch plus individual ' +
+    'command approvals.</p>';
+}
+
 function toast(msg) {
   const el = document.getElementById("toast");
   const announcer = document.getElementById("announcer");
@@ -323,7 +335,8 @@ async function boot() {
       '<div class="card"><h2 style="margin-top:0">Bring your observatory into Discord</h2>' +
       '<p>Add your telescopes, attach them to your servers, and let everyone ' +
       "watch sessions unfold — images, autofocus runs, guiding graphs, and " +
-      "optional remote commands only when you individually approve them in N.I.N.A.</p>" +
+      "optional remote commands authorized locally in N.I.N.A.</p>" +
+      localPrivacyNotice() +
       '<p><a href="/login"><button class="primary">Log in with Discord</button></a></p>' +
       '<p class="hint">Read the ' + hostedPolicyLinks() + ' before signing in.</p></div>';
     return;
@@ -492,7 +505,8 @@ function renderMyTelescopes(telescopes, target) {
   card.className = "card";
   let html = '<div class="head"><h2>' + ico("telescope") + "My telescopes</h2>" +
     '' +
-    '<div class="badges"><span class="hint">yours across every server</span></div></div>';
+    '<div class="badges"><span class="hint">yours across every server</span></div></div>' +
+    localPrivacyNotice();
   if (!telescopes.length) {
     html += '<div class="steps"><span><b>1</b> Add a telescope</span>' +
       "<span><b>2</b> Attach it to a server</span>" +
@@ -913,11 +927,32 @@ mod tests {
             "t.commands_enabled",
             "a.commands_enabled",
             "commands locked in N.I.N.A.",
+            "hardware control start off",
+            "Hardware control requires the N.I.N.A. master switch plus individual",
+            "command approvals",
             "enable the master switch and approve each command individually",
             "Only commands individually approved in N.I.N.A. are available",
         ] {
             assert!(INDEX_HTML.contains(needle), "missing {needle}");
         }
+    }
+
+    #[test]
+    fn page_explains_the_local_event_and_privacy_boundary() {
+        for needle in [
+            "function localPrivacyNotice()",
+            "Ordinary event categories, images, and popup",
+            "notifications start on by default",
+            "before pairing: disabled categories never reach this Hub",
+            "reconstruction or command-failure reporting",
+            "Turning off images also blocks",
+            "existing image history and thumbnails",
+            "snapshots remain available, but Hub state may be incomplete",
+            "forwarding, observatory location sharing, and hardware control start off",
+        ] {
+            assert!(INDEX_HTML.contains(needle), "missing {needle}");
+        }
+        assert!(INDEX_HTML.matches("localPrivacyNotice()").count() >= 3);
     }
 
     #[test]

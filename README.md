@@ -9,10 +9,10 @@ the hosted Hub.
 
 | Mode | N.I.N.A. data path | Chat credentials |
 |---|---|---|
-| Hosted Hub | Plugin → encrypted WebSocket → [hub.chatstronomy.com](https://hub.chatstronomy.com) | Managed by the Hub |
-| Local webhook | Plugin → current-user named pipe → bundled runtime | Discord webhook in the N.I.N.A. profile |
-| Local bot | Plugin → current-user named pipe → bundled runtime | Discord application token/channel in the N.I.N.A. profile |
-| Local Matrix | Plugin → current-user named pipe → bundled runtime | HTTPS homeserver login and room in the N.I.N.A. profile |
+| Hosted Hub | Plugin → encrypted WebSocket → [hub.chatstronomy.com](https://hub.chatstronomy.com) | Discord credentials managed by the Hub; pairing credential in Windows Credential Manager |
+| Local webhook | Plugin → current-user named pipe → bundled runtime | Discord webhook in Windows Credential Manager |
+| Local bot | Plugin → current-user named pipe → bundled runtime | Bot token in Windows Credential Manager; channel in the N.I.N.A. profile |
+| Local Matrix | Plugin → current-user named pipe → bundled runtime | Matrix password in Windows Credential Manager; HTTPS homeserver, username, and room in the profile |
 
 Every N.I.N.A. instance runs the plugin. Multiple instances, including ones on
 different systems, can connect to one Hub account and be routed independently.
@@ -26,13 +26,22 @@ repository when the release is available, or add the
 [Chatstronomy development repository](https://github.com/theatrus/chatstronomy-nina-plugin)
 to N.I.N.A.'s repository list for development builds. Restart N.I.N.A. after
 installation, open **Options → Plugins → Chatstronomy**, and choose Hosted Hub or
-a local delivery method.
+a local delivery method. Before pairing or starting a local runtime, review the
+profile's **Security and privacy** and **Event delivery** selections.
 
 The plugin captures native equipment, image, autofocus, guider, sequence,
-cooling, wait, slew, center, and Target Scheduler state. Per-profile controls
-choose which event families produce chat messages. N.I.N.A. popup notifications
-are enabled by default; raw log levels are separately opt-in because logs can be
-frequent and contain local equipment or path details.
+cooling, wait, slew, center, and Target Scheduler state. Per-profile event
+controls are a hard transmission and privacy boundary: disabled event families
+never reach the hosted Hub or local runtime, including previously buffered
+events. There is no exception for state reconstruction or command-failure
+reporting. Disabling image delivery also blocks existing image history and
+thumbnails; images captured while sharing is off cannot be retrieved later.
+Equipment and status snapshots remain available, but disabled events can leave
+historical or intermediate state incomplete. Most event families, including
+images and N.I.N.A. popup notifications, start enabled. Raw N.I.N.A. log levels
+start disabled and must be enabled individually because logs can contain local
+equipment, paths, or other private details. N.I.N.A. logs are not read while
+every log level is off.
 
 Telescope control is **disabled by default in N.I.N.A.** for every delivery
 mode. To allow hardware commands, the telescope owner must enable the plugin's
@@ -40,7 +49,8 @@ local master switch and separately approve each individual operation; sequence
 validation bypass requires an additional explicit permission. Discord server
 permissions can narrow that access but can never enable an operation that the
 N.I.N.A. profile has not approved. Asynchronous operations are reported as
-accepted, not completed, and later hardware failures are delivered to chat.
+accepted, not completed; later hardware failures reach chat only when their
+**Other N.I.N.A. events** category remains enabled.
 In local Discord-bot mode, only managers of the invoking Discord server can
 request approved operations unless an explicit user allowlist is configured;
 requests must come from the telescope's configured channel, and direct messages
@@ -49,7 +59,9 @@ never gain control authority.
 The plugin does not share the observatory's geographic location, derived local
 sky coordinates, or stable equipment identifiers by default. An owner can
 explicitly opt in to sharing the observatory location for that N.I.N.A. profile;
-equipment identifiers remain private. Review the hosted service's
+equipment identifiers remain private. Enabled images, notifications, target
+names, or log lines can still contain identifying details; review those choices
+before sharing. Review the hosted service's
 [privacy statement](https://chatstronomy.com/hub-privacy.html) and
 [terms of service](https://chatstronomy.com/hub-terms.html) before pairing.
 
