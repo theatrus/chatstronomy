@@ -51,16 +51,28 @@ numbers and strings with zero or empty sentinels. The additive
 `LocationRedacted: true` marker lets newer consumers omit those rows entirely.
 The existing `StatusCode: 202` response marks asynchronous commands as accepted
 rather than completed. Hardware-command failures become
-`CHATSTRONOMY-COMMAND-FAILED` events and remain visible even when ordinary
-event-family delivery is disabled.
+`CHATSTRONOMY-COMMAND-FAILED` events and are transmitted only when their event
+category is enabled in the N.I.N.A. profile.
 
 ## Event delivery and state
 
-The plugin attaches `ChatEnabled` to captured events, images, targets, and
-long-running sequence operations. The Rust updater always consumes those values
-for state reconstruction and deduplication, but posts only values enabled by the
-profile. This allows a user to suppress noisy messages without breaking target,
-wait, cooling, guider, or sequence state.
+Event-delivery settings are enforced before events leave N.I.N.A. Events from
+disabled categories are not sent to the local runtime or the hosted Hub; this
+includes previously captured events whose category has since been disabled.
+There is no state-reconstruction exception and command-failure events follow the
+same category settings as every other event. Log events are sent only when their
+individual log level is enabled.
+
+Disabling image delivery also returns an empty image history and blocks
+thumbnail retrieval, including explicit last-image requests. Images captured
+while delivery is disabled remain unavailable if delivery is later re-enabled.
+
+The Rust updater can reconstruct available state from permitted events and
+independent, allowed sequence or equipment snapshots requested on demand.
+Disabling an event family can reduce historical or intermediate target, wait,
+cooling, guider, or sequence details; the privacy boundary takes precedence over
+that additional state. Older peers that supply `ChatEnabled` continue to be
+accepted for Direct payload compatibility.
 
 Target Scheduler integration follows its N.I.N.A. message-broker topics and
 projects the active container's `Target.TargetName`, avoiding the generic
