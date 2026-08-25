@@ -31,7 +31,10 @@ impl MatrixChatService {
             .await
             .map_err(|e| ChatError::Initialization {
                 service_name: "Matrix".to_string(),
-                reason: format!("Failed to create Matrix client: {}", e),
+                reason: format!(
+                    "Failed to create Matrix client: {}",
+                    crate::security::redact_sensitive(&e.to_string())
+                ),
             })?;
 
         client
@@ -52,7 +55,10 @@ impl MatrixChatService {
                 println!("  - Joining room: {} ({})", room_name, room.room_id());
                 match room.join().await {
                     Ok(_) => println!("    ✅ Successfully joined"),
-                    Err(e) => println!("    ❌ Failed to join: {}", e),
+                    Err(e) => println!(
+                        "    ❌ Failed to join: {}",
+                        crate::security::redact_sensitive(&e.to_string())
+                    ),
                 }
             }
             client.sync_once(SyncSettings::default()).await?;
@@ -83,7 +89,10 @@ impl MatrixChatService {
             let client = client.clone();
             async move {
                 if let Err(e) = client.sync(SyncSettings::default()).await {
-                    eprintln!("Matrix sync error: {}", e);
+                    eprintln!(
+                        "Matrix sync error: {}",
+                        crate::security::redact_sensitive(&e.to_string())
+                    );
                 }
             }
         });

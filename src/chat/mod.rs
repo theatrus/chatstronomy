@@ -71,7 +71,7 @@ impl ChatMessage {
 /// When `discord_channel_id` is set, the Discord bot service takes precedence
 /// over webhook posting for this telescope — the webhook service defers via
 /// `can_route`, and the bot routes the message to the channel.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ChatTarget {
     pub discord_webhook_url: Option<String>,
     pub matrix_room_id: Option<String>,
@@ -80,6 +80,23 @@ pub struct ChatTarget {
     /// and cross-server destinations on the hub). The bot fans out to
     /// `discord_channel_id` plus all of these, deduplicated.
     pub discord_channel_ids: Vec<u64>,
+}
+
+impl std::fmt::Debug for ChatTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatTarget")
+            .field(
+                "discord_webhook_url",
+                &self
+                    .discord_webhook_url
+                    .as_deref()
+                    .map(crate::security::redact_sensitive),
+            )
+            .field("matrix_room_id", &self.matrix_room_id)
+            .field("discord_channel_id", &self.discord_channel_id)
+            .field("discord_channel_ids", &self.discord_channel_ids)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +120,51 @@ mod chat_target_tests {
         };
         assert_eq!(list_only.all_discord_channels(), vec![7]);
     }
+
+    #[test]
+    fn config_and_routing_debug_never_reveal_chat_credentials() {
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "chat": {
+                "discord": {
+                    "default_webhook_url": "https://discord.com/api/webhooks/42/shared-hook-secret"
+                },
+                "matrix": {
+                    "homeserver_url": "https://matrix.example/?access_token=matrix-url-secret",
+                    "username": "@chat:matrix.example",
+                    "password": "matrix-password-secret"
+                },
+                "discord_bot": {
+                    "token": "discord-bot-secret"
+                }
+            },
+            "telescopes": [{
+                "name": "North Rig",
+                "chat": {
+                    "discord_webhook_url": "https://discord.com/api/webhooks/43/override-hook-secret"
+                }
+            }]
+        }))
+        .unwrap();
+
+        let rendered = format!("{config:?}");
+        let target = format!("{:?}", config.telescopes[0].chat.to_chat_target());
+        for secret in [
+            "shared-hook-secret",
+            "matrix-url-secret",
+            "matrix-password-secret",
+            "discord-bot-secret",
+            "override-hook-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "config leaked {secret}: {rendered}"
+            );
+            assert!(!target.contains(secret), "target leaked {secret}: {target}");
+        }
+        assert!(rendered.contains("North Rig"));
+        assert!(rendered.contains("matrix.example"));
+        assert!(rendered.contains("[redacted]"));
+    }
 }
 
 impl ChatTarget {
@@ -120,7 +182,7 @@ impl ChatTarget {
 
 /// Shared Discord configuration. The webhook here is the fallback destination
 /// used when a telescope doesn't supply its own override.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct SharedDiscordConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -131,10 +193,25 @@ pub struct SharedDiscordConfig {
     pub default_webhook_url: Option<String>,
 }
 
+impl std::fmt::Debug for SharedDiscordConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedDiscordConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "default_webhook_url",
+                &self
+                    .default_webhook_url
+                    .as_deref()
+                    .map(crate::security::redact_sensitive),
+            )
+            .finish()
+    }
+}
+
 /// Shared Matrix configuration. The login is held once per process and reused
 /// across every telescope (each telescope can post to a different room via
 /// `ChatTarget::matrix_room_id`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SharedMatrixConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -145,6 +222,21 @@ pub struct SharedMatrixConfig {
     /// `default_room_id` (new) or `room_id` (legacy).
     #[serde(default, alias = "room_id")]
     pub default_room_id: Option<String>,
+}
+
+impl std::fmt::Debug for SharedMatrixConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedMatrixConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "homeserver_url",
+                &crate::security::redact_sensitive(&self.homeserver_url),
+            )
+            .field("username", &self.username)
+            .field("password", &crate::security::secret_marker(&self.password))
+            .field("default_room_id", &self.default_room_id)
+            .finish()
+    }
 }
 
 fn default_enabled() -> bool {
@@ -167,7 +259,7 @@ pub struct ChatConfig {
 /// Shared Discord bot configuration. One bot identity / token serves every
 /// telescope; each telescope can map to a different channel via
 /// `TelescopeChatOverrides::discord_channel_id`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DiscordBotConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -203,6 +295,21 @@ pub struct DiscordBotConfig {
     pub write_acl: Vec<u64>,
 }
 
+impl std::fmt::Debug for DiscordBotConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordBotConfig")
+            .field("enabled", &self.enabled)
+            .field("token", &crate::security::secret_marker(&self.token))
+            .field("application_id", &self.application_id)
+            .field("public_key", &self.public_key)
+            .field("default_channel_id", &self.default_channel_id)
+            .field("live_status", &self.live_status)
+            .field("state_file", &self.state_file)
+            .field("write_acl", &self.write_acl)
+            .finish()
+    }
+}
+
 fn default_state_file() -> String {
     "./chatstronomy-state.json".to_string()
 }
@@ -211,7 +318,7 @@ fn default_state_file() -> String {
 /// the shared default for that service for this telescope only. Setting
 /// `discord_channel_id` switches that telescope's Discord posts from the
 /// webhook path to the bot path.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct TelescopeChatOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discord_webhook_url: Option<String>,
@@ -221,6 +328,22 @@ pub struct TelescopeChatOverrides {
     /// channel; the webhook path is ignored for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discord_channel_id: Option<u64>,
+}
+
+impl std::fmt::Debug for TelescopeChatOverrides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelescopeChatOverrides")
+            .field(
+                "discord_webhook_url",
+                &self
+                    .discord_webhook_url
+                    .as_deref()
+                    .map(crate::security::redact_sensitive),
+            )
+            .field("matrix_room_id", &self.matrix_room_id)
+            .field("discord_channel_id", &self.discord_channel_id)
+            .finish()
+    }
 }
 
 impl TelescopeChatOverrides {

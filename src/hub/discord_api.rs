@@ -14,11 +14,17 @@ pub const OAUTH_SCOPES: &str = "identify email guilds";
 #[derive(Debug, thiserror::Error)]
 pub enum DiscordApiError {
     #[error("Discord request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] crate::security::SafeHttpError),
     #[error("Discord returned status {0}")]
     Status(reqwest::StatusCode),
     #[error("Discord returned an invalid snowflake '{0}'")]
     BadSnowflake(String),
+}
+
+impl From<reqwest::Error> for DiscordApiError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error.into())
+    }
 }
 
 /// Client for the OAuth dance. `base_url` is `https://discord.com` in
@@ -31,9 +37,20 @@ pub struct DiscordOauthClient {
     redirect_uri: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field(
+                "access_token",
+                &crate::security::secret_marker(&self.access_token),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +201,16 @@ impl DiscordOauthClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_token_debug_is_redacted_without_affecting_deserialization() {
+        let response: TokenResponse =
+            serde_json::from_str(r#"{"access_token":"discord-oauth-private"}"#).unwrap();
+        assert_eq!(response.access_token, "discord-oauth-private");
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("discord-oauth-private"));
+        assert!(debug.contains("[redacted]"));
+    }
 
     #[test]
     fn user_parses_with_email() {

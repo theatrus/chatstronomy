@@ -15,12 +15,29 @@ pub struct GuildSnapshot {
     pub is_owner: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionRow {
     pub session_id: String,
     pub csrf_token: String,
     pub discord_user_id: i64,
     pub expires_at: i64,
+}
+
+impl std::fmt::Debug for SessionRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionRow")
+            .field(
+                "session_id",
+                &crate::security::secret_marker(&self.session_id),
+            )
+            .field(
+                "csrf_token",
+                &crate::security::secret_marker(&self.csrf_token),
+            )
+            .field("discord_user_id", &self.discord_user_id)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +292,20 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_debug_never_exposes_session_or_csrf_secrets() {
+        let row = SessionRow {
+            session_id: "private-session-cookie".to_string(),
+            csrf_token: "private-csrf-token".to_string(),
+            discord_user_id: 42,
+            expires_at: 123,
+        };
+        let debug = format!("{row:?}");
+        assert!(!debug.contains("private-session-cookie"));
+        assert!(!debug.contains("private-csrf-token"));
+        assert!(debug.contains("discord_user_id: 42"));
+    }
 
     fn test_user(id: i64) -> UserRow {
         UserRow {
