@@ -505,7 +505,7 @@ async fn resolve_write_or_reply<'a>(
     }
 }
 
-/// One-page summary embed: target + mount + sequence + filter.
+/// Display a one-page status summary including target, mount, sequence, and filter.
 #[poise::command(slash_command)]
 async fn status(
     ctx: Context<'_>,
@@ -594,6 +594,7 @@ async fn status(
     Ok(())
 }
 
+/// Display the current imaging sequence details and the estimated meridian flip time.
 #[poise::command(slash_command)]
 async fn sequence(
     ctx: Context<'_>,
@@ -749,6 +750,7 @@ fn short_duration(duration: chrono::Duration) -> String {
     }
 }
 
+/// Display target coordinates and sequence details for the active target.
 #[poise::command(slash_command)]
 async fn target(
     ctx: Context<'_>,
@@ -809,6 +811,7 @@ async fn target(
     Ok(())
 }
 
+/// Display mount connection status, tracking state, and current coordinates.
 #[poise::command(slash_command)]
 async fn mount(
     ctx: Context<'_>,
@@ -850,6 +853,7 @@ async fn mount(
     Ok(())
 }
 
+/// Display the active optical filter and the list of available filters.
 #[poise::command(slash_command)]
 async fn filter(
     ctx: Context<'_>,
@@ -881,6 +885,7 @@ async fn filter(
     Ok(())
 }
 
+/// Display current focuser position, temperature, and last autofocus run stats.
 #[poise::command(slash_command)]
 async fn focus(
     ctx: Context<'_>,
@@ -925,6 +930,7 @@ async fn focus(
     Ok(())
 }
 
+/// Display guider connection status, tracking state, and real-time RMS error.
 #[poise::command(slash_command)]
 async fn guider(
     ctx: Context<'_>,
@@ -973,6 +979,7 @@ async fn guider(
     Ok(())
 }
 
+/// Display the recent event log history for the telescope.
 #[poise::command(slash_command)]
 async fn events(
     ctx: Context<'_>,
@@ -1003,6 +1010,7 @@ async fn events(
     Ok(())
 }
 
+/// Display the most recently captured image with exposure metadata.
 #[poise::command(slash_command, rename = "last-image")]
 async fn last_image(
     ctx: Context<'_>,
@@ -1160,7 +1168,7 @@ async fn run_command(
 
 // --- Non-destructive (ACL only) ---
 
-/// Unpark the mount.
+/// Unpark the mount to enable tracking and slewing.
 #[poise::command(slash_command)]
 async fn unpark(
     ctx: Context<'_>,
@@ -1174,7 +1182,7 @@ async fn unpark(
     run_command(ctx, &name, &client, "Unpark mount", RigCommand::UnparkMount).await
 }
 
-/// Send the mount to its home position.
+/// Send the mount to its designated home position.
 #[poise::command(slash_command)]
 async fn home(
     ctx: Context<'_>,
@@ -1188,8 +1196,7 @@ async fn home(
     run_command(ctx, &name, &client, "Home mount", RigCommand::HomeMount).await
 }
 
-/// Change the filter wheel position by filter name (resolved to id via
-/// Direct filter-wheel snapshot).
+/// Change the optical filter by name.
 #[poise::command(slash_command, rename = "change-filter")]
 async fn change_filter(
     ctx: Context<'_>,
@@ -1250,7 +1257,7 @@ async fn change_filter(
     .await
 }
 
-/// Start guiding (without calibration).
+/// Start guider tracking.
 #[poise::command(slash_command, rename = "guider-start")]
 async fn guider_start(
     ctx: Context<'_>,
@@ -1274,7 +1281,7 @@ async fn guider_start(
     .await
 }
 
-/// Stop guiding.
+/// Stop guider tracking.
 #[poise::command(slash_command, rename = "guider-stop")]
 async fn guider_stop(
     ctx: Context<'_>,
@@ -1288,7 +1295,7 @@ async fn guider_stop(
     run_command(ctx, &name, &client, "Stop guiding", RigCommand::StopGuiding).await
 }
 
-/// Cool the camera to a target temperature over `minutes` minutes.
+/// Cool the camera sensor to a specified target temperature.
 #[poise::command(slash_command)]
 async fn cool(
     ctx: Context<'_>,
@@ -1317,7 +1324,7 @@ async fn cool(
     .await
 }
 
-/// Warm the camera over `minutes` minutes.
+/// Warm the camera sensor over a specified duration.
 #[poise::command(slash_command)]
 async fn warm(
     ctx: Context<'_>,
@@ -1343,7 +1350,7 @@ async fn warm(
 
 // --- Destructive (ACL + button confirm) ---
 
-/// Trigger a NINA autofocus run, or cancel one with `cancel:true`.
+/// Trigger or cancel a NINA autofocus run.
 #[poise::command(slash_command)]
 async fn autofocus(
     ctx: Context<'_>,
@@ -1377,7 +1384,7 @@ async fn autofocus(
     .await
 }
 
-/// Park the mount (requires confirmation).
+/// Park the mount safely (requires confirmation).
 #[poise::command(slash_command)]
 async fn park(
     ctx: Context<'_>,
@@ -1416,7 +1423,7 @@ async fn abort_capture(
     .await
 }
 
-/// Stop the running sequence (requires confirmation).
+/// Stop the currently active imaging sequence (requires confirmation).
 #[poise::command(slash_command, rename = "stop-sequence")]
 async fn stop_sequence(
     ctx: Context<'_>,
@@ -1439,7 +1446,7 @@ async fn stop_sequence(
     .await
 }
 
-/// Start the loaded sequence (requires confirmation).
+/// Start the loaded imaging sequence (requires confirmation).
 #[poise::command(slash_command, rename = "start-sequence")]
 async fn start_sequence(
     ctx: Context<'_>,
