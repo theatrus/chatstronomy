@@ -29,6 +29,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum EventDetails {
     FilterWheelChange {
         #[serde(rename = "New")]
@@ -65,6 +66,24 @@ pub enum EventDetails {
         position: i32,
         #[serde(rename = "HFR")]
         hfr: f64,
+    },
+    /// A completed autofocus callback. The report timestamp is required to
+    /// keep this untagged arm distinct, while the other fields let newer
+    /// plugins identify the exact report without breaking older runtimes.
+    AutofocusFinished {
+        #[serde(rename = "ReportTimestamp")]
+        report_timestamp: String,
+        #[serde(rename = "Filter", default)]
+        filter: Option<String>,
+        #[serde(rename = "Position", default)]
+        position: Option<f64>,
+        #[serde(rename = "Temperature", default)]
+        temperature: Option<f64>,
+    },
+    /// Authoritative state from N.I.N.A.'s configured safety monitor.
+    SafetyChanged {
+        #[serde(rename = "IsSafe")]
+        is_safe: bool,
     },
     /// Rotator moved. Emitted for both ROTATOR-MOVED and
     /// ROTATOR-MOVED-MECHANICAL — both share `{From, To}` in degrees.
@@ -220,6 +239,72 @@ pub mod event_types {
     pub const CHATSTRONOMY_COMMAND_FAILED: &str = "CHATSTRONOMY-COMMAND-FAILED";
 }
 
+/// The local N.I.N.A. delivery switch that governs an event. Keeping this
+/// classification alongside the wire event names lets legacy payload-v3
+/// consumers treat `ChatEnabled: false` as a category revocation without
+/// inspecting or retaining the disabled event's details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EventDeliveryScope {
+    Images,
+    Autofocus,
+    Guiding,
+    Mount,
+    Sequence,
+    Safety,
+    TargetScheduler,
+    FilterFocuserRotator,
+    EquipmentConnections,
+    NinaNotifications,
+    NinaLogs,
+    Other,
+}
+
+pub(crate) fn event_delivery_scope(event: &str) -> EventDeliveryScope {
+    if event == event_types::NINA_NOTIFICATION {
+        return EventDeliveryScope::NinaNotifications;
+    }
+    if event == event_types::NINA_LOG {
+        return EventDeliveryScope::NinaLogs;
+    }
+    if event.starts_with("TS-") {
+        return EventDeliveryScope::TargetScheduler;
+    }
+    if event.starts_with("SEQUENCE-") {
+        return EventDeliveryScope::Sequence;
+    }
+    if event.starts_with("SAFETY-") {
+        return EventDeliveryScope::Safety;
+    }
+    if event.starts_with("IMAGE-") || event == event_types::API_CAPTURE_FINISHED {
+        return EventDeliveryScope::Images;
+    }
+    if event.starts_with("AUTOFOCUS-")
+        || event == event_types::ERROR_AF
+        || event == event_types::FOCUSER_USER_FOCUSED
+    {
+        return EventDeliveryScope::Autofocus;
+    }
+    if event.ends_with("-CONNECTED")
+        || event.ends_with("-DISCONNECTED")
+        || event == event_types::CAMERA_DOWNLOAD_TIMEOUT
+    {
+        return EventDeliveryScope::EquipmentConnections;
+    }
+    if event.starts_with("GUIDER-") {
+        return EventDeliveryScope::Guiding;
+    }
+    if event.starts_with("MOUNT-") || event == event_types::ERROR_PLATESOLVE {
+        return EventDeliveryScope::Mount;
+    }
+    if event.starts_with("FILTERWHEEL-")
+        || event.starts_with("ROTATOR-")
+        || event.starts_with("FOCUSER-")
+    {
+        return EventDeliveryScope::FilterFocuserRotator;
+    }
+    EventDeliveryScope::Other
+}
+
 impl EventHistoryResponse {
     /// Get all events of a specific type
     pub fn get_events_by_type(&self, event_type: &str) -> Vec<&Event> {
@@ -303,6 +388,49 @@ mod tests {
         assert_eq!(event.event, event_types::AUTOFOCUS_FINISHED);
         assert!(event.chat_enabled);
         assert!(event.details.is_none());
+    }
+
+    #[test]
+    fn native_autofocus_completion_details_parse_without_breaking_legacy_events() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-25T04:15:01Z",
+            "Event": "AUTOFOCUS-FINISHED",
+            "ChatEnabled": true,
+            "Filter": "L",
+            "Position": 4068.0,
+            "Temperature": -8.5,
+            "ReportTimestamp": "2026-08-25T04:15:00Z"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event.details,
+            Some(EventDetails::AutofocusFinished {
+                report_timestamp,
+                filter: Some(filter),
+                position: Some(position),
+                temperature: Some(temperature),
+            }) if report_timestamp == "2026-08-25T04:15:00Z"
+                && filter == "L"
+                && position == 4068.0
+                && temperature == -8.5
+        ));
+    }
+
+    #[test]
+    fn native_safety_state_details_parse() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-25T04:20:00Z",
+            "Event": "SAFETY-CHANGED",
+            "ChatEnabled": true,
+            "IsSafe": false
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event.details,
+            Some(EventDetails::SafetyChanged { is_safe: false })
+        ));
     }
 
     #[test]

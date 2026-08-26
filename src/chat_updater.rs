@@ -2,18 +2,24 @@ use crate::autofocus::AutofocusResponse;
 use crate::camera::CameraInfo;
 use crate::chat::{ChatAttachment, ChatField, ChatMessage, ChatServiceManager, ChatTarget};
 use crate::discord::colors;
-use crate::events::{Event, EventDetails, FilterInfo, TargetCoordinates, event_types};
+use crate::events::{
+    Event, EventDeliveryScope, EventDetails, FilterInfo, TargetCoordinates, event_delivery_scope,
+    event_types,
+};
 use crate::images::ImageMetadata;
 use crate::sequence::{
-    SequenceOperation, SequenceOperationKind, SequenceResponse, extract_current_target,
+    SequenceOperation, SequenceOperationKind, SequenceResponse,
     extract_current_target_with_delivery, extract_meridian_flip_time, extract_sequence_operations,
-    meridian_flip_time_formatted_with_clock,
+    extract_suppressed_sequence_operation_keys, meridian_flip_time_formatted_with_clock,
 };
-use crate::source::SharedRigSource;
+use crate::source::{RigSourceError, SharedRigSource};
 use chrono::{DateTime, FixedOffset, Local, NaiveDateTime, TimeZone, Utc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::hash_map::RandomState;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::time::Instant as TokioInstant;
 use tokio::time::sleep;
 
 /// Default first-retry wait when a telescope is unreachable at startup. A rig
@@ -29,6 +35,25 @@ pub(crate) const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(600);
 /// because the loop already backs off after the first failure, these cycles
 /// are spaced out (≈60s, then 120s, …), so a small count still means minutes.
 const OFFLINE_FAILURE_THRESHOLD: u32 = 3;
+
+/// Autofocus completion is a two-step Direct operation: N.I.N.A. first emits
+/// `AUTOFOCUS-FINISHED`, then Chatstronomy asks for the saved report used to
+/// render the graph. A brief transport or report-read failure must not consume
+/// the completion forever. Report reads are queued behind the normal poll
+/// cycle so they cannot contend with event, sequence, image, or status reads;
+/// only graph rendering and chat delivery run in an updater-owned task.
+const DEFAULT_AUTOFOCUS_RETRY: AutofocusRetryPolicy = AutofocusRetryPolicy {
+    max_attempts: 5,
+    initial_delay: Duration::from_secs(1),
+    max_delay: Duration::from_secs(8),
+};
+
+#[derive(Debug, Clone, Copy)]
+struct AutofocusRetryPolicy {
+    max_attempts: usize,
+    initial_delay: Duration,
+    max_delay: Duration,
+}
 
 /// Double `current`, capped at `max` — but never below `initial`, so a
 /// misconfigured `max < initial` can't shrink the wait. Shared by the startup
@@ -79,6 +104,10 @@ struct TrackedSequenceOperation {
     operation: SequenceOperation,
     started_at: DateTime<Utc>,
     estimated_end: Option<DateTime<Utc>>,
+    /// True only when `estimated_end` came from TS-WAITSTART rather than the
+    /// sequence item itself. A Target Scheduler privacy tombstone can then
+    /// revoke that projection without erasing intrinsic wait configuration.
+    estimated_end_from_target_scheduler: bool,
     initial_temperature: Option<f64>,
     camera: Option<CameraInfo>,
     last_milestone: u8,
@@ -106,11 +135,27 @@ impl TrackedSequenceOperation {
             operation,
             started_at: now,
             estimated_end,
+            estimated_end_from_target_scheduler: false,
             initial_temperature,
             camera,
             last_milestone: 0,
             last_output_key: None,
         }
+    }
+
+    fn restore_intrinsic_wait_estimate(&mut self) {
+        self.estimated_end = match &self.operation.kind {
+            SequenceOperationKind::TimeWait {
+                target_time: Some(target),
+                ..
+            } => Some(target.with_timezone(&Utc)),
+            SequenceOperationKind::TimeWait {
+                configured_duration: Some(duration),
+                ..
+            } => Some(self.started_at + *duration),
+            _ => None,
+        };
+        self.estimated_end_from_target_scheduler = false;
     }
 
     fn progress_percent(&self, now: DateTime<Utc>) -> Option<u8> {
@@ -147,6 +192,9 @@ impl TrackedSequenceOperation {
             SequenceOperationKind::MountSlew { .. } | SequenceOperationKind::MountCenter { .. } => {
                 None
             }
+            SequenceOperationKind::SafetyWait { .. }
+            | SequenceOperationKind::ConditionWait { .. }
+            | SequenceOperationKind::ManualWait => None,
         }
     }
 
@@ -158,7 +206,7 @@ impl TrackedSequenceOperation {
     }
 }
 
-fn plate_solve_output_key(operation: &SequenceOperation) -> Option<String> {
+fn plate_solve_output_key(hasher: &RandomState, operation: &SequenceOperation) -> Option<String> {
     let SequenceOperationKind::MountCenter {
         output: Some(output),
         ..
@@ -166,15 +214,16 @@ fn plate_solve_output_key(operation: &SequenceOperation) -> Option<String> {
     else {
         return None;
     };
-    output.solve_time.clone().or_else(|| {
-        Some(format!(
-            "{:?}:{:?}:{:?}:{:?}",
-            output.success,
-            output.position_angle,
-            output.separation_arcseconds,
-            output.thumbnail.as_ref().map(Vec::len)
+    Some(format!(
+        "p:{:016x}",
+        hasher.hash_one((
+            &output.solve_time,
+            output.success.map(|value| value as u8),
+            output.position_angle.map(f64::to_bits),
+            output.separation_arcseconds.map(f64::to_bits),
+            output.thumbnail.as_ref().map(Vec::len),
         ))
-    })
+    ))
 }
 
 fn promote_ambiguous_slew_to_center(operation: &mut SequenceOperation) -> bool {
@@ -199,16 +248,17 @@ enum OperationUpdate {
     Progress(u8),
     Output,
     Finished { attach_output: bool },
+    Ended { attach_output: bool },
     Failed { attach_output: bool },
 }
 
 /// Insert-only dedup set with a bounded memory footprint.
 ///
-/// The keys embed payload text — for `NINA-LOG` events, a whole log line — and
-/// a local updater lives for the entire N.I.N.A. session, so an unbounded set
-/// grows all night. Evicting the oldest key can at worst re-announce something
-/// older than the whole retained window, which the source histories have
-/// dropped long before.
+/// Enabled-event keys embed payload text — for `NINA-LOG` events, a whole log
+/// line — and a local updater lives for the entire N.I.N.A. session, so an
+/// unbounded set grows all night. Disabled records are never inserted.
+/// Evicting the oldest key can at worst re-announce something older than the
+/// whole retained window, which the source histories have dropped long before.
 /// Eviction is least-recently-*seen*, not insertion order: a key that is still
 /// present in the source history gets re-observed on every poll, and dropping
 /// it would re-announce an event the user has already been told about. Ordering
@@ -290,11 +340,20 @@ const SEEN_SET_CAPACITY: usize = 20_000;
 
 /// State management for the chat updater
 struct UpdaterState {
+    /// Per-updater keyed hasher for dedup identities. History keys must never
+    /// retain event details, target/filter labels, or camera names in memory.
+    dedup_hasher: RandomState,
     events_seen: BoundedSeenSet,
+    /// Privacy-policy tombstones from legacy payload-v3 peers. Keys contain
+    /// only the delivery scope and event timestamp, never disabled details.
+    disabled_event_tombstones: BoundedSeenSet,
     images_seen: BoundedSeenSet,
     current_target: Option<TargetInfo>,
     meridian_flip_time: Option<f64>,
-    sequence: Option<SequenceResponse>,
+    /// Only the chat-visible aggregate needed by sequence notifications. The
+    /// raw snapshot may contain legacy `ChatEnabled: false` nodes and is never
+    /// retained.
+    sequence_container_counts: Option<(usize, usize)>,
     last_image_time: Option<Instant>,
     skipped_images_count: u32,
     last_filter: Option<FilterInfo>,
@@ -331,11 +390,13 @@ struct UpdaterState {
 impl UpdaterState {
     fn new() -> Self {
         Self {
+            dedup_hasher: RandomState::new(),
             events_seen: BoundedSeenSet::new(SEEN_SET_CAPACITY),
+            disabled_event_tombstones: BoundedSeenSet::new(SEEN_SET_CAPACITY),
             images_seen: BoundedSeenSet::new(SEEN_SET_CAPACITY),
             current_target: None,
             meridian_flip_time: None,
-            sequence: None,
+            sequence_container_counts: None,
             last_image_time: None,
             skipped_images_count: 0,
             last_filter: None,
@@ -381,6 +442,7 @@ impl UpdaterState {
         let mut operations = self
             .sequence_operations
             .iter()
+            .filter(|(_, operation)| operation.operation.chat_enabled)
             .map(|(key, operation)| {
                 let bucket = match &operation.operation.kind {
                     SequenceOperationKind::TimeWait { .. } => format!(
@@ -411,6 +473,19 @@ impl UpdaterState {
                             .and_then(|output| output.solve_time.as_deref())
                             .unwrap_or("")
                     ),
+                    SequenceOperationKind::SafetyWait { is_safe, .. } => format!(
+                        "safety:{}",
+                        is_safe
+                            .map(|safe| if safe { "safe" } else { "unsafe" })
+                            .unwrap_or("disconnected")
+                    ),
+                    SequenceOperationKind::ConditionWait { wait_interval } => format!(
+                        "condition:{}",
+                        wait_interval
+                            .map(|duration| duration.num_seconds())
+                            .unwrap_or(-1)
+                    ),
+                    SequenceOperationKind::ManualWait => "manual".to_string(),
                 };
                 format!("{key}:{bucket}")
             })
@@ -429,20 +504,44 @@ impl UpdaterState {
         )
     }
 
-    fn event_key(event: &Event) -> String {
-        format!("{}|{}|{:?}", event.time, event.event, event.details)
+    fn event_key(&self, event: &Event) -> String {
+        format!(
+            "e:{:016x}",
+            self.dedup_hasher
+                .hash_one((&event.time, &event.event, format!("{:?}", event.details)))
+        )
     }
 
-    fn image_key(image: &ImageMetadata) -> String {
-        format!("{}|{}", image.date, image.camera_name)
+    fn image_key(&self, image: &ImageMetadata) -> String {
+        format!(
+            "i:{:016x}",
+            self.dedup_hasher.hash_one(format!("{image:?}"))
+        )
     }
 
     fn has_seen_event(&mut self, event: &Event) -> bool {
-        self.events_seen.check_and_insert(Self::event_key(event))
+        if !event.chat_enabled {
+            // Disabled compatibility records have no side effects. Treat them
+            // as consumed without retaining any of their wire contents.
+            return true;
+        }
+        let key = self.event_key(event);
+        self.events_seen.check_and_insert(key)
+    }
+
+    fn has_seen_disabled_event(&mut self, event: &Event) -> bool {
+        debug_assert!(!event.chat_enabled);
+        let key = format!(
+            "d:{:016x}",
+            self.dedup_hasher
+                .hash_one((&event.time, event_delivery_scope(&event.event)))
+        );
+        self.disabled_event_tombstones.check_and_insert(key)
     }
 
     fn has_seen_image(&mut self, image: &ImageMetadata) -> bool {
-        self.images_seen.check_and_insert(Self::image_key(image))
+        let key = self.image_key(image);
+        self.images_seen.check_and_insert(key)
     }
 }
 
@@ -468,6 +567,52 @@ pub struct ChatUpdater {
     /// restart on every deploy, rig reconnect, and config change, and it
     /// announces scope presence from the connection layer instead.
     announce_lifecycle: bool,
+    autofocus_retry: AutofocusRetryPolicy,
+    pending_autofocus_deliveries: Vec<PendingAutofocusDelivery>,
+    /// Initialization is retried stream-by-stream. Once event history has
+    /// established its baseline, every later event response is a live delta
+    /// even if another capability (such as image history) is still offline.
+    event_baseline_complete: bool,
+}
+
+struct PendingAutofocusDelivery {
+    event_time: String,
+    report_timestamp: Option<String>,
+    attempts: usize,
+    next_attempt_at: TokioInstant,
+    retry_delay: Duration,
+    retry: AutofocusRetryPolicy,
+}
+
+struct AutofocusNotificationTask {
+    chat_manager: Arc<ChatServiceManager>,
+    chat_target: ChatTarget,
+    telescope_name: String,
+    autofocus_data: AutofocusResponse,
+}
+
+fn sequence_container_counts(sequence: &SequenceResponse) -> (usize, usize) {
+    let containers = sequence.get_containers();
+    let running = containers
+        .iter()
+        .filter(|container| container.status.eq_ignore_ascii_case("RUNNING"))
+        .count();
+    (containers.len(), running)
+}
+
+impl AutofocusNotificationTask {
+    async fn run(self) {
+        ChatUpdater::display_autofocus_results(&self.autofocus_data);
+        if self.chat_manager.service_count() > 0 {
+            ChatUpdater::send_autofocus_notification_to(
+                &self.chat_manager,
+                &self.chat_target,
+                &self.telescope_name,
+                &self.autofocus_data,
+            )
+            .await;
+        }
+    }
 }
 
 impl ChatUpdater {
@@ -487,6 +632,9 @@ impl ChatUpdater {
             reconnect_max: DEFAULT_RECONNECT_MAX,
             telescope_name,
             announce_lifecycle: true,
+            autofocus_retry: DEFAULT_AUTOFOCUS_RETRY,
+            pending_autofocus_deliveries: Vec::new(),
+            event_baseline_complete: false,
         }
     }
 
@@ -580,8 +728,10 @@ impl ChatUpdater {
             if reachable {
                 self.refresh_status_message().await;
                 reconnect_delay = self.reconnect_initial;
+                self.poll_autofocus_delivery().await;
                 sleep(poll_interval).await;
             } else {
+                self.poll_autofocus_delivery().await;
                 sleep(reconnect_delay).await;
                 reconnect_delay = self.next_reconnect_delay(reconnect_delay);
             }
@@ -746,6 +896,7 @@ impl ChatUpdater {
     async fn reconcile_sequence_operations(
         &mut self,
         operations: Vec<SequenceOperation>,
+        suppressed_operation_keys: HashSet<String>,
         camera: Option<CameraInfo>,
         announce: bool,
     ) {
@@ -759,6 +910,7 @@ impl ChatUpdater {
         }
         let mut incoming = operations
             .into_iter()
+            .filter(|operation| !suppressed_operation_keys.contains(&operation.key))
             .map(|mut operation| {
                 // Once a recent MOUNT-CENTER event has identified an
                 // legacy coordinate item, retain that classification
@@ -809,6 +961,15 @@ impl ChatUpdater {
             .cloned()
             .collect::<Vec<_>>();
         for key in existing_keys {
+            if suppressed_operation_keys.contains(&key) {
+                if let Some(previous) = self.state.sequence_operations.remove(&key) {
+                    sequence_wait_ended |= matches!(
+                        previous.operation.kind,
+                        SequenceOperationKind::TimeWait { .. }
+                    );
+                }
+                continue;
+            }
             let Some(next) = incoming.get(&key) else {
                 if let Some(mut previous) = self.state.sequence_operations.remove(&key) {
                     if matches!(
@@ -823,7 +984,7 @@ impl ChatUpdater {
                     );
                     notifications.push((
                         previous,
-                        OperationUpdate::Finished {
+                        OperationUpdate::Ended {
                             attach_output: false,
                         },
                     ));
@@ -853,7 +1014,7 @@ impl ChatUpdater {
                     );
                     notifications.push((
                         previous,
-                        OperationUpdate::Finished {
+                        OperationUpdate::Ended {
                             attach_output: false,
                         },
                     ));
@@ -875,7 +1036,7 @@ impl ChatUpdater {
                         previous.operation.kind,
                         SequenceOperationKind::TimeWait { .. }
                     );
-                    let output_key = plate_solve_output_key(next);
+                    let output_key = plate_solve_output_key(&self.state.dedup_hasher, next);
                     let attach_output = claim_plate_solve_output(
                         &mut self.state.plate_solve_outputs_seen,
                         next.chat_enabled,
@@ -887,8 +1048,10 @@ impl ChatUpdater {
                         previous,
                         if next.is_failed() {
                             OperationUpdate::Failed { attach_output }
-                        } else {
+                        } else if next.is_finished() {
                             OperationUpdate::Finished { attach_output }
+                        } else {
+                            OperationUpdate::Ended { attach_output }
                         },
                     ));
                 }
@@ -914,19 +1077,24 @@ impl ChatUpdater {
                 } = &tracked.operation.kind
                 {
                     tracked.estimated_end = Some(target.with_timezone(&Utc));
+                    tracked.estimated_end_from_target_scheduler = false;
                 } else if matches!(
                     tracked.operation.kind,
                     SequenceOperationKind::TimeWait { .. }
-                ) && event_wait_end.is_some()
-                {
-                    tracked.estimated_end = event_wait_end;
+                ) {
+                    tracked.restore_intrinsic_wait_estimate();
+                    if event_wait_end.is_some() {
+                        tracked.estimated_end = event_wait_end;
+                        tracked.estimated_end_from_target_scheduler = true;
+                    }
                 }
 
                 if let Some(milestone) = tracked.next_milestone(now) {
                     tracked.last_milestone = milestone;
                     notifications.push((tracked.clone(), OperationUpdate::Progress(milestone)));
                 }
-                let output_key = plate_solve_output_key(&tracked.operation);
+                let output_key =
+                    plate_solve_output_key(&self.state.dedup_hasher, &tracked.operation);
                 if output_key.is_some() && output_key != tracked.last_output_key {
                     tracked.last_output_key = output_key.clone();
                     if claim_plate_solve_output(
@@ -956,6 +1124,7 @@ impl ChatUpdater {
             ) && event_wait_end.is_some()
             {
                 tracked.estimated_end = event_wait_end;
+                tracked.estimated_end_from_target_scheduler = true;
             }
             if !announce {
                 tracked.last_milestone = tracked
@@ -963,7 +1132,7 @@ impl ChatUpdater {
                     .map(completed_milestone)
                     .unwrap_or(0);
             }
-            let output_key = plate_solve_output_key(&tracked.operation);
+            let output_key = plate_solve_output_key(&self.state.dedup_hasher, &tracked.operation);
             let output_is_new = claim_plate_solve_output(
                 &mut self.state.plate_solve_outputs_seen,
                 tracked.operation.chat_enabled,
@@ -1019,6 +1188,9 @@ impl ChatUpdater {
             (SequenceOperationKind::CameraCooling { .. }, OperationUpdate::Finished { .. }) => {
                 ("Camera cooling", "✅ Camera cooling finished")
             }
+            (SequenceOperationKind::CameraCooling { .. }, OperationUpdate::Ended { .. }) => {
+                ("Camera cooling", "Camera cooling ended")
+            }
             (SequenceOperationKind::CameraCooling { .. }, OperationUpdate::Failed { .. }) => {
                 ("Camera cooling", "❌ Camera cooling failed")
             }
@@ -1031,14 +1203,56 @@ impl ChatUpdater {
             (SequenceOperationKind::TimeWait { .. }, OperationUpdate::Finished { .. }) => {
                 ("Timed wait", "✅ Timed wait finished")
             }
+            (SequenceOperationKind::TimeWait { .. }, OperationUpdate::Ended { .. }) => {
+                ("Timed wait", "Timed wait ended")
+            }
             (SequenceOperationKind::TimeWait { .. }, OperationUpdate::Failed { .. }) => {
                 ("Timed wait", "❌ Timed wait failed")
+            }
+            (SequenceOperationKind::SafetyWait { .. }, OperationUpdate::Started) => {
+                ("Safety wait", "🛡️ Waiting for safe conditions")
+            }
+            (SequenceOperationKind::SafetyWait { .. }, OperationUpdate::Finished { .. }) => {
+                ("Safety wait", "✅ Safe conditions reached")
+            }
+            (SequenceOperationKind::SafetyWait { .. }, OperationUpdate::Ended { .. }) => {
+                ("Safety wait", "Safety wait ended")
+            }
+            (SequenceOperationKind::SafetyWait { .. }, OperationUpdate::Failed { .. }) => {
+                ("Safety wait", "❌ Safety wait failed")
+            }
+            (SequenceOperationKind::ConditionWait { .. }, OperationUpdate::Started) => {
+                ("Condition wait", "⏳ Waiting for a sequence condition")
+            }
+            (SequenceOperationKind::ConditionWait { .. }, OperationUpdate::Finished { .. }) => {
+                ("Condition wait", "✅ Sequence condition reached")
+            }
+            (SequenceOperationKind::ConditionWait { .. }, OperationUpdate::Ended { .. }) => {
+                ("Condition wait", "Sequence condition wait ended")
+            }
+            (SequenceOperationKind::ConditionWait { .. }, OperationUpdate::Failed { .. }) => {
+                ("Condition wait", "❌ Sequence condition wait failed")
+            }
+            (SequenceOperationKind::ManualWait, OperationUpdate::Started) => {
+                ("Manual wait", "⏸️ Waiting for manual sequence resume")
+            }
+            (SequenceOperationKind::ManualWait, OperationUpdate::Finished { .. }) => {
+                ("Manual wait", "▶️ Sequence manually resumed")
+            }
+            (SequenceOperationKind::ManualWait, OperationUpdate::Ended { .. }) => {
+                ("Manual wait", "Manual sequence wait ended")
+            }
+            (SequenceOperationKind::ManualWait, OperationUpdate::Failed { .. }) => {
+                ("Manual wait", "❌ Manual sequence wait failed")
             }
             (SequenceOperationKind::MountSlew { .. }, OperationUpdate::Started) => {
                 ("Mount slew", "🔭 Mount slew started")
             }
             (SequenceOperationKind::MountSlew { .. }, OperationUpdate::Finished { .. }) => {
                 ("Mount slew", "✅ Mount slew finished")
+            }
+            (SequenceOperationKind::MountSlew { .. }, OperationUpdate::Ended { .. }) => {
+                ("Mount slew", "Mount slew ended")
             }
             (SequenceOperationKind::MountSlew { .. }, OperationUpdate::Failed { .. }) => {
                 ("Mount slew", "❌ Mount slew failed")
@@ -1052,6 +1266,9 @@ impl ChatUpdater {
             (SequenceOperationKind::MountCenter { .. }, OperationUpdate::Finished { .. }) => {
                 ("Center", "✅ Centering finished")
             }
+            (SequenceOperationKind::MountCenter { .. }, OperationUpdate::Ended { .. }) => {
+                ("Center", "Centering ended")
+            }
             (SequenceOperationKind::MountCenter { .. }, OperationUpdate::Failed { .. }) => {
                 ("Center", "❌ Centering failed")
             }
@@ -1059,12 +1276,19 @@ impl ChatUpdater {
             | (SequenceOperationKind::MountSlew { .. }, OperationUpdate::Output)
             | (SequenceOperationKind::MountCenter { .. }, OperationUpdate::Progress(_))
             | (SequenceOperationKind::CameraCooling { .. }, OperationUpdate::Output)
-            | (SequenceOperationKind::TimeWait { .. }, OperationUpdate::Output) => {
+            | (SequenceOperationKind::TimeWait { .. }, OperationUpdate::Output)
+            | (SequenceOperationKind::SafetyWait { .. }, OperationUpdate::Progress(_))
+            | (SequenceOperationKind::SafetyWait { .. }, OperationUpdate::Output)
+            | (SequenceOperationKind::ConditionWait { .. }, OperationUpdate::Progress(_))
+            | (SequenceOperationKind::ConditionWait { .. }, OperationUpdate::Output)
+            | (SequenceOperationKind::ManualWait, OperationUpdate::Progress(_))
+            | (SequenceOperationKind::ManualWait, OperationUpdate::Output) => {
                 ("Sequence operation", "Sequence operation update")
             }
         };
         let color = match update {
             OperationUpdate::Finished { .. } => colors::GREEN,
+            OperationUpdate::Ended { .. } => colors::GRAY,
             OperationUpdate::Failed { .. } => colors::RED,
             OperationUpdate::Output => match &tracked.operation.kind {
                 SequenceOperationKind::MountCenter {
@@ -1127,6 +1351,26 @@ impl ChatUpdater {
                         .field("Remaining", &format_duration(remaining), true);
                 }
             }
+            SequenceOperationKind::SafetyWait {
+                is_safe,
+                wait_interval,
+            } => {
+                let state = match is_safe {
+                    Some(true) => "Safe",
+                    Some(false) => "Unsafe",
+                    None => "Monitor disconnected",
+                };
+                message = message.field("Safety monitor", state, true);
+                if let Some(interval) = wait_interval {
+                    message = message.field("Check interval", &format_duration(*interval), true);
+                }
+            }
+            SequenceOperationKind::ConditionWait { wait_interval } => {
+                if let Some(interval) = wait_interval {
+                    message = message.field("Check interval", &format_duration(*interval), true);
+                }
+            }
+            SequenceOperationKind::ManualWait => {}
             SequenceOperationKind::MountSlew { coordinates, .. } => {
                 if let Some(coordinates) = coordinates {
                     message = message.field("Destination", &coordinates.display(), false);
@@ -1210,6 +1454,8 @@ impl ChatUpdater {
                 update,
                 OperationUpdate::Finished {
                     attach_output: true
+                } | OperationUpdate::Ended {
+                    attach_output: true
                 } | OperationUpdate::Failed {
                     attach_output: true
                 }
@@ -1252,7 +1498,12 @@ impl ChatUpdater {
         // Load events and find latest TS-TARGETSTART
         if capabilities.event_history {
             let events = self.source.get_event_history().await?;
-            self.process_baseline_events(&events.response);
+            if self.event_baseline_complete {
+                self.process_live_events(events.response).await;
+            } else {
+                self.process_baseline_events(&events.response);
+                self.event_baseline_complete = true;
+            }
         }
 
         // Load sequence to get meridian flip time and potential sequence target
@@ -1261,24 +1512,25 @@ impl ChatUpdater {
                 Ok(sequence) => {
                     self.state.meridian_flip_time = extract_meridian_flip_time(&sequence);
                     let operations = extract_sequence_operations(&sequence);
+                    let suppressed_operation_keys =
+                        extract_suppressed_sequence_operation_keys(&sequence);
                     let camera = self.camera_snapshot_for(&operations).await;
-                    self.reconcile_sequence_operations(operations, camera, false)
-                        .await;
+                    self.reconcile_sequence_operations(
+                        operations,
+                        suppressed_operation_keys,
+                        camera,
+                        false,
+                    )
+                    .await;
 
-                    // Only use sequence target if no TS-TARGETSTART target was found
-                    if self.state.current_target.is_none()
-                        && let Some(target_name) = extract_current_target(&sequence)
-                    {
-                        self.state.current_target = Some(TargetInfo {
-                            name: target_name,
-                            source: TargetSource::Sequence,
-                            coordinates: None,
-                            project: None,
-                            rotation: None,
-                        });
-                    }
+                    // Apply both an enabled identity and an explicit local
+                    // revocation before formatting startup status or welcome
+                    // output. The latter must clear any historical Target
+                    // Scheduler event reconstructed above.
+                    self.reconcile_sequence_target(extract_current_target_with_delivery(&sequence));
 
-                    self.state.sequence = Some(sequence);
+                    self.state.sequence_container_counts =
+                        Some(sequence_container_counts(&sequence));
                 }
                 Err(e) => {
                     println!("[{n}] Could not load sequence during initialization: {e}");
@@ -1289,10 +1541,18 @@ impl ChatUpdater {
         // Load images
         if capabilities.image_history {
             let images = self.source.get_all_image_history().await?;
-            for image in &images.response {
-                self.state
-                    .images_seen
-                    .insert(UpdaterState::image_key(image));
+            let privacy_boundary = images
+                .response
+                .iter()
+                .rposition(|image| !image.chat_enabled);
+            for (index, image) in images.response.iter().enumerate() {
+                if privacy_boundary.is_some_and(|boundary| index < boundary) {
+                    continue;
+                }
+                if image.chat_enabled {
+                    let key = self.state.image_key(image);
+                    self.state.images_seen.insert(key);
+                }
             }
         }
 
@@ -1325,10 +1585,109 @@ impl ChatUpdater {
         Ok(())
     }
 
+    /// Apply a legacy payload-v3 privacy tombstone without ever reading its
+    /// details. New plugin sessions omit disabled records entirely, but an
+    /// older peer can retain an enabled value followed by a disabled marker;
+    /// the marker must revoke that category's reconstructed state rather than
+    /// allowing the older value to remain visible.
+    fn revoke_state_for_disabled_event(&mut self, event_type: &str) {
+        match event_delivery_scope(event_type) {
+            EventDeliveryScope::TargetScheduler => {
+                self.state.current_target = None;
+                self.state.wait_until = None;
+                for tracked in self.state.sequence_operations.values_mut() {
+                    if tracked.estimated_end_from_target_scheduler {
+                        tracked.restore_intrinsic_wait_estimate();
+                    }
+                }
+            }
+            EventDeliveryScope::FilterFocuserRotator => {
+                self.state.last_filter = None;
+            }
+            EventDeliveryScope::Mount => {
+                self.state.last_mount_event = None;
+                self.state.center_event_seen_at = None;
+                self.state.meridian_flip_time = None;
+                self.state.sequence_operations.retain(|_, tracked| {
+                    !matches!(
+                        tracked.operation.kind,
+                        SequenceOperationKind::MountSlew { .. }
+                            | SequenceOperationKind::MountCenter { .. }
+                    )
+                });
+            }
+            EventDeliveryScope::Guiding => {
+                self.state.last_guider_event = None;
+            }
+            EventDeliveryScope::Sequence => {
+                self.state.sequence_running = false;
+                self.state.wait_until = None;
+                self.state.sequence_container_counts = None;
+                self.state.sequence_operations.retain(|_, tracked| {
+                    matches!(
+                        tracked.operation.kind,
+                        SequenceOperationKind::MountSlew { .. }
+                            | SequenceOperationKind::MountCenter { .. }
+                    )
+                });
+            }
+            EventDeliveryScope::Safety => {
+                self.state.sequence_operations.retain(|_, tracked| {
+                    !matches!(
+                        tracked.operation.kind,
+                        SequenceOperationKind::SafetyWait { .. }
+                    )
+                });
+            }
+            EventDeliveryScope::Autofocus => {
+                self.pending_autofocus_deliveries.clear();
+            }
+            EventDeliveryScope::Images => {
+                self.state.last_image_time = None;
+                self.state.skipped_images_count = 0;
+            }
+            EventDeliveryScope::EquipmentConnections
+            | EventDeliveryScope::NinaNotifications
+            | EventDeliveryScope::NinaLogs
+            | EventDeliveryScope::Other => {}
+        }
+        self.state.last_status_fingerprint = None;
+    }
+
     fn process_baseline_events(&mut self, events: &[Event]) {
         let mut latest_ts_target: Option<(String, TargetInfo)> = None;
+        let mut privacy_boundaries = HashMap::new();
+        for (index, event) in events.iter().enumerate() {
+            if !event.chat_enabled {
+                privacy_boundaries.insert(event_delivery_scope(&event.event), index);
+            }
+        }
 
-        for event in events {
+        for (index, event) in events.iter().enumerate() {
+            let scope = event_delivery_scope(&event.event);
+            if event.chat_enabled
+                && privacy_boundaries
+                    .get(&scope)
+                    .is_some_and(|boundary| index < *boundary)
+            {
+                continue;
+            }
+            if !event.chat_enabled {
+                // Mixed payload-v3 peers may still carry details on an event
+                // whose local N.I.N.A. category is disabled. Retain only a
+                // detail-free policy tombstone and revoke prior category
+                // state; none of the event details may reconstruct status.
+                self.state.has_seen_disabled_event(event);
+                if scope == EventDeliveryScope::TargetScheduler {
+                    latest_ts_target = None;
+                }
+                // Baseline initialization can be retried after a later query
+                // fails. Reapply every tombstone on every attempt so enabled
+                // history earlier in this same pass cannot resurrect state.
+                self.revoke_state_for_disabled_event(&event.event);
+                continue;
+            }
+
             // Skip redundant filterwheel events
             if event.event == event_types::FILTERWHEEL_CHANGED
                 && let Some(EventDetails::FilterWheelChange { new, previous }) = &event.details
@@ -1348,14 +1707,16 @@ impl ChatUpdater {
             }
 
             // Track TS-TARGETSTART events
-            if event.event == event_types::TS_TARGETSTART
-                && let Some(EventDetails::TargetStart {
-                    target_name,
-                    coordinates,
-                    project_name,
-                    rotation,
-                    ..
-                }) = &event.details
+            if matches!(
+                event.event.as_str(),
+                event_types::TS_TARGETSTART | event_types::TS_NEWTARGETSTART
+            ) && let Some(EventDetails::TargetStart {
+                target_name,
+                coordinates,
+                project_name,
+                rotation,
+                ..
+            }) = &event.details
                 && target_name != "Sequential Instruction Set"
             {
                 let target_info = TargetInfo {
@@ -1395,7 +1756,7 @@ impl ChatUpdater {
                 event_types::SEQUENCE_FINISHED => self.state.sequence_running = false,
                 event_types::TS_WAITSTART => {
                     if let Some(EventDetails::WaitStart { wait_end_time }) = &event.details
-                        && let Ok(parsed) = DateTime::parse_from_rfc3339(wait_end_time)
+                        && let Some(parsed) = parse_nina_timestamp(wait_end_time)
                     {
                         self.state.wait_until = Some(parsed);
                     }
@@ -1403,9 +1764,8 @@ impl ChatUpdater {
                 _ => {}
             }
 
-            self.state
-                .events_seen
-                .insert(UpdaterState::event_key(event));
+            let key = self.state.event_key(event);
+            self.state.events_seen.insert(key);
         }
 
         // If the recorded wait has already elapsed, clear it.
@@ -1429,19 +1789,7 @@ impl ChatUpdater {
         }
         match self.source.get_event_history().await {
             Ok(events) => {
-                for event in events.response {
-                    if !self.should_process_event(&event) {
-                        continue;
-                    }
-
-                    if !self.state.has_seen_event(&event) {
-                        self.print_new_event(&event);
-                        self.handle_event(&event).await;
-                    }
-                }
-                if self.state.wait_until.is_some_and(|end| Utc::now() >= end) {
-                    self.state.wait_until = None;
-                }
+                self.process_live_events(events.response).await;
                 true
             }
             Err(e) => {
@@ -1451,7 +1799,48 @@ impl ChatUpdater {
         }
     }
 
+    async fn process_live_events(&mut self, events: Vec<Event>) {
+        let mut privacy_boundaries = HashMap::new();
+        for (index, event) in events.iter().enumerate() {
+            if !event.chat_enabled {
+                privacy_boundaries.insert(event_delivery_scope(&event.event), index);
+            }
+        }
+        for (index, event) in events.into_iter().enumerate() {
+            let scope = event_delivery_scope(&event.event);
+            if event.chat_enabled
+                && privacy_boundaries
+                    .get(&scope)
+                    .is_some_and(|boundary| index < *boundary)
+            {
+                continue;
+            }
+            if !self.should_process_event(&event) {
+                continue;
+            }
+
+            if !event.chat_enabled {
+                if !self.state.has_seen_disabled_event(&event) {
+                    self.revoke_state_for_disabled_event(&event.event);
+                }
+                continue;
+            }
+
+            if !self.state.has_seen_event(&event) {
+                self.print_new_event(&event);
+                self.handle_event(&event).await;
+            }
+        }
+        if self.state.wait_until.is_some_and(|end| Utc::now() >= end) {
+            self.state.wait_until = None;
+        }
+    }
+
     fn should_process_event(&self, event: &Event) -> bool {
+        if !event.chat_enabled {
+            return true;
+        }
+
         // Skip redundant filterwheel events, but only when both filters are
         // known — empty/unknown payloads need to be enriched, not dropped.
         if event.event == event_types::FILTERWHEEL_CHANGED
@@ -1465,6 +1854,13 @@ impl ChatUpdater {
     }
 
     async fn handle_event(&mut self, event: &Event) {
+        if !event.chat_enabled {
+            if !self.state.has_seen_disabled_event(event) {
+                self.revoke_state_for_disabled_event(&event.event);
+            }
+            return;
+        }
+
         match event.event.as_str() {
             event_types::MOUNT_PARKED
             | event_types::MOUNT_UNPARKED
@@ -1502,10 +1898,6 @@ impl ChatUpdater {
                 return;
             }
             _ => {}
-        }
-
-        if !event.chat_enabled {
-            return;
         }
 
         match event.event.as_str() {
@@ -1614,6 +2006,14 @@ impl ChatUpdater {
     }
 
     async fn handle_ts_targetstart(&mut self, event: &Event) {
+        // `ChatEnabled` is a local N.I.N.A. transmission boundary. Current
+        // plugins filter disabled Target Scheduler events before they cross
+        // Direct, but older payload-v3 peers can still include the flag and
+        // target details. Never retain those details in status state.
+        if !event.chat_enabled {
+            return;
+        }
+
         if let Some(EventDetails::TargetStart {
             target_name,
             coordinates,
@@ -1656,20 +2056,114 @@ impl ChatUpdater {
         }
     }
 
-    async fn handle_autofocus_finished(&self, event: &Event) {
+    async fn handle_autofocus_finished(&mut self, event: &Event) {
         println!("[AUTOFOCUS FINISHED] {}", event.time);
-        println!("Fetching autofocus results...");
+        println!("Queued autofocus results for delivery after the poll cycle.");
 
-        match self.source.get_last_autofocus().await {
-            Ok(autofocus_data) => {
-                self.display_autofocus_results(&autofocus_data);
+        let report_timestamp = match &event.details {
+            Some(EventDetails::AutofocusFinished {
+                report_timestamp, ..
+            }) => Some(report_timestamp.clone()),
+            _ => None,
+        };
+        self.pending_autofocus_deliveries
+            .push(PendingAutofocusDelivery {
+                event_time: event.time.clone(),
+                report_timestamp,
+                attempts: 0,
+                next_attempt_at: TokioInstant::now(),
+                retry_delay: self.autofocus_retry.initial_delay,
+                retry: self.autofocus_retry,
+            });
+    }
 
-                if self.chat_manager.service_count() > 0 {
-                    self.send_autofocus_notification(&autofocus_data).await;
-                }
-            }
-            Err(e) => eprintln!("Failed to fetch autofocus data: {e}"),
+    /// Run at most one due report read after the regular source poll cycle.
+    /// Keeping the read on the updater task avoids racing the serialized local
+    /// Direct pipe, while the potentially slower graph/chat work remains in an
+    /// updater-owned task that is aborted when this updater is dropped.
+    async fn poll_autofocus_delivery(&mut self) {
+        let now = TokioInstant::now();
+        let Some(index) = self
+            .pending_autofocus_deliveries
+            .iter()
+            .rposition(|delivery| delivery.next_attempt_at <= now)
+        else {
+            return;
+        };
+        let mut delivery = self.pending_autofocus_deliveries.remove(index);
+        let result = self.source.get_last_autofocus().await;
+        if let Err(RigSourceError::Unavailable { reason, .. }) = &result {
+            // A transport outage says nothing about whether N.I.N.A. has
+            // finished publishing this report. Preserve the attempt budget
+            // and resume after the updater's source can answer again.
+            let delay = delivery.retry.initial_delay.max(Duration::from_millis(1));
+            eprintln!(
+                "[{}] Autofocus report for {} is paused while N.I.N.A. is unavailable: {reason}; retrying in {delay:?}",
+                self.telescope_name, delivery.event_time
+            );
+            delivery.next_attempt_at = TokioInstant::now() + delay;
+            self.pending_autofocus_deliveries.push(delivery);
+            return;
         }
+
+        delivery.attempts += 1;
+        match result {
+            Ok(autofocus_data)
+                if autofocus_report_matches(
+                    delivery.report_timestamp.as_deref(),
+                    &autofocus_data.response.timestamp,
+                ) =>
+            {
+                // Keep graph rendering and delivery inside the updater task.
+                // Awaiting the updater handle is then a complete cancellation
+                // barrier for route removal or consent revocation: no detached
+                // child can post after that barrier returns.
+                AutofocusNotificationTask {
+                    chat_manager: self.chat_manager.clone(),
+                    chat_target: self.chat_target.clone(),
+                    telescope_name: self.telescope_name.clone(),
+                    autofocus_data,
+                }
+                .run()
+                .await;
+            }
+            Ok(autofocus_data) => {
+                let expected = delivery
+                    .report_timestamp
+                    .as_deref()
+                    .unwrap_or("(legacy event)");
+                let reason = format!(
+                    "received report {} instead of {expected}",
+                    autofocus_data.response.timestamp
+                );
+                self.retry_autofocus_delivery(delivery, &reason);
+            }
+            Err(error) => self.retry_autofocus_delivery(delivery, &error.to_string()),
+        }
+    }
+
+    fn retry_autofocus_delivery(&mut self, mut delivery: PendingAutofocusDelivery, reason: &str) {
+        let attempts = delivery.retry.max_attempts.max(1);
+        if delivery.attempts >= attempts {
+            eprintln!(
+                "[{}] Failed to fetch autofocus report for {} after {attempts} attempts: {reason}",
+                self.telescope_name, delivery.event_time
+            );
+            return;
+        }
+
+        let delay = delivery.retry_delay;
+        eprintln!(
+            "[{}] Autofocus report for {} was not available on attempt {}/{attempts}: {reason}; retrying in {delay:?}",
+            self.telescope_name, delivery.event_time, delivery.attempts
+        );
+        delivery.next_attempt_at = TokioInstant::now() + delay;
+        delivery.retry_delay = backoff_delay(
+            delay,
+            delivery.retry.initial_delay,
+            delivery.retry.max_delay,
+        );
+        self.pending_autofocus_deliveries.push(delivery);
     }
 
     async fn handle_mount_event(&self, event: &Event) {
@@ -1735,59 +2229,87 @@ impl ChatUpdater {
                 let new_sequence_target = extract_current_target_with_delivery(&sequence);
                 let new_meridian_flip_time = extract_meridian_flip_time(&sequence);
                 let operations = extract_sequence_operations(&sequence);
+                let suppressed_operation_keys =
+                    extract_suppressed_sequence_operation_keys(&sequence);
                 let camera = self.camera_snapshot_for(&operations).await;
-                self.reconcile_sequence_operations(operations, camera, true)
-                    .await;
+                self.reconcile_sequence_operations(
+                    operations,
+                    suppressed_operation_keys,
+                    camera,
+                    true,
+                )
+                .await;
 
                 self.state.meridian_flip_time = new_meridian_flip_time;
-                self.state.sequence = Some(sequence);
+                self.state.sequence_container_counts = Some(sequence_container_counts(&sequence));
 
-                // Only update target if we don't have a TS-TARGETSTART override
-                if self
-                    .state
-                    .current_target
-                    .as_ref()
-                    .map(|t| t.source != TargetSource::TsTargetStart)
-                    .unwrap_or(true)
-                    && let Some((target_name, chat_enabled)) = new_sequence_target
+                if let Some((old_target, new_target)) =
+                    self.reconcile_sequence_target(new_sequence_target)
                 {
-                    let new_target = TargetInfo {
-                        name: target_name.clone(),
-                        source: TargetSource::Sequence,
-                        coordinates: None,
-                        project: None,
-                        rotation: None,
-                    };
+                    println!("[SEQUENCE TARGET] {}", new_target.name);
 
-                    let old_target = self.state.current_target.clone();
-                    let target_changed = old_target
-                        .as_ref()
-                        .map(|t| t.name != new_target.name)
-                        .unwrap_or(true);
-
-                    if target_changed {
-                        self.state.current_target = Some(new_target.clone());
-                        println!("[SEQUENCE TARGET] {}", target_name);
-
-                        if chat_enabled && self.chat_manager.service_count() > 0 {
-                            if let Some(old) = old_target {
-                                self.send_target_change_notification(&old, &new_target)
-                                    .await;
-                            } else {
-                                self.send_target_start_notification(&new_target).await;
-                            }
+                    if self.chat_manager.service_count() > 0 {
+                        if let Some(old) = old_target {
+                            self.send_target_change_notification(&old, &new_target)
+                                .await;
+                        } else {
+                            self.send_target_start_notification(&new_target).await;
                         }
                     }
                 }
                 true
             }
             Err(e) => {
-                if self.state.sequence.is_none() {
+                if self.state.sequence_container_counts.is_none() {
                     eprintln!("Error fetching sequence (will retry silently): {e}");
                 }
                 false
             }
         }
+    }
+
+    /// Apply the target identity carried by a sequence snapshot.
+    ///
+    /// An explicit `ChatEnabled: false` is also a revocation signal for a
+    /// target retained from an earlier poll or Target Scheduler event. Clear
+    /// it immediately so live status and slash commands cannot keep exposing
+    /// the old name. `None` remains the legacy "no active target observed"
+    /// case and does not erase a Target Scheduler override.
+    fn reconcile_sequence_target(
+        &mut self,
+        projection: Option<(String, bool)>,
+    ) -> Option<(Option<TargetInfo>, TargetInfo)> {
+        let (target_name, chat_enabled) = projection?;
+        if !chat_enabled {
+            self.state.current_target = None;
+            return None;
+        }
+        if self
+            .state
+            .current_target
+            .as_ref()
+            .is_some_and(|target| target.source == TargetSource::TsTargetStart)
+        {
+            return None;
+        }
+
+        let new_target = TargetInfo {
+            name: target_name,
+            source: TargetSource::Sequence,
+            coordinates: None,
+            project: None,
+            rotation: None,
+        };
+        let old_target = self.state.current_target.clone();
+        if old_target
+            .as_ref()
+            .is_some_and(|target| target.name == new_target.name)
+        {
+            return None;
+        }
+
+        self.state.current_target = Some(new_target.clone());
+        Some((old_target, new_target))
     }
 
     /// Returns whether the Direct source responded (see [`Self::poll_events`]).
@@ -1797,9 +2319,24 @@ impl ChatUpdater {
         }
         match self.source.get_all_image_history().await {
             Ok(images) => {
+                let privacy_boundary = images
+                    .response
+                    .iter()
+                    .rposition(|image| !image.chat_enabled);
                 for (index, image) in images.response.iter().enumerate() {
+                    if privacy_boundary.is_some_and(|boundary| index < boundary) {
+                        continue;
+                    }
+                    if !image.chat_enabled {
+                        if !self.state.has_seen_image(image) {
+                            self.revoke_state_for_disabled_event(event_types::IMAGE_SAVE);
+                        }
+                        continue;
+                    }
                     if !self.state.has_seen_image(image) {
-                        self.print_new_image(image);
+                        if image.chat_enabled {
+                            self.print_new_image(image);
+                        }
 
                         if image.chat_enabled && self.chat_manager.service_count() > 0 {
                             self.handle_new_image(image, index).await;
@@ -1870,7 +2407,7 @@ impl ChatUpdater {
         println!();
     }
 
-    fn display_autofocus_results(&self, af: &AutofocusResponse) {
+    fn display_autofocus_results(af: &AutofocusResponse) {
         if !af.success {
             println!("❌ Autofocus failed: {}", af.error);
             return;
@@ -1976,7 +2513,12 @@ impl ChatUpdater {
     fn format_startup_status(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        let mut operations = self.state.sequence_operations.values().collect::<Vec<_>>();
+        let mut operations = self
+            .state
+            .sequence_operations
+            .values()
+            .filter(|tracked| tracked.operation.chat_enabled)
+            .collect::<Vec<_>>();
         operations.sort_by(|left, right| left.operation.key.cmp(&right.operation.key));
         let has_sequence_wait = operations.iter().any(|tracked| {
             matches!(
@@ -2022,6 +2564,31 @@ impl ChatUpdater {
                     } else {
                         parts.push("⏳ Timed wait in progress".to_string());
                     }
+                }
+                SequenceOperationKind::SafetyWait {
+                    is_safe,
+                    wait_interval,
+                } => {
+                    let state = match is_safe {
+                        Some(true) => "safe; resolving",
+                        Some(false) => "unsafe",
+                        None => "monitor disconnected",
+                    };
+                    let interval = wait_interval
+                        .map(|duration| format!(", checks every {}", format_duration(duration)))
+                        .unwrap_or_default();
+                    parts.push(format!(
+                        "🛡️ Waiting for safe conditions ({state}{interval})"
+                    ));
+                }
+                SequenceOperationKind::ConditionWait { wait_interval } => {
+                    let interval = wait_interval
+                        .map(|duration| format!(", checks every {}", format_duration(duration)))
+                        .unwrap_or_default();
+                    parts.push(format!("⏳ Waiting for a sequence condition{interval}"));
+                }
+                SequenceOperationKind::ManualWait => {
+                    parts.push("⏸️ Waiting for manual sequence resume".to_string());
                 }
                 SequenceOperationKind::MountSlew { coordinates, .. } => {
                     parts.push(coordinates.as_ref().map_or_else(
@@ -2156,7 +2723,12 @@ impl ChatUpdater {
             .await;
     }
 
-    async fn send_autofocus_notification(&self, af: &AutofocusResponse) {
+    async fn send_autofocus_notification_to(
+        chat_manager: &ChatServiceManager,
+        chat_target: &ChatTarget,
+        telescope_name: &str,
+        af: &AutofocusResponse,
+    ) {
         if !af.success {
             return;
         }
@@ -2177,50 +2749,51 @@ impl ChatUpdater {
             position_change.to_string()
         };
 
-        let message =
-            ChatMessage::new(&self.titled(format!("{success_indicator} Autofocus Completed")))
-                .color(color)
-                .field("Filter", &af_data.filter, true)
-                .field("Method", &af_data.method, true)
-                .field("Duration", &af_data.duration, true)
-                .field(
-                    "Temperature",
-                    &format!("{:.1}°C", af_data.temperature),
-                    true,
-                )
-                .field(
-                    "Focus Position",
-                    &af_data.calculated_focus_point.position.to_string(),
-                    true,
-                )
-                .field("Position Change", &position_change_text, true)
-                .field(
-                    "HFR Before",
-                    &af_data
-                        .initial_hfr()
-                        .map(|v| format!("{v:.3}"))
-                        .unwrap_or_else(|| "n/a".to_string()),
-                    true,
-                )
-                .field(
-                    "HFR After",
-                    &af_data
-                        .final_hfr()
-                        .map(|v| format!("{v:.3}"))
-                        .unwrap_or_else(|| "n/a".to_string()),
-                    true,
-                )
-                .field(
-                    "R-squared",
-                    &format!("{:.4}", af.get_best_r_squared()),
-                    true,
-                )
-                .field(
-                    "Measurements",
-                    &af_data.measure_points.len().to_string(),
-                    true,
-                )
-                .footer(&format!("Focuser: {}", af_data.auto_focuser_name));
+        let message = ChatMessage::new(&format!(
+            "[{telescope_name}] {success_indicator} Autofocus Completed"
+        ))
+        .color(color)
+        .field("Filter", &af_data.filter, true)
+        .field("Method", &af_data.method, true)
+        .field("Duration", &af_data.duration, true)
+        .field(
+            "Temperature",
+            &format!("{:.1}°C", af_data.temperature),
+            true,
+        )
+        .field(
+            "Focus Position",
+            &af_data.calculated_focus_point.position.to_string(),
+            true,
+        )
+        .field("Position Change", &position_change_text, true)
+        .field(
+            "HFR Before",
+            &af_data
+                .initial_hfr()
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            true,
+        )
+        .field(
+            "HFR After",
+            &af_data
+                .final_hfr()
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            true,
+        )
+        .field(
+            "R-squared",
+            &format!("{:.4}", af.get_best_r_squared()),
+            true,
+        )
+        .field(
+            "Measurements",
+            &af_data.measure_points.len().to_string(),
+            true,
+        )
+        .footer(&format!("Focuser: {}", af_data.auto_focuser_name));
 
         // Attach the rendered autofocus graph; failures are non-fatal and
         // the notification just goes out without it.
@@ -2234,8 +2807,8 @@ impl ChatUpdater {
                 Vec::new()
             }
         };
-        self.chat_manager
-            .send_message_with_attachments(&message, &self.chat_target, &attachments)
+        chat_manager
+            .send_message_with_attachments(&message, chat_target, &attachments)
             .await;
     }
 
@@ -2337,19 +2910,14 @@ impl ChatUpdater {
             }
         }
 
-        if let Some(seq) = &self.state.sequence {
-            let containers = seq.get_containers();
-            if !containers.is_empty() {
-                let running = containers
-                    .iter()
-                    .filter(|c| c.status.eq_ignore_ascii_case("RUNNING"))
-                    .count();
-                message = message.field(
-                    "Containers",
-                    &format!("{} total / {} running", containers.len(), running),
-                    true,
-                );
-            }
+        if let Some((total, running)) = self.state.sequence_container_counts
+            && total > 0
+        {
+            message = message.field(
+                "Containers",
+                &format!("{total} total / {running} running"),
+                true,
+            );
         }
 
         self.chat_manager
@@ -2430,6 +2998,14 @@ impl ChatUpdater {
                 nina_level_color(level),
                 format!("📝 N.I.N.A. log · {}", level.to_ascii_uppercase()),
             ),
+            Some(EventDetails::SafetyChanged { is_safe }) => (
+                if *is_safe { colors::GREEN } else { colors::RED },
+                if *is_safe {
+                    "🛡️ Safety monitor reports safe".to_string()
+                } else {
+                    "⚠️ Safety monitor reports unsafe".to_string()
+                },
+            ),
             _ => (get_event_color(&event.event), get_event_title(&event.event)),
         };
 
@@ -2466,6 +3042,28 @@ impl ChatUpdater {
                     message = message
                         .field("Position", &position.to_string(), true)
                         .field("HFR", &format!("{hfr:.3}"), true);
+                }
+                EventDetails::AutofocusFinished {
+                    filter,
+                    position,
+                    temperature,
+                    report_timestamp,
+                } => {
+                    message = message.field("Report", report_timestamp, false);
+                    if let Some(filter) = filter {
+                        message = message.field("Filter", filter, true);
+                    }
+                    if let Some(position) = position {
+                        message = message.field("Position", &format!("{position:.0}"), true);
+                    }
+                    if let Some(temperature) = temperature {
+                        message =
+                            message.field("Temperature", &format!("{temperature:.1} °C"), true);
+                    }
+                }
+                EventDetails::SafetyChanged { is_safe } => {
+                    message =
+                        message.field("State", if *is_safe { "Safe" } else { "Unsafe" }, true);
                 }
                 EventDetails::RotatorMoved { from, to } => {
                     message = message
@@ -2783,6 +3381,21 @@ fn parse_nina_timestamp(value: &str) -> Option<DateTime<FixedOffset>> {
         .map(|local| local.fixed_offset())
 }
 
+fn autofocus_report_matches(expected: Option<&str>, actual: &str) -> bool {
+    let Some(expected) = expected else {
+        // Payload v1/v2 completions carry no report identity. Preserve their
+        // historical "last report" behavior while v3 uses exact correlation.
+        return true;
+    };
+    match (parse_nina_timestamp(expected), parse_nina_timestamp(actual)) {
+        // The N.I.N.A. callback and the report writer can timestamp the same
+        // completed run a few seconds apart. Match the plugin's five-second
+        // correlation window while still rejecting an adjacent autofocus run.
+        (Some(expected), Some(actual)) => (expected - actual).abs() <= chrono::Duration::seconds(5),
+        _ => expected.trim() == actual.trim(),
+    }
+}
+
 fn truncate_to(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         return value.to_string();
@@ -2817,6 +3430,9 @@ fn get_event_title(event: &str) -> String {
         event_types::NINA_NOTIFICATION => "🔔 N.I.N.A. notification".to_string(),
         event_types::NINA_LOG => "📝 N.I.N.A. log".to_string(),
         event_types::CHATSTRONOMY_COMMAND_FAILED => "❌ Telescope command failed".to_string(),
+        event_types::SAFETY_CONNECTED => "🛡️ Safety monitor connected".to_string(),
+        event_types::SAFETY_DISCONNECTED => "⚠️ Safety monitor disconnected".to_string(),
+        event_types::SAFETY_CHANGED => "🛡️ Safety state changed".to_string(),
         // The event name comes from the plugin, so it is not length-bounded.
         _ => format!("📡 {}", truncate_chat_title(event)),
     }
@@ -2825,6 +3441,331 @@ fn get_event_title(event: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_types::CommandResponse;
+    use crate::camera::CameraInfoResponse;
+    use crate::chat::ChatService;
+    use crate::error::ChatError;
+    use crate::events::EventHistoryResponse;
+    use crate::filterwheel::FilterWheelInfoResponse;
+    use crate::focuser::FocuserInfoResponse;
+    use crate::guider::{GuiderGraphResponse, GuiderInfoResponse};
+    use crate::images::{ImageHistoryResponse, ThumbnailResponse};
+    use crate::mount::MountInfoResponse;
+    use crate::rotator::RotatorInfoResponse;
+    use crate::source::{
+        RigCapabilities, RigCommand, RigSource, RigSourceError, RigSourceKind, RigSourceResult,
+    };
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FlakyAutofocusSource {
+        event: Event,
+        event_queries: AtomicUsize,
+        image_queries: AtomicUsize,
+        autofocus_queries: AtomicUsize,
+        unavailable_queries: usize,
+        invalid_response: bool,
+        baseline_retry: bool,
+    }
+
+    impl FlakyAutofocusSource {
+        fn new(event: Event) -> Self {
+            Self::unavailable_for(event, 1)
+        }
+
+        fn unavailable_for(event: Event, unavailable_queries: usize) -> Self {
+            Self {
+                event,
+                event_queries: AtomicUsize::new(0),
+                image_queries: AtomicUsize::new(0),
+                autofocus_queries: AtomicUsize::new(0),
+                unavailable_queries,
+                invalid_response: false,
+                baseline_retry: false,
+            }
+        }
+
+        fn invalid(event: Event) -> Self {
+            Self {
+                event,
+                event_queries: AtomicUsize::new(0),
+                image_queries: AtomicUsize::new(0),
+                autofocus_queries: AtomicUsize::new(0),
+                unavailable_queries: 0,
+                invalid_response: true,
+                baseline_retry: false,
+            }
+        }
+
+        fn baseline_retry(event: Event) -> Self {
+            Self {
+                event,
+                event_queries: AtomicUsize::new(0),
+                image_queries: AtomicUsize::new(0),
+                autofocus_queries: AtomicUsize::new(0),
+                unavailable_queries: 0,
+                invalid_response: false,
+                baseline_retry: true,
+            }
+        }
+
+        fn unexpected<T>() -> RigSourceResult<T> {
+            panic!("unexpected RigSource query in autofocus delivery test")
+        }
+    }
+
+    #[async_trait]
+    impl RigSource for FlakyAutofocusSource {
+        fn kind(&self) -> RigSourceKind {
+            RigSourceKind::NinaDirect
+        }
+
+        fn capabilities(&self) -> RigCapabilities {
+            if self.baseline_retry {
+                let mut capabilities = RigCapabilities::none();
+                capabilities.event_history = true;
+                capabilities.image_history = true;
+                capabilities
+            } else {
+                RigCapabilities::all()
+            }
+        }
+
+        async fn get_event_history(&self) -> RigSourceResult<EventHistoryResponse> {
+            let query = self.event_queries.fetch_add(1, Ordering::SeqCst);
+            let response = if self.baseline_retry && query == 0 {
+                Vec::new()
+            } else if self.baseline_retry {
+                vec![
+                    self.event.clone(),
+                    Event {
+                        time: "2026-08-25T22:30:01Z".to_string(),
+                        event: event_types::SAFETY_CHANGED.to_string(),
+                        chat_enabled: true,
+                        details: Some(EventDetails::SafetyChanged { is_safe: false }),
+                    },
+                ]
+            } else {
+                vec![self.event.clone()]
+            };
+            Ok(EventHistoryResponse {
+                response,
+                error: String::new(),
+                status_code: 200,
+                success: true,
+                response_type: "API".to_string(),
+            })
+        }
+
+        async fn get_all_image_history(&self) -> RigSourceResult<ImageHistoryResponse> {
+            if !self.baseline_retry {
+                return Self::unexpected();
+            }
+            if self.image_queries.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(RigSourceError::Unavailable {
+                    kind: RigSourceKind::NinaDirect,
+                    reason: "image history is temporarily unavailable".to_string(),
+                });
+            }
+            Ok(ImageHistoryResponse {
+                response: Vec::new(),
+                error: String::new(),
+                status_code: 200,
+                success: true,
+                response_type: "API".to_string(),
+            })
+        }
+
+        async fn get_sequence(&self) -> RigSourceResult<SequenceResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_thumbnail(&self, _index: u32) -> RigSourceResult<ThumbnailResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_last_autofocus(&self) -> RigSourceResult<AutofocusResponse> {
+            let query = self.autofocus_queries.fetch_add(1, Ordering::SeqCst);
+            if query < self.unavailable_queries {
+                return Err(RigSourceError::Unavailable {
+                    kind: RigSourceKind::NinaDirect,
+                    reason: "report is still being published".to_string(),
+                });
+            }
+            if self.invalid_response {
+                return Err(RigSourceError::InvalidResponse {
+                    kind: RigSourceKind::NinaDirect,
+                    reason: "malformed autofocus payload".to_string(),
+                });
+            }
+            Ok(
+                serde_json::from_str(include_str!("../example_last_af.json"))
+                    .expect("valid autofocus fixture"),
+            )
+        }
+
+        async fn get_mount_info(&self) -> RigSourceResult<MountInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_camera_info(&self) -> RigSourceResult<CameraInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_filterwheel_info(&self) -> RigSourceResult<FilterWheelInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_guider_info(&self) -> RigSourceResult<GuiderInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_guider_graph(&self) -> RigSourceResult<GuiderGraphResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_rotator_info(&self) -> RigSourceResult<RotatorInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_focuser_info(&self) -> RigSourceResult<FocuserInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn execute_command(&self, _command: RigCommand) -> RigSourceResult<CommandResponse> {
+            Self::unexpected()
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingChatState {
+        deliveries: Mutex<Vec<(ChatMessage, Vec<ChatAttachment>)>>,
+    }
+
+    struct RecordingChatService {
+        state: Arc<RecordingChatState>,
+    }
+
+    #[async_trait]
+    impl ChatService for RecordingChatService {
+        async fn send_message(
+            &self,
+            message: &ChatMessage,
+            _target: &ChatTarget,
+        ) -> Result<(), ChatError> {
+            self.state
+                .deliveries
+                .lock()
+                .unwrap()
+                .push((message.clone(), Vec::new()));
+            Ok(())
+        }
+
+        async fn send_message_with_image(
+            &self,
+            message: &ChatMessage,
+            _target: &ChatTarget,
+            image_data: &[u8],
+            filename: &str,
+        ) -> Result<(), ChatError> {
+            self.state.deliveries.lock().unwrap().push((
+                message.clone(),
+                vec![ChatAttachment {
+                    data: image_data.to_vec(),
+                    filename: filename.to_string(),
+                }],
+            ));
+            Ok(())
+        }
+
+        async fn send_message_with_attachments(
+            &self,
+            message: &ChatMessage,
+            _target: &ChatTarget,
+            attachments: &[ChatAttachment],
+        ) -> Result<(), ChatError> {
+            self.state
+                .deliveries
+                .lock()
+                .unwrap()
+                .push((message.clone(), attachments.to_vec()));
+            Ok(())
+        }
+
+        fn service_name(&self) -> &'static str {
+            "recording chat"
+        }
+
+        fn can_route(&self, _target: &ChatTarget) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingChatState {
+        started: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    struct BlockingChatService {
+        state: Arc<BlockingChatState>,
+    }
+
+    struct BlockingDeliveryGuard(Arc<BlockingChatState>);
+
+    impl Drop for BlockingDeliveryGuard {
+        fn drop(&mut self) {
+            self.0.cancelled.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl BlockingChatService {
+        async fn block(&self) -> Result<(), ChatError> {
+            self.state.started.fetch_add(1, Ordering::SeqCst);
+            let _guard = BlockingDeliveryGuard(self.state.clone());
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ChatService for BlockingChatService {
+        async fn send_message(
+            &self,
+            _message: &ChatMessage,
+            _target: &ChatTarget,
+        ) -> Result<(), ChatError> {
+            self.block().await
+        }
+
+        async fn send_message_with_image(
+            &self,
+            _message: &ChatMessage,
+            _target: &ChatTarget,
+            _image_data: &[u8],
+            _filename: &str,
+        ) -> Result<(), ChatError> {
+            self.block().await
+        }
+
+        async fn send_message_with_attachments(
+            &self,
+            _message: &ChatMessage,
+            _target: &ChatTarget,
+            _attachments: &[ChatAttachment],
+        ) -> Result<(), ChatError> {
+            self.block().await
+        }
+
+        fn service_name(&self) -> &'static str {
+            "blocking chat"
+        }
+
+        fn can_route(&self, _target: &ChatTarget) -> bool {
+            true
+        }
+    }
 
     fn operation(kind: SequenceOperationKind) -> SequenceOperation {
         SequenceOperation {
@@ -2834,6 +3775,737 @@ mod tests {
             chat_enabled: true,
             kind,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autofocus_completion_retries_off_poller_and_delivers_one_graph() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                // N.I.N.A.'s callback can precede the matching report timestamp
+                // slightly; the plugin accepts this exact run with a 5s window.
+                report_timestamp: "2025-08-11T23:28:29.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::new(event));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source.clone(),
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        )
+        .with_lifecycle_announcements(false);
+        updater.autofocus_retry = AutofocusRetryPolicy {
+            max_attempts: 3,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(20),
+        };
+
+        // Event polling only queues the potentially slow report fetch. Seeing
+        // the same retained event on the next poll must not queue another task.
+        tokio::time::timeout(Duration::from_millis(1), updater.poll_events())
+            .await
+            .expect("autofocus delivery blocked the event poller");
+        tokio::time::timeout(Duration::from_millis(1), updater.poll_events())
+            .await
+            .expect("deduplicating autofocus blocked the event poller");
+
+        // The source read is owned by the updater and starts only after the
+        // normal poll methods have completed.
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 0);
+        updater.poll_autofocus_delivery().await;
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 1);
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+
+        tokio::time::advance(Duration::from_millis(10)).await;
+        updater.poll_autofocus_delivery().await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if !chat_state.deliveries.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 2);
+        {
+            let deliveries = chat_state.deliveries.lock().unwrap();
+            assert_eq!(deliveries.len(), 1);
+            let (message, attachments) = &deliveries[0];
+            assert!(message.title.contains("Autofocus Completed"));
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].filename, "autofocus.png");
+            assert_eq!(
+                attachments[0].data.get(..8),
+                Some(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a][..])
+            );
+        }
+
+        // Advancing beyond the entire retry window cannot produce a duplicate.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        updater.poll_autofocus_delivery().await;
+        tokio::task::yield_now().await;
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autofocus_completion_never_delivers_a_different_reports_graph() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2026-08-25T22:29:59Z".to_string(),
+                filter: Some("L".to_string()),
+                position: Some(5000.0),
+                temperature: Some(-5.0),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::unavailable_for(event, 0));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source.clone(),
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        updater.autofocus_retry = AutofocusRetryPolicy {
+            max_attempts: 2,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(10),
+        };
+
+        updater.poll_events().await;
+        updater.poll_autofocus_delivery().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        updater.poll_autofocus_delivery().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 2);
+        assert!(updater.pending_autofocus_deliveries.is_empty());
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_event_baseline_is_live_on_later_initialization_retry() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T23:28:29.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::baseline_retry(event));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source.clone(),
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        )
+        .with_lifecycle_announcements(false);
+
+        assert!(updater.initialize_baseline().await.is_err());
+        assert!(updater.event_baseline_complete);
+        assert!(updater.pending_autofocus_deliveries.is_empty());
+
+        updater.initialize_baseline().await.unwrap();
+
+        assert_eq!(source.event_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(source.image_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(updater.pending_autofocus_deliveries.len(), 1);
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert!(
+            deliveries
+                .iter()
+                .any(|(message, _)| message.title.contains("Safety"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autofocus_outage_does_not_consume_report_attempt_budget() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T23:28:29.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::unavailable_for(event, 5));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source.clone(),
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        updater.autofocus_retry = AutofocusRetryPolicy {
+            max_attempts: 1,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(10),
+        };
+
+        updater.poll_events().await;
+        for _ in 0..5 {
+            updater.poll_autofocus_delivery().await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+        }
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 5);
+        assert_eq!(updater.pending_autofocus_deliveries.len(), 1);
+        assert_eq!(updater.pending_autofocus_deliveries[0].attempts, 0);
+
+        updater.poll_autofocus_delivery().await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if !chat_state.deliveries.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 6);
+        assert!(updater.pending_autofocus_deliveries.is_empty());
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_autofocus_report_exhausts_attempt_budget() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T23:28:29.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::invalid(event));
+        let mut updater = ChatUpdater::new(
+            source.clone(),
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(ChatServiceManager::new()),
+        );
+        updater.autofocus_retry = AutofocusRetryPolicy {
+            max_attempts: 2,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(10),
+        };
+
+        updater.poll_events().await;
+        updater.poll_autofocus_delivery().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        updater.poll_autofocus_delivery().await;
+
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 2);
+        assert!(updater.pending_autofocus_deliveries.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aborting_updater_task_cancels_inflight_autofocus_notification() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::new(event));
+        let chat_state = Arc::new(BlockingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(BlockingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        updater.autofocus_retry = AutofocusRetryPolicy {
+            max_attempts: 2,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(10),
+        };
+
+        updater.poll_events().await;
+        updater.poll_autofocus_delivery().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let delivery = tokio::spawn(async move {
+            updater.poll_autofocus_delivery().await;
+            updater
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if chat_state.started.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+        }
+        assert_eq!(chat_state.started.load(Ordering::SeqCst), 1);
+
+        delivery.abort();
+        let _ = delivery.await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if chat_state.cancelled.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+        }
+        assert_eq!(chat_state.cancelled.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sequencer_plus_wait_lifecycle_and_status_stay_privacy_safe() {
+        let source = Arc::new(FlakyAutofocusSource::new(Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::SEQUENCE_STARTING.to_string(),
+            chat_enabled: true,
+            details: None,
+        }));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        let now = Utc::now();
+        let condition = TrackedSequenceOperation::new(
+            operation(SequenceOperationKind::ConditionWait {
+                wait_interval: Some(chrono::Duration::seconds(17)),
+            }),
+            now,
+            None,
+        );
+        let mut manual_operation = operation(SequenceOperationKind::ManualWait);
+        manual_operation.key = "0/2".to_string();
+        let manual = TrackedSequenceOperation::new(manual_operation, now, None);
+        let mut disabled_safety_operation = operation(SequenceOperationKind::SafetyWait {
+            is_safe: Some(false),
+            wait_interval: Some(chrono::Duration::seconds(5)),
+        });
+        disabled_safety_operation.key = "0/3".to_string();
+        disabled_safety_operation.chat_enabled = false;
+        let disabled_safety = TrackedSequenceOperation::new(disabled_safety_operation, now, None);
+
+        updater
+            .send_sequence_operation_update(&condition, OperationUpdate::Started)
+            .await;
+        updater
+            .send_sequence_operation_update(
+                &manual,
+                OperationUpdate::Finished {
+                    attach_output: false,
+                },
+            )
+            .await;
+
+        updater
+            .state
+            .sequence_operations
+            .insert(condition.operation.key.clone(), condition);
+        updater
+            .state
+            .sequence_operations
+            .insert(manual.operation.key.clone(), manual);
+        updater
+            .state
+            .sequence_operations
+            .insert(disabled_safety.operation.key.clone(), disabled_safety);
+        let status = updater.format_startup_status();
+        assert!(status.contains("Waiting for a sequence condition"));
+        assert!(status.contains("checks every 17s"));
+        assert!(status.contains("Waiting for manual sequence resume"));
+        assert!(!status.contains("Waiting for safe conditions"));
+        assert!(!updater.state.status_fingerprint().contains("0/3"));
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert!(
+            deliveries[0]
+                .0
+                .title
+                .contains("Waiting for a sequence condition")
+        );
+        assert!(
+            deliveries[0]
+                .0
+                .fields
+                .iter()
+                .any(|field| field.name == "Check interval")
+        );
+        assert!(deliveries[1].0.title.contains("Sequence manually resumed"));
+        let rendered = format!("{deliveries:?}\n{status}");
+        for private_label in ["Expression", "Predicate", "Reason"] {
+            assert!(!rendered.contains(private_label));
+        }
+    }
+
+    #[tokio::test]
+    async fn disappearing_safety_wait_does_not_claim_conditions_became_safe() {
+        let source = Arc::new(FlakyAutofocusSource::new(Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::SEQUENCE_STARTING.to_string(),
+            chat_enabled: true,
+            details: None,
+        }));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        let safety_wait = TrackedSequenceOperation::new(
+            operation(SequenceOperationKind::SafetyWait {
+                is_safe: Some(false),
+                wait_interval: Some(chrono::Duration::seconds(5)),
+            }),
+            Utc::now(),
+            None,
+        );
+        updater
+            .state
+            .sequence_operations
+            .insert(safety_wait.operation.key.clone(), safety_wait);
+
+        updater
+            .reconcile_sequence_operations(Vec::new(), HashSet::new(), None, true)
+            .await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].0.title.contains("Safety wait ended"));
+        assert!(!deliveries[0].0.title.contains("Safe conditions reached"));
+    }
+
+    #[tokio::test]
+    async fn suppressed_active_safety_wait_is_removed_without_delivery() {
+        let source = Arc::new(FlakyAutofocusSource::new(Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::SEQUENCE_STARTING.to_string(),
+            chat_enabled: true,
+            details: None,
+        }));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        let safety_wait = TrackedSequenceOperation::new(
+            operation(SequenceOperationKind::SafetyWait {
+                is_safe: Some(false),
+                wait_interval: Some(chrono::Duration::seconds(5)),
+            }),
+            Utc::now(),
+            None,
+        );
+        let key = safety_wait.operation.key.clone();
+        updater
+            .state
+            .sequence_operations
+            .insert(key.clone(), safety_wait);
+        let mut suppressed_operation_keys = HashSet::new();
+        suppressed_operation_keys.insert(key);
+
+        updater
+            .reconcile_sequence_operations(Vec::new(), suppressed_operation_keys, None, true)
+            .await;
+
+        assert!(updater.state.sequence_operations.is_empty());
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn suppressed_time_wait_clears_internal_wait_state_without_delivery() {
+        let source = Arc::new(FlakyAutofocusSource::new(Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::SEQUENCE_STARTING.to_string(),
+            chat_enabled: true,
+            details: None,
+        }));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        let time_wait = TrackedSequenceOperation::new(
+            operation(SequenceOperationKind::TimeWait {
+                target_time: None,
+                configured_duration: Some(chrono::Duration::minutes(5)),
+            }),
+            Utc::now(),
+            None,
+        );
+        let key = time_wait.operation.key.clone();
+        updater
+            .state
+            .sequence_operations
+            .insert(key.clone(), time_wait);
+        updater.state.wait_until = Some(
+            DateTime::parse_from_rfc3339("2026-08-26T06:00:00Z").expect("valid wait timestamp"),
+        );
+        let mut suppressed_operation_keys = HashSet::new();
+        suppressed_operation_keys.insert(key);
+
+        updater
+            .reconcile_sequence_operations(Vec::new(), suppressed_operation_keys, None, true)
+            .await;
+
+        assert!(updater.state.sequence_operations.is_empty());
+        assert!(updater.state.wait_until.is_none());
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+    }
+
+    fn target_event(chat_enabled: bool, name: &str) -> Event {
+        Event {
+            time: "2026-08-26T06:00:00Z".to_string(),
+            event: event_types::TS_TARGETSTART.to_string(),
+            chat_enabled,
+            details: Some(EventDetails::TargetStart {
+                target_name: name.to_string(),
+                project_name: None,
+                rotation: None,
+                target_end_time: None,
+                coordinates: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_legacy_event_details_never_enter_baseline_or_live_status_state() {
+        let source = Arc::new(FlakyAutofocusSource::new(target_event(
+            false,
+            "Private target",
+        )));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(ChatServiceManager::new()),
+        );
+
+        let disabled_events = vec![
+            target_event(false, "Private baseline target"),
+            Event {
+                time: "2026-08-26T06:00:01Z".to_string(),
+                event: event_types::FILTERWHEEL_CHANGED.to_string(),
+                chat_enabled: false,
+                details: Some(EventDetails::FilterWheelChange {
+                    new: FilterInfo {
+                        name: "Private filter".to_string(),
+                        id: 4,
+                    },
+                    previous: FilterInfo {
+                        name: "Old private filter".to_string(),
+                        id: 3,
+                    },
+                }),
+            },
+            Event {
+                time: "2026-08-26T06:00:02Z".to_string(),
+                event: event_types::TS_WAITSTART.to_string(),
+                chat_enabled: false,
+                details: Some(EventDetails::WaitStart {
+                    wait_end_time: "2026-08-26T07:00:00Z".to_string(),
+                }),
+            },
+            Event {
+                time: "2026-08-26T06:00:03Z".to_string(),
+                event: event_types::MOUNT_PARKED.to_string(),
+                chat_enabled: false,
+                details: None,
+            },
+            Event {
+                time: "2026-08-26T06:00:04Z".to_string(),
+                event: event_types::GUIDER_START.to_string(),
+                chat_enabled: false,
+                details: None,
+            },
+            Event {
+                time: "2026-08-26T06:00:05Z".to_string(),
+                event: event_types::SEQUENCE_STARTING.to_string(),
+                chat_enabled: false,
+                details: None,
+            },
+        ];
+
+        updater.process_baseline_events(&disabled_events);
+        assert!(updater.state.current_target.is_none());
+        assert!(updater.state.last_filter.is_none());
+        assert!(updater.state.wait_until.is_none());
+        assert!(updater.state.last_mount_event.is_none());
+        assert!(updater.state.last_guider_event.is_none());
+        assert!(!updater.state.sequence_running);
+        let retained_keys = updater
+            .state
+            .events_seen
+            .seen
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!retained_keys.contains("Private"));
+        assert!(!retained_keys.contains("07:00:00"));
+
+        for event in &disabled_events {
+            updater.handle_event(event).await;
+        }
+        assert!(updater.state.current_target.is_none());
+        assert!(updater.state.last_filter.is_none());
+        assert!(updater.state.wait_until.is_none());
+        assert!(updater.state.last_mount_event.is_none());
+        assert!(updater.state.last_guider_event.is_none());
+        assert!(!updater.state.sequence_running);
+
+        updater.state.current_target = Some(TargetInfo {
+            name: "Previously shared target".to_string(),
+            source: TargetSource::TsTargetStart,
+            coordinates: None,
+            project: None,
+            rotation: None,
+        });
+        assert!(
+            updater
+                .reconcile_sequence_target(Some(("Private projection".to_string(), false)))
+                .is_none()
+        );
+        assert!(updater.state.current_target.is_none());
+    }
+
+    #[test]
+    fn enabled_sequence_target_still_updates_when_no_scheduler_override_exists() {
+        let source = Arc::new(FlakyAutofocusSource::new(target_event(true, "M42")));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(ChatServiceManager::new()),
+        );
+
+        let (_, target) = updater
+            .reconcile_sequence_target(Some(("M42".to_string(), true)))
+            .expect("enabled target should update state");
+        assert_eq!(target.name, "M42");
+        assert_eq!(
+            updater
+                .state
+                .current_target
+                .as_ref()
+                .map(|target| target.name.as_str()),
+            Some("M42")
+        );
+    }
+
+    #[test]
+    fn new_target_event_reconstructs_target_during_baseline() {
+        let mut event = target_event(true, "M31");
+        event.event = event_types::TS_NEWTARGETSTART.to_string();
+        let source = Arc::new(FlakyAutofocusSource::new(event.clone()));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(ChatServiceManager::new()),
+        );
+
+        updater.process_baseline_events(&[event]);
+
+        assert_eq!(
+            updater
+                .state
+                .current_target
+                .as_ref()
+                .map(|target| target.name.as_str()),
+            Some("M31")
+        );
+    }
+
+    #[test]
+    fn target_scheduler_tombstone_removes_only_scheduler_wait_estimate() {
+        let source = Arc::new(FlakyAutofocusSource::new(target_event(true, "M31")));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(ChatServiceManager::new()),
+        );
+        let started = Utc::now();
+        let mut tracked = TrackedSequenceOperation::new(
+            operation(SequenceOperationKind::TimeWait {
+                target_time: None,
+                configured_duration: Some(chrono::Duration::minutes(5)),
+            }),
+            started,
+            None,
+        );
+        let intrinsic = tracked.estimated_end;
+        tracked.estimated_end = Some(started + chrono::Duration::hours(8));
+        tracked.estimated_end_from_target_scheduler = true;
+        updater
+            .state
+            .sequence_operations
+            .insert(tracked.operation.key.clone(), tracked);
+
+        updater.revoke_state_for_disabled_event(event_types::TS_WAITSTART);
+
+        let retained = updater.state.sequence_operations.values().next().unwrap();
+        assert_eq!(retained.estimated_end, intrinsic);
+        assert!(!retained.estimated_end_from_target_scheduler);
     }
 
     #[test]
@@ -2899,6 +4571,36 @@ mod tests {
             true,
             Some(&key),
         ));
+    }
+
+    #[test]
+    fn plate_solve_dedup_identity_does_not_retain_solve_timestamp() {
+        let state = UpdaterState::new();
+        let private_timestamp = "2026-08-26T06:12:34.567-private";
+        let operation = operation(SequenceOperationKind::MountCenter {
+            coordinates: None,
+            rotation: None,
+            output: Some(Box::new(crate::sequence::PlateSolveOutput {
+                solve_time: Some(private_timestamp.to_string()),
+                success: Some(true),
+                coordinates: None,
+                position_angle: None,
+                pixel_scale: None,
+                radius_degrees: None,
+                separation_arcseconds: None,
+                ra_error: None,
+                dec_error: None,
+                ra_pixel_error: None,
+                dec_pixel_error: None,
+                flipped: None,
+                thumbnail: None,
+                thumbnail_media_type: None,
+            })),
+        });
+
+        let key = plate_solve_output_key(&state.dedup_hasher, &operation).unwrap();
+        assert!(key.starts_with("p:"));
+        assert!(!key.contains(private_timestamp));
     }
 
     #[test]

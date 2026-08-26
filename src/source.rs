@@ -86,6 +86,9 @@ pub enum RigSourceError {
 
     #[error("{kind:?} source is unavailable: {reason}")]
     Unavailable { kind: RigSourceKind, reason: String },
+
+    #[error("{kind:?} source returned an invalid response: {reason}")]
+    InvalidResponse { kind: RigSourceKind, reason: String },
 }
 
 pub type RigSourceResult<T> = Result<T, RigSourceError>;

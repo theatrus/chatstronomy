@@ -2,6 +2,7 @@ use base64::Engine;
 use chrono::{DateTime as ChronoDateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -184,6 +185,7 @@ pub struct SequenceOperation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SequenceOperationKind {
     CameraCooling {
         target_temperature: f64,
@@ -193,6 +195,19 @@ pub enum SequenceOperationKind {
         target_time: Option<ChronoDateTime<FixedOffset>>,
         configured_duration: Option<chrono::Duration>,
     },
+    SafetyWait {
+        is_safe: Option<bool>,
+        wait_interval: Option<chrono::Duration>,
+    },
+    /// A Sequencer+ condition wait. Only the polling interval crosses the
+    /// Direct boundary; the condition expression and predicate remain inside
+    /// N.I.N.A. and are deliberately absent from this model.
+    ConditionWait {
+        wait_interval: Option<chrono::Duration>,
+    },
+    /// A Sequencer+ operation that pauses until a person resumes the
+    /// sequence. No reason or other free-form details cross the boundary.
+    ManualWait,
     MountSlew {
         coordinates: Option<OperationCoordinates>,
         /// Older Direct payloads can expose coordinates but not the
@@ -281,6 +296,13 @@ impl SequenceOperation {
             "FAILED" | "ABORTED" | "CANCELLED" | "CANCELED"
         )
     }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(
+            self.status.to_ascii_uppercase().as_str(),
+            "FINISHED" | "COMPLETED" | "SUCCEEDED" | "SUCCESS"
+        )
+    }
 }
 
 /// Find chat-visible, long-running sequence items without depending on
@@ -292,11 +314,20 @@ pub fn extract_sequence_operations(sequence: &SequenceResponse) -> Vec<SequenceO
             let Some(object) = value.as_object() else {
                 continue;
             };
-            let key = if parent.is_empty() {
-                index.to_string()
-            } else {
-                format!("{parent}/{index}")
-            };
+            let key = sequence_item_key(parent, index);
+            let chat_enabled = object
+                .get("ChatEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if !chat_enabled {
+                // A mixed-v3 peer may leave legacy operation details on a
+                // locally disabled node. Treat the node as opaque, while still
+                // walking children that have their own independent consent.
+                if let Some(items) = object.get("Items").and_then(Value::as_array) {
+                    visit_items(items, &key, output);
+                }
+                continue;
+            }
             let name = object
                 .get("Name")
                 .and_then(Value::as_str)
@@ -308,16 +339,15 @@ pub fn extract_sequence_operations(sequence: &SequenceResponse) -> Vec<SequenceO
                 .unwrap_or_default()
                 .to_string();
             let explicit_kind = object.get("OperationKind").and_then(Value::as_str);
-            let chat_enabled = object
-                .get("ChatEnabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-
             let is_cooling = explicit_kind == Some("camera_cooling")
                 || (object.contains_key("Temperature") && object.contains_key("MinCoolingTime"));
             let is_wait = explicit_kind == Some("time_wait")
                 || object.contains_key("CalculatedWaitDuration")
                 || object.contains_key("Delay");
+            let is_safety_wait = explicit_kind == Some("safety_wait")
+                || (object.contains_key("IsSafe") && object.contains_key("WaitInterval"));
+            let is_condition_wait = explicit_kind == Some("condition_wait");
+            let is_manual_wait = explicit_kind == Some("manual_wait");
             let has_coordinates =
                 object.contains_key("Coordinates") && !name.ends_with("_Container");
             let lower_name = name.to_ascii_lowercase();
@@ -343,6 +373,35 @@ pub fn extract_sequence_operations(sequence: &SequenceResponse) -> Vec<SequenceO
                         },
                     });
                 }
+            } else if is_safety_wait {
+                output.push(SequenceOperation {
+                    key: key.clone(),
+                    name: name.clone(),
+                    status: status.clone(),
+                    chat_enabled,
+                    kind: SequenceOperationKind::SafetyWait {
+                        is_safe: object.get("IsSafe").and_then(Value::as_bool),
+                        wait_interval: object.get("WaitInterval").and_then(parse_duration_value),
+                    },
+                });
+            } else if is_condition_wait {
+                output.push(SequenceOperation {
+                    key: key.clone(),
+                    name: name.clone(),
+                    status: status.clone(),
+                    chat_enabled,
+                    kind: SequenceOperationKind::ConditionWait {
+                        wait_interval: object.get("WaitInterval").and_then(parse_duration_value),
+                    },
+                });
+            } else if is_manual_wait {
+                output.push(SequenceOperation {
+                    key: key.clone(),
+                    name: name.clone(),
+                    status: status.clone(),
+                    chat_enabled,
+                    kind: SequenceOperationKind::ManualWait,
+                });
             } else if is_wait {
                 let configured_duration = object
                     .get("CalculatedWaitDuration")
@@ -405,6 +464,45 @@ pub fn extract_sequence_operations(sequence: &SequenceResponse) -> Vec<SequenceO
     let mut operations = Vec::new();
     visit_items(&sequence.response, "", &mut operations);
     operations
+}
+
+/// Find explicit privacy tombstones in a sequence snapshot.
+///
+/// A suppressed item deliberately omits the operation details that would let
+/// [`extract_sequence_operations`] identify it. Its stable tree path lets the
+/// updater silently forget any previously tracked operation at that position
+/// instead of treating the disappearance as a completed or ended operation.
+pub fn extract_suppressed_sequence_operation_keys(sequence: &SequenceResponse) -> HashSet<String> {
+    fn visit_items(values: &[Value], parent: &str, output: &mut HashSet<String>) {
+        for (index, value) in values.iter().enumerate() {
+            let Some(object) = value.as_object() else {
+                continue;
+            };
+            let key = sequence_item_key(parent, index);
+            // `ChatEnabled: false` is itself a legacy suppression marker. Do
+            // not require the additive `Suppressed` field before clearing an
+            // operation previously tracked at this stable tree path.
+            let suppressed = object.get("ChatEnabled").and_then(Value::as_bool) == Some(false);
+            if suppressed {
+                output.insert(key.clone());
+            }
+            if let Some(items) = object.get("Items").and_then(Value::as_array) {
+                visit_items(items, &key, output);
+            }
+        }
+    }
+
+    let mut keys = HashSet::new();
+    visit_items(&sequence.response, "", &mut keys);
+    keys
+}
+
+fn sequence_item_key(parent: &str, index: usize) -> String {
+    if parent.is_empty() {
+        index.to_string()
+    } else {
+        format!("{parent}/{index}")
+    }
 }
 
 fn parse_operation_coordinates(value: &Value) -> Option<OperationCoordinates> {
@@ -573,8 +671,33 @@ impl SequenceResponse {
         self.response
             .iter()
             .skip(1) // Skip global triggers
-            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            // Mixed payload-v3 peers can expose legacy containers/items but
+            // mark them locally disabled. Strip those nodes recursively before
+            // slash commands deserialize or count any private fields.
+            .filter_map(chat_visible_value)
+            .filter_map(|item| serde_json::from_value(item).ok())
             .collect()
+    }
+}
+
+fn chat_visible_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Object(object) => {
+            if object.get("ChatEnabled").and_then(Value::as_bool) == Some(false) {
+                return None;
+            }
+            let projected = object
+                .iter()
+                .filter_map(|(name, value)| {
+                    chat_visible_value(value).map(|value| (name.clone(), value))
+                })
+                .collect();
+            Some(Value::Object(projected))
+        }
+        Value::Array(values) => Some(Value::Array(
+            values.iter().filter_map(chat_visible_value).collect(),
+        )),
+        _ => Some(value.clone()),
     }
 }
 
@@ -639,10 +762,16 @@ pub fn extract_current_target_with_delivery(sequence: &SequenceResponse) -> Opti
     fn search_explicit_targets(values: &[Value]) -> Option<(String, bool)> {
         for value in values {
             if let Some(obj) = value.as_object() {
-                if obj
+                let is_target = obj
                     .get("IsTargetContainer")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if is_target && obj.get("ChatEnabled").and_then(Value::as_bool) == Some(false) {
+                    // Privacy tombstone: clear a previously shared target
+                    // without reading or retaining its name/status fields.
+                    return Some((String::new(), false));
+                }
+                if is_target
                     && let Some(name) = active_container_name(obj)
                     && let Some(target) = obj
                         .get("TargetName")
@@ -702,7 +831,9 @@ pub fn extract_current_target_with_delivery(sequence: &SequenceResponse) -> Opti
 /// Extract just the current target name. Kept as the compatibility surface
 /// used by commands and older callers that do not need delivery policy.
 pub fn extract_current_target(sequence: &SequenceResponse) -> Option<String> {
-    extract_current_target_with_delivery(sequence).map(|(name, _)| name)
+    extract_current_target_with_delivery(sequence)
+        .filter(|(_, chat_enabled)| *chat_enabled)
+        .map(|(name, _)| name)
 }
 
 /// Extract the meridian flip time from a sequence response
@@ -719,14 +850,20 @@ pub fn extract_current_target(sequence: &SequenceResponse) -> Option<String> {
 pub fn extract_meridian_flip_time(sequence: &SequenceResponse) -> Option<f64> {
     // Get global triggers from the first item
     let global_triggers_item = sequence.response.first()?;
-    let global_triggers_array = global_triggers_item
-        .as_object()?
-        .get("GlobalTriggers")?
-        .as_array()?;
+    let global_triggers_object = global_triggers_item.as_object()?;
+    if global_triggers_object
+        .get("ChatEnabled")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return None;
+    }
+    let global_triggers_array = global_triggers_object.get("GlobalTriggers")?.as_array()?;
 
     // Search for the Meridian Flip trigger
     for trigger in global_triggers_array {
         if let Some(trigger_obj) = trigger.as_object()
+            && trigger_obj.get("ChatEnabled").and_then(Value::as_bool) != Some(false)
             && let Some(name) = trigger_obj.get("Name").and_then(|v| v.as_str())
             && name == "Meridian Flip_Trigger"
         {
@@ -871,12 +1008,9 @@ mod tests {
 
         assert_eq!(
             extract_current_target_with_delivery(&sequence),
-            Some(("NGC 7000".to_string(), false))
+            Some((String::new(), false))
         );
-        assert_eq!(
-            extract_current_target(&sequence),
-            Some("NGC 7000".to_string())
-        );
+        assert_eq!(extract_current_target(&sequence), None);
     }
 
     #[test]
@@ -1187,6 +1321,182 @@ mod tests {
                 configured_duration: Some(duration)
             } if duration == chrono::Duration::minutes(5)
         ));
+    }
+
+    #[test]
+    fn extracts_native_and_legacy_safety_wait_operations() {
+        let sequence: SequenceResponse = serde_json::from_value(serde_json::json!({
+            "Response": [{
+                "Name": "Safety waits",
+                "Status": "RUNNING",
+                "Items": [{
+                    "Name": "Wait until safe",
+                    "Status": "RUNNING",
+                    "OperationKind": "safety_wait",
+                    "IsSafe": false,
+                    "WaitInterval": "00:00:05",
+                    "ChatEnabled": true
+                }, {
+                    "Name": "Legacy safety wait",
+                    "Status": "RUNNING",
+                    "IsSafe": true,
+                    "WaitInterval": 7,
+                    "ChatEnabled": false
+                }]
+            }],
+            "Error": "",
+            "StatusCode": 200,
+            "Success": true,
+            "Type": "API"
+        }))
+        .unwrap();
+
+        let operations = extract_sequence_operations(&sequence);
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(
+            operations[0].kind,
+            SequenceOperationKind::SafetyWait {
+                is_safe: Some(false),
+                wait_interval: Some(duration),
+            } if duration == chrono::Duration::seconds(5)
+        ));
+        assert!(operations[0].chat_enabled);
+    }
+
+    #[test]
+    fn disabled_top_level_containers_are_absent_from_public_container_views() {
+        let sequence: SequenceResponse = serde_json::from_value(serde_json::json!({
+            "Response": [{
+                "GlobalTriggers": []
+            }, {
+                "Name": "Visible target",
+                "Status": "RUNNING",
+                "Items": [{
+                    "Name": "Visible operation",
+                    "Status": "RUNNING",
+                    "ChatEnabled": true
+                }, {
+                    "Name": "Private operation",
+                    "Status": "RUNNING",
+                    "Coordinates": { "RA": 1.0, "Dec": 2.0 },
+                    "ChatEnabled": false
+                }],
+                "Triggers": [],
+                "Conditions": [],
+                "ChatEnabled": true
+            }, {
+                "Name": "Private_TargetContainer",
+                "Status": "RUNNING",
+                "Items": [],
+                "Triggers": [],
+                "Conditions": [],
+                "ChatEnabled": false
+            }],
+            "Error": "",
+            "StatusCode": 200,
+            "Success": true,
+            "Type": "API"
+        }))
+        .unwrap();
+
+        let containers = sequence.get_containers();
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].name, "Visible target");
+        assert_eq!(containers[0].items.len(), 1);
+        assert_eq!(containers[0].items[0].name, "Visible operation");
+    }
+
+    #[test]
+    fn extracts_nested_suppressed_operation_tombstone_keys() {
+        let sequence: SequenceResponse = serde_json::from_value(serde_json::json!({
+            "Response": [{
+                "Name": "Root",
+                "Status": "RUNNING",
+                "Items": [{
+                    "Name": "Visible item",
+                    "Suppressed": true,
+                    "ChatEnabled": true
+                }, {
+                    "Name": "Nested container",
+                    "Items": [{
+                        "Name": "Private safety wait",
+                        "Suppressed": true,
+                        "ChatEnabled": false
+                    }, {
+                        "Name": "Disabled but not suppressed",
+                        "ChatEnabled": false
+                    }]
+                }]
+            }],
+            "Error": "",
+            "StatusCode": 200,
+            "Success": true,
+            "Type": "API"
+        }))
+        .unwrap();
+
+        let keys = extract_suppressed_sequence_operation_keys(&sequence);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains("0/1/0"));
+        assert!(keys.contains("0/1/1"));
+    }
+
+    #[test]
+    fn extracts_privacy_safe_sequencer_plus_wait_operations() {
+        let sequence: SequenceResponse = serde_json::from_value(serde_json::json!({
+            "Response": [{
+                "Name": "Sequencer+ waits",
+                "Status": "RUNNING",
+                "Items": [{
+                    "Name": "Wait until condition",
+                    "Status": "RUNNING",
+                    "OperationKind": "condition_wait",
+                    "WaitInterval": "00:00:11",
+                    "Expression": "private observatory expression",
+                    "Predicate": "private predicate",
+                    "Reason": "private reason",
+                    "ChatEnabled": true
+                }, {
+                    "Name": "Pause for operator",
+                    "Status": "RUNNING",
+                    "OperationKind": "manual_wait",
+                    "Expression": "must not leave N.I.N.A.",
+                    "Predicate": "must not leave N.I.N.A.",
+                    "Reason": "must not leave N.I.N.A.",
+                    "ChatEnabled": true
+                }]
+            }],
+            "Error": "",
+            "StatusCode": 200,
+            "Success": true,
+            "Type": "API"
+        }))
+        .unwrap();
+
+        let operations = extract_sequence_operations(&sequence);
+        assert_eq!(operations.len(), 2);
+        assert!(matches!(
+            operations[0].kind,
+            SequenceOperationKind::ConditionWait {
+                wait_interval: Some(duration),
+            } if duration == chrono::Duration::seconds(11)
+        ));
+        assert!(matches!(
+            operations[1].kind,
+            SequenceOperationKind::ManualWait
+        ));
+
+        // The operation model has no field capable of retaining the private
+        // Sequencer+ expression, predicate, or reason values.
+        let rendered = format!("{operations:?}");
+        for private_value in [
+            "private observatory expression",
+            "private predicate",
+            "private reason",
+            "must not leave N.I.N.A.",
+        ] {
+            assert!(!rendered.contains(private_value));
+        }
     }
 
     #[test]

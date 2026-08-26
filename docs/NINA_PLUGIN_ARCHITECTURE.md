@@ -33,8 +33,10 @@ Credential Manager. Multiple profiles and systems can connect concurrently.
 rendering, Discord slash commands, and Matrix/Discord delivery. It includes:
 
 - bounded event, image, and sequence snapshots;
-- thumbnails, autofocus data, guider data and rendered graph inputs;
+- thumbnails, the matching completed autofocus report, guider data, and
+  rendered graph inputs;
 - mount, camera, filter wheel, guider, rotator, and focuser snapshots;
+- safety-monitor transitions and active safety-wait state;
 - typed commands such as park, guide, cool, autofocus, and sequence control.
 
 Direct v1 envelopes currently advertise additive payload contract v3. Version
@@ -73,6 +75,30 @@ Disabling an event family can reduce historical or intermediate target, wait,
 cooling, guider, or sequence details; the privacy boundary takes precedence over
 that additional state. Older peers that supply `ChatEnabled` continue to be
 accepted for Direct payload compatibility.
+
+The plugin observes native safety-monitor connection and safe/unsafe changes.
+Safety events have their own delivery switch. A **Wait Until Safe** operation is
+visible only when both sequence and safety delivery are enabled, and its state
+comes from the safety-monitor mediator rather than a potentially stale sequence
+item property.
+
+Sequence snapshots identify selected long-running Sequencer+ waits: **Wait
+Until Safe**, condition waits, and manual waits. The wire projection includes
+only operational state such as status and polling interval; condition
+expressions and free-form pause reasons stay inside N.I.N.A. Other Sequencer+
+items continue to use the existing generic sequence representation.
+
+For mixed payload-v3 deployments, changing mount, sequence, or safety delivery
+invalidates the existing Direct session before the plugin publishes the new
+policy. Reconnection creates a fresh updater baseline, so an older peer cannot
+interpret a newly opaque item as the completion of details cached under the
+previous consent state. Current peers also understand the explicit suppression
+tombstone and discard that tracked path silently.
+
+Autofocus completion is matched to the corresponding finished report before it
+is used for graph input. Both the plugin and updater retry bounded transient
+report-availability failures so a preceding run is not rendered as the new
+autofocus result.
 
 Target Scheduler integration follows its N.I.N.A. message-broker topics and
 projects the active container's `Target.TargetName`, avoiding the generic

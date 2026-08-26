@@ -78,6 +78,13 @@ impl DirectPipeRigSource {
         }
     }
 
+    fn invalid_response(reason: impl Into<String>) -> RigSourceError {
+        RigSourceError::InvalidResponse {
+            kind: RigSourceKind::NinaDirect,
+            reason: reason.into(),
+        }
+    }
+
     async fn query_as<T: serde::de::DeserializeOwned>(
         &self,
         kind: QueryKind,
@@ -122,12 +129,14 @@ impl DirectPipeRigSource {
             .map_err(|_| Self::unavailable("Direct query timed out"))?
             .map_err(|error| Self::unavailable(error.to_string()))?;
         let message: DirectMessage = serde_json::from_str(&response)
-            .map_err(|error| Self::unavailable(format!("invalid Direct response: {error}")))?;
+            .map_err(|error| Self::invalid_response(format!("invalid Direct response: {error}")))?;
         let DirectMessage::QueryResult(result) = message else {
-            return Err(Self::unavailable("plugin returned a non-result frame"));
+            return Err(Self::invalid_response("plugin returned a non-result frame"));
         };
         if result.id != id {
-            return Err(Self::unavailable("plugin returned a mismatched query ID"));
+            return Err(Self::invalid_response(
+                "plugin returned a mismatched query ID",
+            ));
         }
         if !result.ok {
             return Err(RigSourceError::Rejected {
@@ -135,8 +144,9 @@ impl DirectPipeRigSource {
                 reason: result.error.unwrap_or_else(|| "query failed".to_string()),
             });
         }
-        serde_json::from_value(result.payload)
-            .map_err(|error| Self::unavailable(format!("invalid payload from plugin: {error}")))
+        serde_json::from_value(result.payload).map_err(|error| {
+            Self::invalid_response(format!("invalid payload from plugin: {error}"))
+        })
     }
 }
 

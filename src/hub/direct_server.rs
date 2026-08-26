@@ -45,6 +45,13 @@ pub const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
 /// One live, authenticated rig connection.
 pub struct RigConnection {
     pub telescope_id: i64,
+    /// Client-issued identity for this N.I.N.A. plugin process/profile
+    /// lifecycle. It survives transport reconnects but changes on a genuine
+    /// plugin restart, so long-lived consumers know when retained state is no
+    /// longer applicable.
+    pub session_id: Uuid,
+    /// N.I.N.A. profile identity paired with this credential/session.
+    pub profile_id: Uuid,
     /// Server-issued identity for this exact WebSocket generation. The
     /// client's session ID intentionally survives reconnects, so it cannot be
     /// used to decide whether a retiring handler still owns the live slot.
@@ -71,11 +78,23 @@ struct CloseRequest {
 struct PendingQueryGuard<'a> {
     connection: &'a RigConnection,
     id: Uuid,
+    sent: bool,
+    completed: bool,
 }
 
 impl Drop for PendingQueryGuard<'_> {
     fn drop(&mut self) {
         self.connection.remove_pending(&self.id);
+        if self.sent && !self.completed {
+            // The plugin advances its private history cursor when it writes a
+            // result. If this future is cancelled or times out before the Hub
+            // consumes that result, only a physical reconnect can rewind the
+            // unacknowledged delta safely.
+            self.connection.request_close(
+                "a Direct query was interrupted; reconnecting to replay history",
+                true,
+            );
+        }
     }
 }
 
@@ -83,6 +102,9 @@ impl RigConnection {
     /// Send a query and await its result. Errors are strings so callers can
     /// wrap them in their own error type.
     pub async fn query(&self, kind: QueryKind, timeout: Duration) -> Result<QueryResult, String> {
+        if self.is_retiring() {
+            return Err("rig connection is reconnecting".to_string());
+        }
         let id = Uuid::new_v4();
         let (tx, rx) = oneshot::channel();
         {
@@ -92,9 +114,11 @@ impl RigConnection {
             }
             pending.insert(id, tx);
         }
-        let _pending_guard = PendingQueryGuard {
+        let mut pending_guard = PendingQueryGuard {
             connection: self,
             id,
+            sent: false,
+            completed: false,
         };
         // The rig must not execute this after the hub has stopped waiting.
         let expires_at = Some(crate::hub::db::unix_now() + timeout.as_secs() as i64);
@@ -109,8 +133,12 @@ impl RigConnection {
                 mpsc::error::TrySendError::Closed(_) => "rig connection is closed".to_string(),
             });
         }
+        pending_guard.sent = true;
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok(result)) => {
+                pending_guard.completed = true;
+                Ok(result)
+            }
             Ok(Err(_)) => Err("rig connection closed while waiting".to_string()),
             Err(_) => Err("rig did not answer in time".to_string()),
         }
@@ -122,7 +150,7 @@ impl RigConnection {
         }
     }
 
-    fn resolve(&self, result: QueryResult) {
+    pub(crate) fn resolve(&self, result: QueryResult) {
         if let Ok(mut pending) = self.pending.lock()
             && let Some(tx) = pending.remove(&result.id)
         {
@@ -154,6 +182,10 @@ impl RigConnection {
         });
     }
 
+    fn is_retiring(&self) -> bool {
+        self.close_request.borrow().is_some()
+    }
+
     #[cfg(test)]
     fn close_requested(&self) -> bool {
         self.close_request.borrow().is_some()
@@ -167,11 +199,32 @@ impl RigConnection {
         telescope_id: i64,
         connection_id: Uuid,
     ) -> (Arc<RigConnection>, mpsc::Receiver<DirectMessage>) {
+        Self::stub_with_session(telescope_id, connection_id, connection_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stub_with_session(
+        telescope_id: i64,
+        connection_id: Uuid,
+        session_id: Uuid,
+    ) -> (Arc<RigConnection>, mpsc::Receiver<DirectMessage>) {
+        Self::stub_with_identity(telescope_id, connection_id, session_id, Uuid::nil())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stub_with_identity(
+        telescope_id: i64,
+        connection_id: Uuid,
+        session_id: Uuid,
+        profile_id: Uuid,
+    ) -> (Arc<RigConnection>, mpsc::Receiver<DirectMessage>) {
         let (outgoing, rx) = mpsc::channel(MAX_PENDING_QUERIES);
         let (close_request, _close_requests) = watch::channel(None);
         (
             Arc::new(RigConnection {
                 telescope_id,
+                session_id,
+                profile_id,
                 connection_id,
                 payload_version: CURRENT_PAYLOAD_VERSION,
                 capabilities: crate::source::RigCapabilities::all(),
@@ -190,10 +243,30 @@ impl RigConnection {
 #[derive(Default)]
 pub struct RigConnections {
     inner: Mutex<HashMap<i64, Arc<RigConnection>>>,
+    /// Server-side lifecycle boundary. Transport reconnects leave this value
+    /// alone; explicit credential rotation/revocation advances it so no later
+    /// socket can inherit updater state from the old trust relationship.
+    lifecycle_generations: Mutex<HashMap<i64, u64>>,
 }
 
 impl RigConnections {
     pub fn get(&self, telescope_id: i64) -> Option<Arc<RigConnection>> {
+        self.inner.lock().ok()?.get(&telescope_id).cloned()
+    }
+
+    /// Read a connection and its trust epoch as one coherent snapshot. The
+    /// lock order matches `insert_if_generation`, so a revoke cannot advance
+    /// the epoch between validation and selecting a same-identity socket.
+    pub(crate) fn get_if_generation(
+        &self,
+        telescope_id: i64,
+        expected_generation: u64,
+    ) -> Option<Arc<RigConnection>> {
+        let generations = self.lifecycle_generations.lock().ok()?;
+        let current = generations.get(&telescope_id).copied().unwrap_or(0);
+        if current != expected_generation {
+            return None;
+        }
         self.inner.lock().ok()?.get(&telescope_id).cloned()
     }
 
@@ -205,6 +278,7 @@ impl RigConnections {
     }
 
     /// Insert a connection, returning the one it replaced (if any).
+    #[cfg(test)]
     pub(crate) fn insert(&self, connection: Arc<RigConnection>) -> Option<Arc<RigConnection>> {
         self.inner
             .lock()
@@ -212,9 +286,46 @@ impl RigConnections {
             .insert(connection.telescope_id, connection)
     }
 
-    /// Force-remove a telescope's connection (e.g. credentials revoked) and
-    /// return it so the caller can close the socket.
-    pub(crate) fn remove(&self, telescope_id: i64) -> Option<Arc<RigConnection>> {
+    /// Insert only while the server-side trust generation observed during
+    /// authentication is still current. The generation lock is held through
+    /// the connection-map write, using the same lock order as `revoke`, so an
+    /// owner revoke/delete cannot race a completed handshake back into place.
+    pub(crate) fn insert_if_generation(
+        &self,
+        connection: Arc<RigConnection>,
+        expected_generation: u64,
+    ) -> Result<Option<Arc<RigConnection>>, Arc<RigConnection>> {
+        let Ok(generations) = self.lifecycle_generations.lock() else {
+            return Err(connection);
+        };
+        let current = generations
+            .get(&connection.telescope_id)
+            .copied()
+            .unwrap_or(0);
+        if current != expected_generation {
+            return Err(connection);
+        }
+        let Ok(mut connections) = self.inner.lock() else {
+            return Err(connection);
+        };
+        Ok(connections.insert(connection.telescope_id, connection))
+    }
+
+    pub(crate) fn lifecycle_generation(&self, telescope_id: i64) -> u64 {
+        self.lifecycle_generations
+            .lock()
+            .ok()
+            .and_then(|generations| generations.get(&telescope_id).copied())
+            .unwrap_or(0)
+    }
+
+    /// Advance the logical trust lifecycle and force-remove the connection.
+    /// The caller receives the socket so it can send a final close reason.
+    pub(crate) fn revoke(&self, telescope_id: i64) -> Option<Arc<RigConnection>> {
+        if let Ok(mut generations) = self.lifecycle_generations.lock() {
+            let generation = generations.entry(telescope_id).or_default();
+            *generation = generation.saturating_add(1);
+        }
         self.inner.lock().ok()?.remove(&telescope_id)
     }
 
@@ -236,6 +347,13 @@ impl RigConnections {
         {
             map.remove(&telescope_id);
         }
+    }
+
+    /// Remove a socket without advancing the logical trust generation. This
+    /// forces the plugin's physical transport replay for an updater rebuild
+    /// while preserving the authenticated session/profile identity.
+    pub(crate) fn disconnect_for_replay(&self, telescope_id: i64) -> Option<Arc<RigConnection>> {
+        self.inner.lock().ok()?.remove(&telescope_id)
     }
 }
 
@@ -307,7 +425,13 @@ struct PairRollback {
 /// legitimate rig to stop retrying, and must not spend its budget either.
 enum AuthFailure {
     Client(String),
-    Internal(String),
+    Internal {
+        message: String,
+        /// Pairing may have committed revocation of every prior credential
+        /// before a later hub-side failure. The live socket/updater must then
+        /// be retired even though authentication never produced a response.
+        retire_telescope: Option<i64>,
+    },
 }
 
 impl AuthFailure {
@@ -316,7 +440,17 @@ impl AuthFailure {
     }
 
     fn internal(message: impl Into<String>) -> Self {
-        Self::Internal(message.into())
+        Self::Internal {
+            message: message.into(),
+            retire_telescope: None,
+        }
+    }
+
+    fn internal_and_retire(message: impl Into<String>, telescope_id: i64) -> Self {
+        Self::Internal {
+            message: message.into(),
+            retire_telescope: Some(telescope_id),
+        }
     }
 }
 
@@ -344,13 +478,17 @@ fn authenticate(
             // The token is spent now, and it was committed in its own
             // transaction. Every later failure has to hand it back, or a hub
             // fault burns the user's one-time code for good.
-            let restore_token = |context: String| {
+            let restore_token = |context: String, retire_live_connection: bool| {
                 if let Err(error) = state.db.restore_pairing_token(pairing_token) {
                     eprintln!(
                         "Could not restore the pairing token for telescope {telescope_id} after {context}: {error}"
                     );
                 }
-                AuthFailure::internal(context)
+                if retire_live_connection {
+                    AuthFailure::internal_and_retire(context, telescope_id)
+                } else {
+                    AuthFailure::internal(context)
+                }
             };
 
             // Pairing rotates: earlier credentials die so a retired install can
@@ -363,9 +501,10 @@ fn authenticate(
                 ),
                 Ok(_) => {}
                 Err(error) => {
-                    return Err(restore_token(format!(
-                        "could not revoke earlier credentials: {error}"
-                    )));
+                    return Err(restore_token(
+                        format!("could not revoke earlier credentials: {error}"),
+                        false,
+                    ));
                 }
             }
 
@@ -376,9 +515,10 @@ fn authenticate(
             ) {
                 Ok(credential) => credential,
                 Err(error) => {
-                    return Err(restore_token(format!(
-                        "could not create the rig credential: {error}"
-                    )));
+                    return Err(restore_token(
+                        format!("could not create the rig credential: {error}"),
+                        true,
+                    ));
                 }
             };
             let response = DirectMessage::PairResult(crate::direct::protocol::PairResult {
@@ -436,6 +576,9 @@ fn check_hello(hello: &ClientHello) -> Result<(), String> {
             hello.payload_version
         ));
     }
+    if hello.session_id.is_nil() {
+        return Err("Direct session ID must not be nil".to_string());
+    }
     Ok(())
 }
 
@@ -479,7 +622,19 @@ async fn handle_socket(state: HubState, mut socket: WebSocket, client_ip: String
             reject(socket, &message, false).await;
             return;
         }
-        Err(AuthFailure::Internal(message)) => {
+        Err(AuthFailure::Internal {
+            message,
+            retire_telescope,
+        }) => {
+            if let Some(telescope_id) = retire_telescope {
+                if let Some(connection) = state.rig_connections.revoke(telescope_id) {
+                    connection.request_close(
+                        "pairing failed after earlier credentials were revoked",
+                        false,
+                    );
+                }
+                state.refresh_updater(telescope_id).await;
+            }
             // A hub-side fault is not the rig's doing: tell it to come back,
             // and do not spend its per-IP budget on our outage.
             eprintln!("Direct handshake failed for {client_ip}: {message}");
@@ -497,11 +652,12 @@ async fn handle_socket(state: HubState, mut socket: WebSocket, client_ip: String
         DirectMessage::AgentHello(hello) => hello.connection_id,
         _ => unreachable!("authentication only returns hello responses"),
     };
+    let is_pairing = pair_rollback.is_some();
     if !send_message(&mut socket, &response).await {
         // A pairing reply that never arrived means the client still has no
         // credential: give the token back and drop the orphan credential so
         // the client's retry with the same token works.
-        if let Some(rollback) = pair_rollback {
+        if let Some(rollback) = pair_rollback.as_ref() {
             let mut failures = Vec::new();
             if let Err(error) = state.db.delete_rig_credential(&rollback.credential) {
                 failures.push(format!("credential not deleted: {error}"));
@@ -522,6 +678,61 @@ async fn handle_socket(state: HubState, mut socket: WebSocket, client_ip: String
                 );
             }
         }
+        // `authenticate` already revoked every older credential before it
+        // minted the replacement. A failed PairResult cannot restore those
+        // credentials, so the old live socket and updater must not outlive
+        // the now-revoked database trust relationship.
+        if is_pairing {
+            if let Some(replaced) = state.rig_connections.revoke(telescope_id) {
+                replaced.request_close("pairing failed after credentials rotated", false);
+            }
+            state.refresh_updater(telescope_id).await;
+        }
+        return;
+    }
+
+    // A successful pairing is a new trust lifecycle even when the same
+    // running plugin reuses its profile/session IDs. Retire the old updater
+    // generation before adopting the freshly credentialed socket.
+    let authenticated_generation = if is_pairing {
+        if let Some(replaced) = state.rig_connections.revoke(telescope_id) {
+            replaced.request_close("replaced after a new pairing", false);
+        }
+        // Capture the epoch created by this pairing before awaiting updater
+        // retirement. Any owner revoke or competing pairing during that wait
+        // then makes the later conditional insert fail closed.
+        let generation = state.rig_connections.lifecycle_generation(telescope_id);
+        state.refresh_updater(telescope_id).await;
+        generation
+    } else {
+        // Sample before the final database check. A revoke after that check is
+        // still caught by `insert_if_generation`; a revoke before it removes
+        // the credential that is checked below.
+        state.rig_connections.lifecycle_generation(telescope_id)
+    };
+
+    let authenticated_credential = match (&first, pair_rollback.as_ref()) {
+        (DirectMessage::Auth(AuthRequest { credential, .. }), _) => credential.as_str(),
+        (DirectMessage::Pair(_), Some(rollback)) => rollback.credential.as_str(),
+        _ => unreachable!("authenticated pairing must retain its credential"),
+    };
+    let still_valid = state
+        .db
+        .lookup_rig_credential(authenticated_credential)
+        .ok()
+        .flatten()
+        .is_some_and(|row| {
+            row.telescope_id == telescope_id
+                && row.node_id == hello.node_id.to_string()
+                && row.profile_id == hello.profile_id.to_string()
+        });
+    if !still_valid {
+        reject(
+            socket,
+            "credential was revoked while this connection authenticated",
+            false,
+        )
+        .await;
         return;
     }
 
@@ -532,6 +743,8 @@ async fn handle_socket(state: HubState, mut socket: WebSocket, client_ip: String
     let (close_request, mut close_requests) = watch::channel(None);
     let connection = Arc::new(RigConnection {
         telescope_id,
+        session_id: hello.session_id,
+        profile_id: hello.profile_id,
         connection_id,
         payload_version,
         capabilities: hello.capabilities,
@@ -554,7 +767,22 @@ async fn handle_socket(state: HubState, mut socket: WebSocket, client_ip: String
             hello.payload_version
         );
     }
-    if let Some(replaced) = state.rig_connections.insert(connection.clone()) {
+    let replaced = match state
+        .rig_connections
+        .insert_if_generation(connection.clone(), authenticated_generation)
+    {
+        Ok(replaced) => replaced,
+        Err(_) => {
+            reject(
+                socket,
+                "telescope access changed while this connection authenticated",
+                false,
+            )
+            .await;
+            return;
+        }
+    };
+    if let Some(replaced) = replaced {
         replaced.request_close("replaced by a newer connection for this telescope", true);
         println!(
             "Rig for telescope {telescope_id} reconnected with payload v{payload_version} {compatibility}; replacing previous connection"
@@ -565,6 +793,14 @@ async fn handle_socket(state: HubState, mut socket: WebSocket, client_ip: String
             hello.profile_name
         );
     }
+    state
+        .adopt_updater_identity(
+            telescope_id,
+            connection.session_id,
+            connection.profile_id,
+            authenticated_generation,
+        )
+        .await;
 
     let idle = tokio::time::sleep(CLIENT_IDLE_TIMEOUT);
     tokio::pin!(idle);
@@ -752,6 +988,15 @@ mod tests {
         assert!(error.contains("unsupported payload version"));
     }
 
+    #[test]
+    fn websocket_hello_rejects_nil_session_identity() {
+        let mut hello = hello_fixture();
+        hello.session_id = Uuid::nil();
+
+        let error = check_hello(&hello).unwrap_err();
+        assert!(error.contains("session ID"));
+    }
+
     #[tokio::test]
     async fn websocket_pairs_unmarked_legacy_payload_client() {
         let (hub_base, _db, state, telescope_id, pairing_token) = spawn_hub().await;
@@ -823,7 +1068,7 @@ mod tests {
         std::mem::forget(rx);
         connections.insert(connection);
 
-        let removed = connections.remove(7).expect("connection present");
+        let removed = connections.revoke(7).expect("connection present");
         removed.request_close("credentials revoked", false);
         assert!(connections.get(7).is_none());
         assert!(removed.close_requested());
@@ -872,14 +1117,16 @@ mod tests {
         }
         assert!(connection.pending.lock().unwrap().is_empty());
 
-        // The canceled frames still occupy the bounded transport queue, so a
-        // new query fails fast instead of growing memory. The writer will
-        // discard each frame because its waiter no longer exists.
+        // A sent query whose waiter was cancelled makes this physical socket
+        // retire. The plugin may already have advanced its history cursor, so
+        // accepting another query here could silently skip that delta rather
+        // than forcing a reconnect/replay.
         let queue_error = connection
             .query(QueryKind::CameraInfo, Duration::from_secs(1))
             .await
-            .expect_err("full transport queue is bounded");
-        assert!(queue_error.contains("busy"));
+            .expect_err("cancelled sent queries retire the transport");
+        assert!(queue_error.contains("reconnecting"));
+        assert!(connection.close_requested());
         assert!(connection.pending.lock().unwrap().is_empty());
 
         let mut queued = 0;
@@ -888,6 +1135,27 @@ mod tests {
             queued += 1;
         }
         assert_eq!(queued, MAX_PENDING_QUERIES);
+    }
+
+    #[tokio::test]
+    async fn updater_refresh_forces_a_physical_transport_replay() {
+        let db = Db::open_in_memory().unwrap();
+        let state = HubState::build(HubConfig::default(), db, None).unwrap();
+        let (connection, outgoing) = RigConnection::stub(7, Uuid::new_v4());
+        std::mem::forget(outgoing);
+        state.rig_connections.insert(connection.clone());
+
+        // Even if a history query already returned and is blocked later in
+        // chart/chat delivery, rebuilding its updater closes this transport.
+        // The plugin's next BeginDirectTransport call rewinds that confirmed
+        // delta instead of baselining it away.
+        state.refresh_updater(7).await;
+
+        assert!(state.rig_connections.get(7).is_none());
+        assert!(connection.close_requested());
+        let request = connection.close_request.borrow().clone().unwrap();
+        assert!(request.retryable);
+        assert!(request.reason.contains("reconnecting"));
     }
 
     #[test]

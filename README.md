@@ -29,13 +29,17 @@ installation, open **Options → Plugins → Chatstronomy**, and choose Hosted H
 a local delivery method. Before pairing or starting a local runtime, review the
 profile's **Security and privacy** and **Event delivery** selections.
 
-The plugin captures native equipment, image, autofocus, guider, sequence,
-cooling, wait, slew, center, and Target Scheduler state. Per-profile event
-controls are a hard transmission and privacy boundary: disabled event families
-never reach the hosted Hub or local runtime, including previously buffered
-events. There is no exception for state reconstruction or command-failure
-reporting. Disabling image delivery also blocks existing image history and
-thumbnails; images captured while sharing is off cannot be retrieved later.
+The plugin captures native equipment, image, autofocus, guider, safety-monitor,
+sequence, cooling, wait, slew, center, and Target Scheduler state. Autofocus
+graph input comes from the report matching the completed run. Supported
+long-running Sequencer+ waits include condition and manual waits as well as
+**Wait Until Safe**; private condition expressions and pause reasons remain
+inside N.I.N.A. Per-profile event controls are a hard transmission and privacy
+boundary: disabled event families never reach the hosted Hub or local runtime,
+including previously buffered events. There is no exception for state
+reconstruction or command-failure reporting. Disabling image delivery also
+blocks existing image history and thumbnails; images captured while sharing is
+off cannot be retrieved later.
 Equipment and status snapshots remain available, but disabled events can leave
 historical or intermediate state incomplete. Most event families, including
 images and N.I.N.A. popup notifications, start enabled. Raw N.I.N.A. log levels

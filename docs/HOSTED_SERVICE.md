@@ -99,8 +99,14 @@ Use HTTPS/WSS at the public edge. Health is exposed at `/healthz`.
 
 The plugin answers independently permitted event, image, sequence, chart,
 equipment, and typed-command queries. Hub updaters reconstruct available target,
-sequence, wait, cooling, guider, mount, and image state from enabled event
-families and permitted status snapshots; disabled events or images can make
-that state incomplete. Only approved notifications are routed to attached
-Discord channels. Disconnects remove the live source; reconnecting with the
-stored credential replaces the stale session for the same rig identity.
+sequence, timed waits, supported Sequencer+ waits, safety transitions and active
+safety-wait state, cooling, guider, mount, and image state from enabled event
+families and permitted status snapshots. Autofocus graphs use the report matched
+to the completed run, and graph delivery tolerates bounded transient query
+failures. Guider
+graph failures remain non-fatal and the image notification is sent without the
+graph.
+Disabled events or images can make state incomplete. Only approved
+notifications are routed to attached Discord channels. Disconnects remove the
+live source; reconnecting with the stored credential replaces the stale session
+for the same rig identity.
