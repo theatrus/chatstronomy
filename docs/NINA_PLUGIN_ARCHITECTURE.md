@@ -36,7 +36,11 @@ rendering, Discord slash commands, and Matrix/Discord delivery. It includes:
 - thumbnails, the matching completed autofocus report, guider data, and
   rendered graph inputs;
 - mount, camera, filter wheel, guider, rotator, and focuser snapshots;
-- safety-monitor transitions and active safety-wait state;
+- durable safety-monitor state and active safety-wait state;
+- mount-slew completion; dome/shutter and flat-panel lifecycle; and connection
+  state for weather and switch devices;
+- image-save failures and sequence-item failures with explicit sequence
+  completion outcomes;
 - typed commands such as park, guide, cool, autofocus, and sequence control.
 
 Direct v1 envelopes currently advertise additive payload contract v3. Version
@@ -53,17 +57,19 @@ numbers and strings with zero or empty sentinels. The additive
 `LocationRedacted: true` marker lets newer consumers omit those rows entirely.
 The existing `StatusCode: 202` response marks asynchronous commands as accepted
 rather than completed. Hardware-command failures become
-`CHATSTRONOMY-COMMAND-FAILED` events and are transmitted only when their event
-category is enabled in the N.I.N.A. profile.
+`CHATSTRONOMY-COMMAND-FAILED` events. Once N.I.N.A. accepts a locally permitted
+command, its terminal failure is always delivered as part of that command
+exchange rather than optional event chatter.
 
 ## Event delivery and state
 
 Event-delivery settings are enforced before events leave N.I.N.A. Events from
 disabled categories are not sent to the local runtime or the hosted Hub; this
 includes previously captured events whose category has since been disabled.
-There is no state-reconstruction exception and command-failure events follow the
-same category settings as every other event. Log events are sent only when their
-individual log level is enabled.
+There is no state-reconstruction exception. The sole delivery exception is a
+terminal failure for a locally permitted command that N.I.N.A. already
+accepted; it remains part of that command exchange. Log events are sent only
+when their individual log level is enabled.
 
 Disabling image delivery also returns an empty image history and blocks
 thumbnail retrieval, including explicit last-image requests. Images captured
@@ -77,16 +83,30 @@ that additional state. Older peers that supply `ChatEnabled` continue to be
 accepted for Direct payload compatibility.
 
 The plugin observes native safety-monitor connection and safe/unsafe changes.
-Safety events have their own delivery switch. A **Wait Until Safe** operation is
-visible only when both sequence and safety delivery are enabled, and its state
-comes from the safety-monitor mediator rather than a potentially stale sequence
-item property.
+The updater retains the resulting unknown, disconnected, safe, or unsafe state
+for status output while safety delivery remains enabled. Safety events have
+their own delivery switch. A **Wait Until Safe** operation is visible only when
+both sequence and safety delivery are enabled, and its state comes from the
+safety-monitor mediator rather than a potentially stale sequence item property.
 
-Sequence snapshots identify selected long-running Sequencer+ waits: **Wait
-Until Safe**, condition waits, and manual waits. The wire projection includes
-only operational state such as status and polling interval; condition
-expressions and free-form pause reasons stay inside N.I.N.A. Other Sequencer+
-items continue to use the existing generic sequence representation.
+Sequence snapshots identify N.I.N.A.'s built-in timed, altitude, Moon-altitude,
+Sun-altitude, horizon, and safety waits, camera cooling and warming, mount slews,
+centering, and standalone plate solves. They also identify selected long-running
+Sequencer+ waits: **Wait Until Safe**, condition waits, and manual waits. The
+wire projection includes only operational state such as status and polling
+interval; condition expressions and free-form pause reasons stay inside
+N.I.N.A. Other Sequencer+ items continue to use the existing generic sequence
+representation. Root sequence-item failures are emitted separately, and final
+sequence events carry an explicit outcome; an ambiguous end is rendered
+neutrally rather than being presented as a successful completion.
+
+Dome/shutter actions and flat-panel cover, light, and brightness changes are
+governed by the plugin's dedicated **Observatory and flat panel** switch.
+Connect/disconnect events for dome, flat-panel, weather, and switch devices are
+governed by **Equipment connections**. The contract does not expose weather
+measurements, switch values, or LiveStack data as structured telemetry. Enabled
+popup notifications and opt-in raw N.I.N.A. logs remain unstructured text and
+may contain operational details.
 
 For mixed payload-v3 deployments, changing mount, sequence, or safety delivery
 invalidates the existing Direct session before the plugin publishes the new

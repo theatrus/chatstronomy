@@ -191,9 +191,21 @@ pub enum SequenceOperationKind {
         target_temperature: f64,
         minimum_duration: Option<chrono::Duration>,
     },
+    CameraWarming {
+        minimum_duration: Option<chrono::Duration>,
+    },
     TimeWait {
         target_time: Option<ChronoDateTime<FixedOffset>>,
         configured_duration: Option<chrono::Duration>,
+    },
+    AstronomicalWait {
+        target_altitude_degrees: Option<f64>,
+        current_altitude_degrees: Option<f64>,
+        comparator: Option<String>,
+        /// N.I.N.A. may serialize an observatory-local `DateTime` without an
+        /// offset. Preserve the bounded display value rather than guessing the
+        /// observatory timezone on a remote Hub.
+        expected_time: Option<String>,
     },
     SafetyWait {
         is_safe: Option<bool>,
@@ -216,6 +228,11 @@ pub enum SequenceOperationKind {
         may_be_center: bool,
     },
     MountCenter {
+        coordinates: Option<OperationCoordinates>,
+        rotation: Option<f64>,
+        output: Option<Box<PlateSolveOutput>>,
+    },
+    PlateSolve {
         coordinates: Option<OperationCoordinates>,
         rotation: Option<f64>,
         output: Option<Box<PlateSolveOutput>>,
@@ -341,9 +358,12 @@ pub fn extract_sequence_operations(sequence: &SequenceResponse) -> Vec<SequenceO
             let explicit_kind = object.get("OperationKind").and_then(Value::as_str);
             let is_cooling = explicit_kind == Some("camera_cooling")
                 || (object.contains_key("Temperature") && object.contains_key("MinCoolingTime"));
+            let is_warming = explicit_kind == Some("camera_warming")
+                || (explicit_kind.is_none() && object.contains_key("MinWarmingTime"));
             let is_wait = explicit_kind == Some("time_wait")
                 || object.contains_key("CalculatedWaitDuration")
                 || object.contains_key("Delay");
+            let is_astronomical_wait = explicit_kind == Some("astronomical_wait");
             let is_safety_wait = explicit_kind == Some("safety_wait")
                 || (object.contains_key("IsSafe") && object.contains_key("WaitInterval"));
             let is_condition_wait = explicit_kind == Some("condition_wait");
@@ -356,6 +376,7 @@ pub fn extract_sequence_operations(sequence: &SequenceResponse) -> Vec<SequenceO
                 || lower_name.contains("zentrier");
             let is_center = explicit_kind == Some("mount_center")
                 || (has_coordinates && (object.contains_key("Rotation") || name_is_center));
+            let is_plate_solve = explicit_kind == Some("plate_solve");
             let is_slew = explicit_kind == Some("mount_slew") || (has_coordinates && !is_center);
 
             if is_cooling {
@@ -373,6 +394,39 @@ pub fn extract_sequence_operations(sequence: &SequenceResponse) -> Vec<SequenceO
                         },
                     });
                 }
+            } else if is_warming {
+                output.push(SequenceOperation {
+                    key: key.clone(),
+                    name: name.clone(),
+                    status: status.clone(),
+                    chat_enabled,
+                    kind: SequenceOperationKind::CameraWarming {
+                        minimum_duration: object
+                            .get("MinWarmingTime")
+                            .and_then(parse_minutes_or_timespan),
+                    },
+                });
+            } else if is_astronomical_wait {
+                output.push(SequenceOperation {
+                    key: key.clone(),
+                    name: name.clone(),
+                    status: status.clone(),
+                    chat_enabled,
+                    kind: SequenceOperationKind::AstronomicalWait {
+                        target_altitude_degrees: object
+                            .get("TargetAltitude")
+                            .or_else(|| object.get("Altitude"))
+                            .and_then(value_as_angle),
+                        current_altitude_degrees: object
+                            .get("CurrentAltitude")
+                            .and_then(value_as_angle),
+                        comparator: object.get("Comparator").and_then(value_as_wire_text),
+                        expected_time: object
+                            .get("ExpectedDateTime")
+                            .or_else(|| object.get("ExpectedTime"))
+                            .and_then(value_as_wire_text),
+                    },
+                });
             } else if is_safety_wait {
                 output.push(SequenceOperation {
                     key: key.clone(),
@@ -423,6 +477,23 @@ pub fn extract_sequence_operations(sequence: &SequenceResponse) -> Vec<SequenceO
                         },
                     });
                 }
+            } else if is_plate_solve {
+                output.push(SequenceOperation {
+                    key: key.clone(),
+                    name: name.clone(),
+                    status: status.clone(),
+                    chat_enabled,
+                    kind: SequenceOperationKind::PlateSolve {
+                        coordinates: object
+                            .get("Coordinates")
+                            .and_then(parse_operation_coordinates),
+                        rotation: object.get("Rotation").and_then(value_as_f64),
+                        output: object
+                            .get("PlateSolveOutput")
+                            .and_then(parse_plate_solve_output)
+                            .map(Box::new),
+                    },
+                });
             } else if is_center {
                 output.push(SequenceOperation {
                     key: key.clone(),
@@ -595,6 +666,23 @@ fn value_as_f64(value: &Value) -> Option<f64> {
         .as_f64()
         .or_else(|| value.as_str()?.parse::<f64>().ok())
         .filter(|value| value.is_finite())
+}
+
+fn value_as_angle(value: &Value) -> Option<f64> {
+    value_as_f64(value).or_else(|| value.get("Degree").and_then(value_as_f64))
+}
+
+fn value_as_wire_text(value: &Value) -> Option<String> {
+    const MAX_WIRE_TEXT_LEN: usize = 256;
+    let value = match value {
+        Value::String(value) => value.trim().to_string(),
+        Value::Number(_) | Value::Bool(_) => value.to_string(),
+        _ => return None,
+    };
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(MAX_WIRE_TEXT_LEN).collect())
 }
 
 fn parse_target_time(value: &str) -> Option<ChronoDateTime<FixedOffset>> {
@@ -1288,6 +1376,12 @@ mod tests {
                             "MinCoolingTime": "00:15:00"
                         },
                         {
+                            "Name": "Warm camera",
+                            "Status": "RUNNING",
+                            "OperationKind": "camera_warming",
+                            "MinWarmingTime": "00:10:00"
+                        },
+                        {
                             "Name": "Wait for time span",
                             "Status": "RUNNING",
                             "OperationKind": "time_wait",
@@ -1305,7 +1399,7 @@ mod tests {
         .unwrap();
 
         let operations = extract_sequence_operations(&sequence);
-        assert_eq!(operations.len(), 2);
+        assert_eq!(operations.len(), 3);
         assert!(operations.iter().all(SequenceOperation::is_active));
         assert!(matches!(
             operations[0].kind,
@@ -1316,6 +1410,12 @@ mod tests {
         ));
         assert!(matches!(
             operations[1].kind,
+            SequenceOperationKind::CameraWarming {
+                minimum_duration: Some(duration)
+            } if duration == chrono::Duration::minutes(10)
+        ));
+        assert!(matches!(
+            operations[2].kind,
             SequenceOperationKind::TimeWait {
                 target_time: None,
                 configured_duration: Some(duration)
@@ -1627,6 +1727,86 @@ mod tests {
                 && output.separation_arcseconds == Some(2.4)
                 && output.thumbnail.as_deref() == Some(&[1, 2, 3][..])
         ));
+    }
+
+    #[test]
+    fn extracts_astronomical_wait_and_standalone_plate_solve() {
+        let sequence: SequenceResponse = serde_json::from_value(serde_json::json!({
+            "Response": [{
+                "Name": "Target_Container",
+                "Status": "RUNNING",
+                "Items": [{
+                    "Name": "Wait for altitude",
+                    "Status": "RUNNING",
+                    "OperationKind": "astronomical_wait",
+                    "TargetAltitude": { "Degree": 30.0 },
+                    "CurrentAltitude": 18.5,
+                    "Comparator": "GREATER_THAN",
+                    "ExpectedDateTime": "2026-08-26T04:30:00-07:00",
+                    "ChatEnabled": true
+                }, {
+                    "Name": "Solve image",
+                    "Status": "RUNNING",
+                    "OperationKind": "plate_solve",
+                    "Coordinates": {
+                        "RAString": "12:30:00",
+                        "DecString": "+42:15:00",
+                        "Epoch": "J2000"
+                    },
+                    "Rotation": 91.5,
+                    "PlateSolveOutput": {
+                        "SolveTime": "2026-08-26T11:30:00Z",
+                        "Success": true,
+                        "PositionAngle": 91.45,
+                        "PixelScale": 1.25,
+                        "SeparationArcseconds": 2.4,
+                        "ThumbnailBase64": "AQID",
+                        "ThumbnailMediaType": "image/jpeg"
+                    },
+                    "ChatEnabled": true
+                }, {
+                    "Name": "Private solve",
+                    "Status": "RUNNING",
+                    "OperationKind": "plate_solve",
+                    "Coordinates": { "RA": 1.0, "Dec": 2.0 },
+                    "ChatEnabled": false
+                }]
+            }],
+            "Error": "",
+            "StatusCode": 200,
+            "Success": true,
+            "Type": "Direct"
+        }))
+        .unwrap();
+
+        let operations = extract_sequence_operations(&sequence);
+        assert_eq!(operations.len(), 2);
+        assert!(matches!(
+            &operations[0].kind,
+            SequenceOperationKind::AstronomicalWait {
+                target_altitude_degrees: Some(target),
+                current_altitude_degrees: Some(current),
+                comparator: Some(comparator),
+                expected_time: Some(expected),
+            } if (*target - 30.0).abs() < f64::EPSILON
+                && (*current - 18.5).abs() < f64::EPSILON
+                && comparator == "GREATER_THAN"
+                && expected == "2026-08-26T04:30:00-07:00"
+        ));
+        assert!(matches!(
+            &operations[1].kind,
+            SequenceOperationKind::PlateSolve {
+                coordinates: Some(coordinates),
+                rotation: Some(rotation),
+                output: Some(output),
+            } if coordinates.ra_string.as_deref() == Some("12:30:00")
+                && (*rotation - 91.5).abs() < f64::EPSILON
+                && output.success == Some(true)
+                && output.thumbnail.as_deref() == Some(&[1, 2, 3][..])
+        ));
+
+        let suppressed = extract_suppressed_sequence_operation_keys(&sequence);
+        assert!(suppressed.contains("0/2"));
     }
 
     #[test]

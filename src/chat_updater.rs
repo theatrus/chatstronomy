@@ -8,12 +8,12 @@ use crate::events::{
 };
 use crate::images::ImageMetadata;
 use crate::sequence::{
-    SequenceOperation, SequenceOperationKind, SequenceResponse,
+    PlateSolveOutput, SequenceOperation, SequenceOperationKind, SequenceResponse,
     extract_current_target_with_delivery, extract_meridian_flip_time, extract_sequence_operations,
     extract_suppressed_sequence_operation_keys, meridian_flip_time_formatted_with_clock,
 };
 use crate::source::{RigSourceError, SharedRigSource};
-use chrono::{DateTime, FixedOffset, Local, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
@@ -91,12 +91,41 @@ struct TargetInfo {
     coordinates: Option<TargetCoordinates>,
     project: Option<String>,
     rotation: Option<f64>,
+    target_end_time: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum TargetSource {
     Sequence,
     TsTargetStart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SafetyState {
+    Unknown,
+    ConnectedUnknown,
+    Safe,
+    Unsafe,
+    Disconnected,
+}
+
+impl SafetyState {
+    fn status_text(self) -> Option<&'static str> {
+        match self {
+            Self::Unknown => None,
+            Self::ConnectedUnknown => Some("🛡️ Safety monitor connected; state unknown"),
+            Self::Safe => Some("🛡️ Conditions safe"),
+            Self::Unsafe => Some("⚠️ Conditions unsafe"),
+            Self::Disconnected => Some("⚠️ Safety monitor disconnected"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SequenceFailureInfo {
+    entity: String,
+    entity_type: String,
+    error: String,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +153,9 @@ impl TrackedSequenceOperation {
             SequenceOperationKind::TimeWait {
                 configured_duration: Some(duration),
                 ..
+            } => Some(now + *duration),
+            SequenceOperationKind::CameraWarming {
+                minimum_duration: Some(duration),
             } => Some(now + *duration),
             _ => None,
         };
@@ -189,9 +221,26 @@ impl TrackedSequenceOperation {
                 let remaining = (camera.temperature - target_temperature).abs();
                 Some(((1.0 - remaining / total).clamp(0.0, 1.0) * 100.0).round() as u8)
             }
-            SequenceOperationKind::MountSlew { .. } | SequenceOperationKind::MountCenter { .. } => {
-                None
+            SequenceOperationKind::CameraWarming { minimum_duration } => {
+                let end = self
+                    .estimated_end
+                    .or_else(|| minimum_duration.map(|duration| self.started_at + duration))?;
+                let total = end
+                    .signed_duration_since(self.started_at)
+                    .num_milliseconds();
+                if total <= 0 {
+                    return Some(100);
+                }
+                let elapsed = now
+                    .signed_duration_since(self.started_at)
+                    .num_milliseconds()
+                    .clamp(0, total);
+                Some(((elapsed as f64 / total as f64) * 100.0).round() as u8)
             }
+            SequenceOperationKind::MountSlew { .. }
+            | SequenceOperationKind::MountCenter { .. }
+            | SequenceOperationKind::PlateSolve { .. }
+            | SequenceOperationKind::AstronomicalWait { .. } => None,
             SequenceOperationKind::SafetyWait { .. }
             | SequenceOperationKind::ConditionWait { .. }
             | SequenceOperationKind::ManualWait => None,
@@ -206,14 +255,82 @@ impl TrackedSequenceOperation {
     }
 }
 
+fn operation_plate_solve_output(kind: &SequenceOperationKind) -> Option<&PlateSolveOutput> {
+    match kind {
+        SequenceOperationKind::MountCenter {
+            output: Some(output),
+            ..
+        }
+        | SequenceOperationKind::PlateSolve {
+            output: Some(output),
+            ..
+        } => Some(output),
+        _ => None,
+    }
+}
+
+fn add_plate_solve_output_fields(
+    mut message: ChatMessage,
+    output: &PlateSolveOutput,
+) -> ChatMessage {
+    if let Some(success) = output.success {
+        message = message.field(
+            "Plate solve",
+            if success { "Succeeded" } else { "Failed" },
+            true,
+        );
+    }
+    if let Some(coordinates) = &output.coordinates {
+        message = message.field("Solved position", &coordinates.display(), false);
+    }
+    if let Some(angle) = output.position_angle {
+        message = message.field("Position angle", &format!("{angle:.2}°"), true);
+    }
+    if let Some(scale) = output.pixel_scale {
+        message = message.field("Image scale", &format!("{scale:.2} arcsec/px"), true);
+    }
+    if let Some(radius) = output.radius_degrees {
+        message = message.field("Solve radius", &format!("{radius:.2}°"), true);
+    }
+    if let Some(separation) = output.separation_arcseconds {
+        message = message.field("Pointing error", &format!("{separation:.1} arcsec"), true);
+    }
+    if output.ra_error.is_some() || output.dec_error.is_some() {
+        message = message.field(
+            "Axis error",
+            &format!(
+                "RA {} · Dec {}",
+                output.ra_error.as_deref().unwrap_or("--"),
+                output.dec_error.as_deref().unwrap_or("--")
+            ),
+            false,
+        );
+    }
+    if output.ra_pixel_error.is_some() || output.dec_pixel_error.is_some() {
+        message = message.field(
+            "Pixel error",
+            &format!(
+                "RA {} · Dec {}",
+                output
+                    .ra_pixel_error
+                    .map(|value| format!("{value:.2} px"))
+                    .unwrap_or_else(|| "--".to_string()),
+                output
+                    .dec_pixel_error
+                    .map(|value| format!("{value:.2} px"))
+                    .unwrap_or_else(|| "--".to_string())
+            ),
+            false,
+        );
+    }
+    if output.flipped == Some(true) {
+        message = message.field("Orientation", "Flipped", true);
+    }
+    message
+}
+
 fn plate_solve_output_key(hasher: &RandomState, operation: &SequenceOperation) -> Option<String> {
-    let SequenceOperationKind::MountCenter {
-        output: Some(output),
-        ..
-    } = &operation.kind
-    else {
-        return None;
-    };
+    let output = operation_plate_solve_output(&operation.kind)?;
     Some(format!(
         "p:{:016x}",
         hasher.hash_one((
@@ -363,8 +480,24 @@ struct UpdaterState {
     last_guider_event: Option<String>,
     /// True if the last sequence event was STARTING (not FINISHED).
     sequence_running: bool,
+    /// Failure from the current or most recently ended sequence. Cleared by a
+    /// subsequent sequence start so a normal finish is never called success.
+    sequence_failure: Option<SequenceFailureInfo>,
+    sequence_outcome: Option<String>,
     /// Active TS-WAITSTART wait-end time, if NINA is currently waiting.
     wait_until: Option<DateTime<FixedOffset>>,
+    safety_state: SafetyState,
+    dome_connected: Option<bool>,
+    dome_shutter_open: Option<bool>,
+    dome_azimuth: Option<f64>,
+    dome_parked: Option<bool>,
+    dome_homed: Option<bool>,
+    flat_connected: Option<bool>,
+    flat_cover_state: Option<String>,
+    flat_light_on: Option<bool>,
+    flat_brightness: Option<i32>,
+    weather_connected: Option<bool>,
+    switch_connected: Option<bool>,
     /// A recent legacy signal that the otherwise-ambiguous coordinate
     /// operation is a center rather than a plain slew.
     center_event_seen_at: Option<DateTime<Utc>>,
@@ -403,7 +536,21 @@ impl UpdaterState {
             last_mount_event: None,
             last_guider_event: None,
             sequence_running: false,
+            sequence_failure: None,
+            sequence_outcome: None,
             wait_until: None,
+            safety_state: SafetyState::Unknown,
+            dome_connected: None,
+            dome_shutter_open: None,
+            dome_azimuth: None,
+            dome_parked: None,
+            dome_homed: None,
+            flat_connected: None,
+            flat_cover_state: None,
+            flat_light_on: None,
+            flat_brightness: None,
+            weather_connected: None,
+            switch_connected: None,
             center_event_seen_at: None,
             sequence_operations: HashMap::new(),
             plate_solve_outputs_seen: BoundedSeenSet::new(SEEN_SET_CAPACITY),
@@ -460,6 +607,14 @@ impl UpdaterState {
                             .map(|camera| (camera.temperature * 2.0).round() as i64)
                             .unwrap_or(i64::MIN)
                     ),
+                    SequenceOperationKind::CameraWarming { .. } => format!(
+                        "warm:{}",
+                        operation
+                            .camera
+                            .as_ref()
+                            .map(|camera| (camera.temperature * 2.0).round() as i64)
+                            .unwrap_or(i64::MIN)
+                    ),
                     SequenceOperationKind::MountSlew { coordinates, .. } => format!(
                         "slew:{}",
                         coordinates.as_ref().map_or("", |coordinates| {
@@ -472,6 +627,25 @@ impl UpdaterState {
                             .as_ref()
                             .and_then(|output| output.solve_time.as_deref())
                             .unwrap_or("")
+                    ),
+                    SequenceOperationKind::PlateSolve { output, .. } => format!(
+                        "solve:{}",
+                        output
+                            .as_ref()
+                            .and_then(|output| output.solve_time.as_deref())
+                            .unwrap_or("")
+                    ),
+                    SequenceOperationKind::AstronomicalWait {
+                        target_altitude_degrees,
+                        current_altitude_degrees,
+                        comparator,
+                        expected_time,
+                    } => format!(
+                        "astro:{:?}:{:?}:{}:{}",
+                        target_altitude_degrees.map(f64::to_bits),
+                        current_altitude_degrees.map(f64::to_bits),
+                        comparator.as_deref().unwrap_or(""),
+                        expected_time.as_deref().unwrap_or("")
                     ),
                     SequenceOperationKind::SafetyWait { is_safe, .. } => format!(
                         "safety:{}",
@@ -497,9 +671,32 @@ impl UpdaterState {
             .meridian_flip_time
             .map(|h| (h * 60.0).round() as i64)
             .unwrap_or(-1);
+        let target_end = self
+            .current_target
+            .as_ref()
+            .and_then(|target| target.target_end_time)
+            .map(|end| end.timestamp())
+            .unwrap_or_default();
+        let failure = self
+            .sequence_failure
+            .as_ref()
+            .map_or("", |failure| failure.error.as_str());
         format!(
-            "t={target}|f={filter}|m={mount}|g={guider}|w={wait_minutes}|sr={}|flip={flip_minutes}|ops={}",
+            "t={target}|te={target_end}|f={filter}|m={mount}|g={guider}|w={wait_minutes}|sr={}|sf={failure}|so={:?}|safe={:?}|dc={:?}|dso={:?}|daz={:?}|dp={:?}|dh={:?}|fc={:?}|fcs={:?}|fl={:?}|fb={:?}|wc={:?}|sw={:?}|flip={flip_minutes}|ops={}",
             self.sequence_running,
+            self.sequence_outcome,
+            self.safety_state,
+            self.dome_connected,
+            self.dome_shutter_open,
+            self.dome_azimuth,
+            self.dome_parked,
+            self.dome_homed,
+            self.flat_connected,
+            self.flat_cover_state,
+            self.flat_light_on,
+            self.flat_brightness,
+            self.weather_connected,
+            self.switch_connected,
             operations.join(",")
         )
     }
@@ -578,6 +775,9 @@ pub struct ChatUpdater {
 struct PendingAutofocusDelivery {
     event_time: String,
     report_timestamp: Option<String>,
+    filter: Option<String>,
+    position: Option<f64>,
+    temperature: Option<f64>,
     attempts: usize,
     next_attempt_at: TokioInstant,
     retry_delay: Duration,
@@ -807,6 +1007,7 @@ impl ChatUpdater {
     /// bot). No-op for telescopes routed only through webhooks/Matrix, or
     /// when the state fingerprint hasn't changed since the last cycle.
     pub async fn refresh_status_message(&mut self) {
+        self.expire_target_scheduler_target(Utc::now());
         if !self.chat_manager.has_status_upsert(&self.chat_target) {
             return;
         }
@@ -875,11 +1076,16 @@ impl ChatUpdater {
     async fn camera_snapshot_for(&self, operations: &[SequenceOperation]) -> Option<CameraInfo> {
         let cooling = operations.iter().any(|operation| {
             operation.is_active()
-                && matches!(operation.kind, SequenceOperationKind::CameraCooling { .. })
+                && matches!(
+                    operation.kind,
+                    SequenceOperationKind::CameraCooling { .. }
+                        | SequenceOperationKind::CameraWarming { .. }
+                )
         }) || self.state.sequence_operations.values().any(|tracked| {
             matches!(
                 tracked.operation.kind,
                 SequenceOperationKind::CameraCooling { .. }
+                    | SequenceOperationKind::CameraWarming { .. }
             )
         });
         if !cooling || !self.source.capabilities().equipment_snapshots {
@@ -975,6 +1181,7 @@ impl ChatUpdater {
                     if matches!(
                         previous.operation.kind,
                         SequenceOperationKind::CameraCooling { .. }
+                            | SequenceOperationKind::CameraWarming { .. }
                     ) {
                         previous.camera = camera.clone();
                     }
@@ -1005,6 +1212,7 @@ impl ChatUpdater {
                     if matches!(
                         previous.operation.kind,
                         SequenceOperationKind::CameraCooling { .. }
+                            | SequenceOperationKind::CameraWarming { .. }
                     ) {
                         previous.camera = camera.clone();
                     }
@@ -1029,6 +1237,7 @@ impl ChatUpdater {
                     if matches!(
                         previous.operation.kind,
                         SequenceOperationKind::CameraCooling { .. }
+                            | SequenceOperationKind::CameraWarming { .. }
                     ) {
                         previous.camera = camera.clone();
                     }
@@ -1063,6 +1272,7 @@ impl ChatUpdater {
                 if matches!(
                     tracked.operation.kind,
                     SequenceOperationKind::CameraCooling { .. }
+                        | SequenceOperationKind::CameraWarming { .. }
                 ) {
                     if tracked.initial_temperature.is_none() {
                         tracked.initial_temperature = camera
@@ -1113,14 +1323,20 @@ impl ChatUpdater {
                 continue;
             }
             let suppress_duplicate_center = center_event_operation.as_deref() == Some(key.as_str());
-            let operation_camera =
-                matches!(operation.kind, SequenceOperationKind::CameraCooling { .. })
-                    .then(|| camera.clone())
-                    .flatten();
+            let operation_camera = matches!(
+                operation.kind,
+                SequenceOperationKind::CameraCooling { .. }
+                    | SequenceOperationKind::CameraWarming { .. }
+            )
+            .then(|| camera.clone())
+            .flatten();
             let mut tracked = TrackedSequenceOperation::new(operation, now, operation_camera);
             if matches!(
-                tracked.operation.kind,
-                SequenceOperationKind::TimeWait { .. }
+                &tracked.operation.kind,
+                SequenceOperationKind::TimeWait {
+                    target_time: None,
+                    ..
+                }
             ) && event_wait_end.is_some()
             {
                 tracked.estimated_end = event_wait_end;
@@ -1194,6 +1410,21 @@ impl ChatUpdater {
             (SequenceOperationKind::CameraCooling { .. }, OperationUpdate::Failed { .. }) => {
                 ("Camera cooling", "❌ Camera cooling failed")
             }
+            (SequenceOperationKind::CameraWarming { .. }, OperationUpdate::Started) => {
+                ("Camera warming", "🌡️ Camera warming started")
+            }
+            (SequenceOperationKind::CameraWarming { .. }, OperationUpdate::Progress(_)) => {
+                ("Camera warming", "🌡️ Camera warming update")
+            }
+            (SequenceOperationKind::CameraWarming { .. }, OperationUpdate::Finished { .. }) => {
+                ("Camera warming", "✅ Camera warming finished")
+            }
+            (SequenceOperationKind::CameraWarming { .. }, OperationUpdate::Ended { .. }) => {
+                ("Camera warming", "Camera warming ended")
+            }
+            (SequenceOperationKind::CameraWarming { .. }, OperationUpdate::Failed { .. }) => {
+                ("Camera warming", "❌ Camera warming failed")
+            }
             (SequenceOperationKind::TimeWait { .. }, OperationUpdate::Started) => {
                 ("Timed wait", "⏳ Timed wait started")
             }
@@ -1208,6 +1439,18 @@ impl ChatUpdater {
             }
             (SequenceOperationKind::TimeWait { .. }, OperationUpdate::Failed { .. }) => {
                 ("Timed wait", "❌ Timed wait failed")
+            }
+            (SequenceOperationKind::AstronomicalWait { .. }, OperationUpdate::Started) => {
+                ("Astronomical wait", "🌌 Astronomical wait started")
+            }
+            (SequenceOperationKind::AstronomicalWait { .. }, OperationUpdate::Finished { .. }) => {
+                ("Astronomical wait", "✅ Astronomical condition reached")
+            }
+            (SequenceOperationKind::AstronomicalWait { .. }, OperationUpdate::Ended { .. }) => {
+                ("Astronomical wait", "Astronomical wait ended")
+            }
+            (SequenceOperationKind::AstronomicalWait { .. }, OperationUpdate::Failed { .. }) => {
+                ("Astronomical wait", "❌ Astronomical wait failed")
             }
             (SequenceOperationKind::SafetyWait { .. }, OperationUpdate::Started) => {
                 ("Safety wait", "🛡️ Waiting for safe conditions")
@@ -1272,11 +1515,30 @@ impl ChatUpdater {
             (SequenceOperationKind::MountCenter { .. }, OperationUpdate::Failed { .. }) => {
                 ("Center", "❌ Centering failed")
             }
+            (SequenceOperationKind::PlateSolve { .. }, OperationUpdate::Started) => {
+                ("Plate solve", "🔎 Plate solve started")
+            }
+            (SequenceOperationKind::PlateSolve { .. }, OperationUpdate::Output) => {
+                ("Plate solve", "🔎 Plate solve result")
+            }
+            (SequenceOperationKind::PlateSolve { .. }, OperationUpdate::Finished { .. }) => {
+                ("Plate solve", "✅ Plate solve finished")
+            }
+            (SequenceOperationKind::PlateSolve { .. }, OperationUpdate::Ended { .. }) => {
+                ("Plate solve", "Plate solve ended")
+            }
+            (SequenceOperationKind::PlateSolve { .. }, OperationUpdate::Failed { .. }) => {
+                ("Plate solve", "❌ Plate solve failed")
+            }
             (SequenceOperationKind::MountSlew { .. }, OperationUpdate::Progress(_))
             | (SequenceOperationKind::MountSlew { .. }, OperationUpdate::Output)
             | (SequenceOperationKind::MountCenter { .. }, OperationUpdate::Progress(_))
+            | (SequenceOperationKind::PlateSolve { .. }, OperationUpdate::Progress(_))
             | (SequenceOperationKind::CameraCooling { .. }, OperationUpdate::Output)
+            | (SequenceOperationKind::CameraWarming { .. }, OperationUpdate::Output)
             | (SequenceOperationKind::TimeWait { .. }, OperationUpdate::Output)
+            | (SequenceOperationKind::AstronomicalWait { .. }, OperationUpdate::Progress(_))
+            | (SequenceOperationKind::AstronomicalWait { .. }, OperationUpdate::Output)
             | (SequenceOperationKind::SafetyWait { .. }, OperationUpdate::Progress(_))
             | (SequenceOperationKind::SafetyWait { .. }, OperationUpdate::Output)
             | (SequenceOperationKind::ConditionWait { .. }, OperationUpdate::Progress(_))
@@ -1290,13 +1552,13 @@ impl ChatUpdater {
             OperationUpdate::Finished { .. } => colors::GREEN,
             OperationUpdate::Ended { .. } => colors::GRAY,
             OperationUpdate::Failed { .. } => colors::RED,
-            OperationUpdate::Output => match &tracked.operation.kind {
-                SequenceOperationKind::MountCenter {
-                    output: Some(output),
-                    ..
-                } if output.success == Some(false) => colors::RED,
-                _ => colors::CYAN,
-            },
+            OperationUpdate::Output
+                if operation_plate_solve_output(&tracked.operation.kind)
+                    .is_some_and(|output| output.success == Some(false)) =>
+            {
+                colors::RED
+            }
+            OperationUpdate::Output => colors::CYAN,
             OperationUpdate::Started | OperationUpdate::Progress(_) => colors::YELLOW,
         };
         let mut message = ChatMessage::new(&self.titled(title))
@@ -1337,6 +1599,20 @@ impl ChatUpdater {
                     }
                 }
             }
+            SequenceOperationKind::CameraWarming { minimum_duration } => {
+                if let Some(duration) = minimum_duration {
+                    message = message.field("Minimum time", &format_duration(*duration), true);
+                }
+                if let Some(camera) = &tracked.camera
+                    && camera.temperature.is_finite()
+                {
+                    message = message.field(
+                        "Current temperature",
+                        &format!("{:.1} °C", camera.temperature),
+                        true,
+                    );
+                }
+            }
             SequenceOperationKind::TimeWait { .. } => {
                 if let Some(end) = tracked.estimated_end {
                     let remaining = end
@@ -1349,6 +1625,30 @@ impl ChatUpdater {
                             false,
                         )
                         .field("Remaining", &format_duration(remaining), true);
+                }
+            }
+            SequenceOperationKind::AstronomicalWait {
+                target_altitude_degrees,
+                current_altitude_degrees,
+                comparator,
+                expected_time,
+            } => {
+                if let Some(target) = target_altitude_degrees {
+                    let comparison = comparator
+                        .as_deref()
+                        .map(|value| format!("{value} "))
+                        .unwrap_or_default();
+                    message = message.field(
+                        "Target altitude",
+                        &format!("{comparison}{target:.2}°"),
+                        true,
+                    );
+                }
+                if let Some(current) = current_altitude_degrees {
+                    message = message.field("Current altitude", &format!("{current:.2}°"), true);
+                }
+                if let Some(expected) = expected_time {
+                    message = message.field("Expected", &truncate_chat_value(expected), false);
                 }
             }
             SequenceOperationKind::SafetyWait {
@@ -1379,7 +1679,7 @@ impl ChatUpdater {
             SequenceOperationKind::MountCenter {
                 coordinates,
                 rotation,
-                output,
+                ..
             } => {
                 if let Some(coordinates) = coordinates {
                     message = message.field("Target", &coordinates.display(), false);
@@ -1387,67 +1687,22 @@ impl ChatUpdater {
                 if let Some(rotation) = rotation {
                     message = message.field("Target rotation", &format!("{rotation:.1}°"), true);
                 }
-                if let Some(output) = output {
-                    if let Some(success) = output.success {
-                        message = message.field(
-                            "Plate solve",
-                            if success { "Succeeded" } else { "Failed" },
-                            true,
-                        );
-                    }
-                    if let Some(coordinates) = &output.coordinates {
-                        message = message.field("Solved position", &coordinates.display(), false);
-                    }
-                    if let Some(angle) = output.position_angle {
-                        message = message.field("Position angle", &format!("{angle:.2}°"), true);
-                    }
-                    if let Some(scale) = output.pixel_scale {
-                        message =
-                            message.field("Image scale", &format!("{scale:.2} arcsec/px"), true);
-                    }
-                    if let Some(radius) = output.radius_degrees {
-                        message = message.field("Solve radius", &format!("{radius:.2}°"), true);
-                    }
-                    if let Some(separation) = output.separation_arcseconds {
-                        message = message.field(
-                            "Pointing error",
-                            &format!("{separation:.1} arcsec"),
-                            true,
-                        );
-                    }
-                    if output.ra_error.is_some() || output.dec_error.is_some() {
-                        message = message.field(
-                            "Axis error",
-                            &format!(
-                                "RA {} · Dec {}",
-                                output.ra_error.as_deref().unwrap_or("--"),
-                                output.dec_error.as_deref().unwrap_or("--")
-                            ),
-                            false,
-                        );
-                    }
-                    if output.ra_pixel_error.is_some() || output.dec_pixel_error.is_some() {
-                        message = message.field(
-                            "Pixel error",
-                            &format!(
-                                "RA {} · Dec {}",
-                                output
-                                    .ra_pixel_error
-                                    .map(|value| format!("{value:.2} px"))
-                                    .unwrap_or_else(|| "--".to_string()),
-                                output
-                                    .dec_pixel_error
-                                    .map(|value| format!("{value:.2} px"))
-                                    .unwrap_or_else(|| "--".to_string())
-                            ),
-                            false,
-                        );
-                    }
-                    if output.flipped == Some(true) {
-                        message = message.field("Orientation", "Flipped", true);
-                    }
+            }
+            SequenceOperationKind::PlateSolve {
+                coordinates,
+                rotation,
+                ..
+            } => {
+                if let Some(coordinates) = coordinates {
+                    message = message.field("Requested position", &coordinates.display(), false);
+                }
+                if let Some(rotation) = rotation {
+                    message = message.field("Requested rotation", &format!("{rotation:.1}°"), true);
                 }
             }
+        }
+        if let Some(output) = operation_plate_solve_output(&tracked.operation.kind) {
+            message = add_plate_solve_output_fields(message, output);
         }
         let attach_output = matches!(update, OperationUpdate::Output)
             || matches!(
@@ -1461,27 +1716,24 @@ impl ChatUpdater {
                 }
             );
         let attachments = if attach_output {
-            match &tracked.operation.kind {
-                SequenceOperationKind::MountCenter {
-                    output: Some(output),
-                    ..
-                } => output
-                    .thumbnail
-                    .as_ref()
-                    .map(|thumbnail| {
-                        vec![ChatAttachment {
-                            data: thumbnail.clone(),
-                            filename: if output.thumbnail_media_type.as_deref() == Some("image/png")
-                            {
-                                "plate_solve.png".to_string()
-                            } else {
-                                "plate_solve.jpg".to_string()
-                            },
-                        }]
-                    })
-                    .unwrap_or_default(),
-                _ => Vec::new(),
-            }
+            operation_plate_solve_output(&tracked.operation.kind)
+                .and_then(|output| {
+                    output
+                        .thumbnail
+                        .as_ref()
+                        .map(|thumbnail| (output, thumbnail))
+                })
+                .map(|(output, thumbnail)| {
+                    vec![ChatAttachment {
+                        data: thumbnail.clone(),
+                        filename: if output.thumbnail_media_type.as_deref() == Some("image/png") {
+                            "plate_solve.png".to_string()
+                        } else {
+                            "plate_solve.jpg".to_string()
+                        },
+                    }]
+                })
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -1556,6 +1808,8 @@ impl ChatUpdater {
             }
         }
 
+        self.expire_target_scheduler_target(Utc::now());
+
         println!(
             "[{n}] Baseline: {} events, {} images",
             self.state.events_seen.len(),
@@ -1613,6 +1867,7 @@ impl ChatUpdater {
                         tracked.operation.kind,
                         SequenceOperationKind::MountSlew { .. }
                             | SequenceOperationKind::MountCenter { .. }
+                            | SequenceOperationKind::PlateSolve { .. }
                     )
                 });
             }
@@ -1621,6 +1876,8 @@ impl ChatUpdater {
             }
             EventDeliveryScope::Sequence => {
                 self.state.sequence_running = false;
+                self.state.sequence_failure = None;
+                self.state.sequence_outcome = None;
                 self.state.wait_until = None;
                 self.state.sequence_container_counts = None;
                 self.state.sequence_operations.retain(|_, tracked| {
@@ -1628,10 +1885,12 @@ impl ChatUpdater {
                         tracked.operation.kind,
                         SequenceOperationKind::MountSlew { .. }
                             | SequenceOperationKind::MountCenter { .. }
+                            | SequenceOperationKind::PlateSolve { .. }
                     )
                 });
             }
             EventDeliveryScope::Safety => {
+                self.state.safety_state = SafetyState::Unknown;
                 self.state.sequence_operations.retain(|_, tracked| {
                     !matches!(
                         tracked.operation.kind,
@@ -1646,7 +1905,22 @@ impl ChatUpdater {
                 self.state.last_image_time = None;
                 self.state.skipped_images_count = 0;
             }
-            EventDeliveryScope::EquipmentConnections
+            EventDeliveryScope::Observatory => {
+                self.state.dome_shutter_open = None;
+                self.state.dome_azimuth = None;
+                self.state.dome_parked = None;
+                self.state.dome_homed = None;
+                self.state.flat_cover_state = None;
+                self.state.flat_light_on = None;
+                self.state.flat_brightness = None;
+            }
+            EventDeliveryScope::EquipmentConnections => {
+                self.state.dome_connected = None;
+                self.state.flat_connected = None;
+                self.state.weather_connected = None;
+                self.state.switch_connected = None;
+            }
+            EventDeliveryScope::CommandFailures
             | EventDeliveryScope::NinaNotifications
             | EventDeliveryScope::NinaLogs
             | EventDeliveryScope::Other => {}
@@ -1654,8 +1928,181 @@ impl ChatUpdater {
         self.state.last_status_fingerprint = None;
     }
 
+    fn apply_event_state(&mut self, event: &Event) {
+        match event.event.as_str() {
+            event_types::MOUNT_PARKED
+            | event_types::MOUNT_UNPARKED
+            | event_types::MOUNT_HOMED
+            | event_types::MOUNT_SLEWED => {
+                self.state.last_mount_event = Some(event.event.clone());
+            }
+            event_types::MOUNT_CENTER => {
+                self.state.last_mount_event = Some(event.event.clone());
+                self.state.center_event_seen_at = Some(Utc::now());
+            }
+            // Flip and dither events describe brief activity, not a stable
+            // state. They are announced but must not replace the status state.
+            event_types::MOUNT_BEFORE_FLIP | event_types::MOUNT_AFTER_FLIP => {}
+            event_types::GUIDER_START | event_types::GUIDER_STOP => {
+                self.state.last_guider_event = Some(event.event.clone());
+            }
+            event_types::GUIDER_DITHER => {}
+            event_types::SEQUENCE_STARTING => {
+                self.state.sequence_running = true;
+                self.state.sequence_failure = None;
+                self.state.sequence_outcome = None;
+                self.state.wait_until = None;
+            }
+            event_types::SEQUENCE_FINISHED => {
+                self.state.sequence_running = false;
+                self.state.wait_until = None;
+                if let Some(EventDetails::SequenceFinished {
+                    outcome,
+                    status,
+                    had_failures,
+                }) = &event.details
+                {
+                    self.state.sequence_outcome = Some(outcome.clone());
+                    if (*had_failures
+                        || matches!(outcome.as_str(), "failed" | "completed_with_failures"))
+                        && self.state.sequence_failure.is_none()
+                    {
+                        self.state.sequence_failure = Some(SequenceFailureInfo {
+                            entity: "Sequence".to_string(),
+                            entity_type: "Sequence root".to_string(),
+                            error: format!("N.I.N.A. ended the sequence with status {status}"),
+                        });
+                    }
+                } else {
+                    self.state.sequence_outcome = None;
+                }
+            }
+            event_types::SEQUENCE_ENTITY_FAILED => {
+                self.state.sequence_failure = Some(match &event.details {
+                    Some(EventDetails::SequenceEntityFailed {
+                        entity,
+                        entity_type,
+                        error,
+                    }) => SequenceFailureInfo {
+                        entity: entity.clone(),
+                        entity_type: entity_type.clone(),
+                        error: error.clone(),
+                    },
+                    _ => SequenceFailureInfo {
+                        entity: "Sequence item".to_string(),
+                        entity_type: "Unknown".to_string(),
+                        error: "N.I.N.A. reported that the sequence item failed".to_string(),
+                    },
+                });
+            }
+            event_types::TS_TARGETSTART | event_types::TS_NEWTARGETSTART => {
+                self.state.wait_until = None;
+            }
+            event_types::TS_WAITSTART => {
+                if let Some(EventDetails::WaitStart { wait_end_time }) = &event.details
+                    && let Some(parsed) =
+                        parse_nina_timestamp_with_context(wait_end_time, Some(&event.time))
+                {
+                    self.state.wait_until = Some(parsed);
+                }
+            }
+            event_types::SAFETY_CONNECTED => {
+                self.state.safety_state = SafetyState::ConnectedUnknown;
+            }
+            event_types::SAFETY_DISCONNECTED => {
+                self.state.safety_state = SafetyState::Disconnected;
+            }
+            event_types::SAFETY_CHANGED => {
+                if let Some(EventDetails::SafetyChanged { is_safe }) = &event.details {
+                    self.state.safety_state = if *is_safe {
+                        SafetyState::Safe
+                    } else {
+                        SafetyState::Unsafe
+                    };
+                }
+            }
+            event_types::DOME_CONNECTED => {
+                self.state.dome_connected = Some(true);
+                self.state.dome_shutter_open = None;
+                self.state.dome_azimuth = None;
+                self.state.dome_parked = None;
+                self.state.dome_homed = None;
+            }
+            event_types::DOME_DISCONNECTED => {
+                self.state.dome_connected = Some(false);
+                self.state.dome_shutter_open = None;
+                self.state.dome_azimuth = None;
+                self.state.dome_parked = None;
+                self.state.dome_homed = None;
+            }
+            event_types::DOME_SHUTTER_OPENED => {
+                self.state.dome_shutter_open = Some(true);
+            }
+            event_types::DOME_SHUTTER_CLOSED => {
+                self.state.dome_shutter_open = Some(false);
+            }
+            event_types::DOME_HOMED => {
+                self.state.dome_homed = Some(true);
+                self.state.dome_parked = Some(false);
+                self.state.dome_azimuth = None;
+            }
+            event_types::DOME_PARKED => {
+                self.state.dome_parked = Some(true);
+                self.state.dome_homed = Some(false);
+                self.state.dome_azimuth = None;
+            }
+            // Synchronizing changes the azimuth reference without moving the
+            // shutter or changing the known park/home state. Discard the last
+            // slew azimuth rather than presenting it against the new reference.
+            event_types::DOME_SYNCED => self.state.dome_azimuth = None,
+            event_types::DOME_SLEWED => {
+                if let Some(EventDetails::DomeSlewed { to, .. }) = &event.details {
+                    self.state.dome_azimuth = Some(*to);
+                    self.state.dome_parked = Some(false);
+                    self.state.dome_homed = Some(false);
+                }
+            }
+            event_types::FLAT_CONNECTED => {
+                self.state.flat_connected = Some(true);
+                self.state.flat_cover_state = None;
+                self.state.flat_light_on = None;
+                self.state.flat_brightness = None;
+            }
+            event_types::FLAT_DISCONNECTED => {
+                self.state.flat_connected = Some(false);
+                self.state.flat_cover_state = None;
+                self.state.flat_light_on = None;
+                self.state.flat_brightness = None;
+            }
+            event_types::FLAT_COVER_OPENED => {
+                self.state.flat_cover_state = Some("Open".to_string());
+            }
+            event_types::FLAT_COVER_CLOSED => {
+                self.state.flat_cover_state = Some("Closed".to_string());
+            }
+            event_types::FLAT_LIGHT_TOGGLED => {
+                if let Some(EventDetails::FlatLightToggled { on }) = &event.details {
+                    self.state.flat_light_on = *on;
+                } else {
+                    self.state.flat_light_on = None;
+                }
+            }
+            event_types::FLAT_BRIGHTNESS_CHANGED => {
+                if let Some(EventDetails::FlatBrightnessChanged { new, .. }) = &event.details {
+                    self.state.flat_brightness = Some(*new);
+                }
+            }
+            event_types::WEATHER_CONNECTED => self.state.weather_connected = Some(true),
+            event_types::WEATHER_DISCONNECTED => self.state.weather_connected = Some(false),
+            event_types::SWITCH_CONNECTED => self.state.switch_connected = Some(true),
+            event_types::SWITCH_DISCONNECTED => self.state.switch_connected = Some(false),
+            _ => {}
+        }
+        self.state.last_status_fingerprint = None;
+    }
+
     fn process_baseline_events(&mut self, events: &[Event]) {
-        let mut latest_ts_target: Option<(String, TargetInfo)> = None;
+        let mut latest_ts_target: Option<(Option<DateTime<FixedOffset>>, usize, TargetInfo)> = None;
         let mut privacy_boundaries = HashMap::new();
         for (index, event) in events.iter().enumerate() {
             if !event.chat_enabled {
@@ -1715,7 +2162,7 @@ impl ChatUpdater {
                 coordinates,
                 project_name,
                 rotation,
-                ..
+                target_end_time,
             }) = &event.details
                 && target_name != "Sequential Instruction Set"
             {
@@ -1725,44 +2172,29 @@ impl ChatUpdater {
                     coordinates: coordinates.clone(),
                     project: project_name.clone(),
                     rotation: *rotation,
+                    target_end_time: target_end_time
+                        .as_deref()
+                        .and_then(|end| parse_nina_timestamp_with_context(end, Some(&event.time))),
                 };
 
-                if latest_ts_target.is_none()
-                    || latest_ts_target
+                let parsed_time = parse_nina_timestamp(&event.time);
+                let is_newer =
+                    latest_ts_target
                         .as_ref()
-                        .map(|(time, _)| time < &event.time)
-                        .unwrap_or(false)
-                {
-                    latest_ts_target = Some((event.time.clone(), target_info));
+                        .is_none_or(|(latest_time, latest_index, _)| {
+                            match (parsed_time, *latest_time) {
+                                (Some(candidate), Some(latest)) => candidate > latest,
+                                (Some(_), None) => true,
+                                (None, Some(_)) => false,
+                                (None, None) => index > *latest_index,
+                            }
+                        });
+                if is_newer {
+                    latest_ts_target = Some((parsed_time, index, target_info));
                 }
             }
 
-            // Track latest mount-state event (events are in chronological order).
-            match event.event.as_str() {
-                event_types::MOUNT_PARKED
-                | event_types::MOUNT_UNPARKED
-                | event_types::MOUNT_HOMED
-                | event_types::MOUNT_BEFORE_FLIP
-                | event_types::MOUNT_AFTER_FLIP
-                | event_types::MOUNT_CENTER => {
-                    self.state.last_mount_event = Some(event.event.clone());
-                }
-                event_types::GUIDER_START
-                | event_types::GUIDER_STOP
-                | event_types::GUIDER_DITHER => {
-                    self.state.last_guider_event = Some(event.event.clone());
-                }
-                event_types::SEQUENCE_STARTING => self.state.sequence_running = true,
-                event_types::SEQUENCE_FINISHED => self.state.sequence_running = false,
-                event_types::TS_WAITSTART => {
-                    if let Some(EventDetails::WaitStart { wait_end_time }) = &event.details
-                        && let Some(parsed) = parse_nina_timestamp(wait_end_time)
-                    {
-                        self.state.wait_until = Some(parsed);
-                    }
-                }
-                _ => {}
-            }
+            self.apply_event_state(event);
 
             let key = self.state.event_key(event);
             self.state.events_seen.insert(key);
@@ -1776,7 +2208,7 @@ impl ChatUpdater {
         }
 
         // Set the latest TS target if found
-        if let Some((_, target)) = latest_ts_target {
+        if let Some((_, _, target)) = latest_ts_target {
             self.state.current_target = Some(target);
         }
     }
@@ -1790,6 +2222,7 @@ impl ChatUpdater {
         match self.source.get_event_history().await {
             Ok(events) => {
                 self.process_live_events(events.response).await;
+                self.expire_target_scheduler_target(Utc::now());
                 true
             }
             Err(e) => {
@@ -1861,32 +2294,7 @@ impl ChatUpdater {
             return;
         }
 
-        match event.event.as_str() {
-            event_types::MOUNT_PARKED
-            | event_types::MOUNT_UNPARKED
-            | event_types::MOUNT_HOMED
-            | event_types::MOUNT_BEFORE_FLIP
-            | event_types::MOUNT_AFTER_FLIP
-            | event_types::MOUNT_CENTER => {
-                self.state.last_mount_event = Some(event.event.clone());
-                if event.event == event_types::MOUNT_CENTER {
-                    self.state.center_event_seen_at = Some(Utc::now());
-                }
-            }
-            event_types::GUIDER_START | event_types::GUIDER_STOP | event_types::GUIDER_DITHER => {
-                self.state.last_guider_event = Some(event.event.clone());
-            }
-            event_types::SEQUENCE_STARTING => self.state.sequence_running = true,
-            event_types::SEQUENCE_FINISHED => self.state.sequence_running = false,
-            event_types::TS_WAITSTART => {
-                if let Some(EventDetails::WaitStart { wait_end_time }) = &event.details
-                    && let Some(parsed) = parse_nina_timestamp(wait_end_time)
-                {
-                    self.state.wait_until = Some(parsed);
-                }
-            }
-            _ => {}
-        }
+        self.apply_event_state(event);
 
         match event.event.as_str() {
             event_types::TS_TARGETSTART | event_types::TS_NEWTARGETSTART => {
@@ -1907,13 +2315,14 @@ impl ChatUpdater {
             | event_types::MOUNT_PARKED
             | event_types::MOUNT_UNPARKED
             | event_types::MOUNT_HOMED
-            | event_types::MOUNT_CENTER => self.handle_mount_event(event).await,
+            | event_types::MOUNT_CENTER
+            | event_types::MOUNT_SLEWED => self.handle_mount_event(event).await,
             event_types::GUIDER_START | event_types::GUIDER_DITHER => {
                 self.handle_guider_event(event).await
             }
-            event_types::SEQUENCE_STARTING | event_types::SEQUENCE_FINISHED => {
-                self.handle_sequence_event(event).await
-            }
+            event_types::SEQUENCE_STARTING
+            | event_types::SEQUENCE_FINISHED
+            | event_types::SEQUENCE_ENTITY_FAILED => self.handle_sequence_event(event).await,
             event_types::ROTATOR_SYNCED => self.handle_rotator_synced(event).await,
             event_types::FOCUSER_USER_FOCUSED => self.handle_focuser_user_focused(event).await,
             event_types::IMAGE_SAVE => {} // Handled in image polling
@@ -2019,9 +2428,10 @@ impl ChatUpdater {
             coordinates,
             project_name,
             rotation,
-            ..
+            target_end_time,
         }) = &event.details
         {
+            self.state.wait_until = None;
             if target_name == "Sequential Instruction Set" {
                 return;
             }
@@ -2032,6 +2442,9 @@ impl ChatUpdater {
                 coordinates: coordinates.clone(),
                 project: project_name.clone(),
                 rotation: *rotation,
+                target_end_time: target_end_time
+                    .as_deref()
+                    .and_then(|end| parse_nina_timestamp_with_context(end, Some(&event.time))),
             };
 
             let old_target = self.state.current_target.clone();
@@ -2040,8 +2453,8 @@ impl ChatUpdater {
                 .map(|t| t.name != new_target.name)
                 .unwrap_or(true);
 
+            self.state.current_target = Some(new_target.clone());
             if target_changed {
-                self.state.current_target = Some(new_target.clone());
                 println!("[TS-TARGETSTART] Target: {}", target_name);
 
                 if event.chat_enabled && self.chat_manager.service_count() > 0 {
@@ -2060,16 +2473,27 @@ impl ChatUpdater {
         println!("[AUTOFOCUS FINISHED] {}", event.time);
         println!("Queued autofocus results for delivery after the poll cycle.");
 
-        let report_timestamp = match &event.details {
+        let (report_timestamp, filter, position, temperature) = match &event.details {
             Some(EventDetails::AutofocusFinished {
-                report_timestamp, ..
-            }) => Some(report_timestamp.clone()),
-            _ => None,
+                report_timestamp,
+                filter,
+                position,
+                temperature,
+            }) => (
+                Some(report_timestamp.clone()),
+                filter.clone(),
+                *position,
+                *temperature,
+            ),
+            _ => (None, None, None, None),
         };
         self.pending_autofocus_deliveries
             .push(PendingAutofocusDelivery {
                 event_time: event.time.clone(),
                 report_timestamp,
+                filter,
+                position,
+                temperature,
                 attempts: 0,
                 next_attempt_at: TokioInstant::now(),
                 retry_delay: self.autofocus_retry.initial_delay,
@@ -2136,19 +2560,50 @@ impl ChatUpdater {
                     "received report {} instead of {expected}",
                     autofocus_data.response.timestamp
                 );
-                self.retry_autofocus_delivery(delivery, &reason);
+                self.retry_autofocus_delivery(delivery, &reason).await;
             }
-            Err(error) => self.retry_autofocus_delivery(delivery, &error.to_string()),
+            Err(error) => {
+                self.retry_autofocus_delivery(delivery, &error.to_string())
+                    .await
+            }
         }
     }
 
-    fn retry_autofocus_delivery(&mut self, mut delivery: PendingAutofocusDelivery, reason: &str) {
+    async fn retry_autofocus_delivery(
+        &mut self,
+        mut delivery: PendingAutofocusDelivery,
+        reason: &str,
+    ) {
         let attempts = delivery.retry.max_attempts.max(1);
         if delivery.attempts >= attempts {
             eprintln!(
                 "[{}] Failed to fetch autofocus report for {} after {attempts} attempts: {reason}",
                 self.telescope_name, delivery.event_time
             );
+            if self.chat_manager.service_count() > 0 {
+                let mut message = ChatMessage::new(
+                    &self.titled("⚠️ Autofocus Completed · Report Unavailable"),
+                )
+                .color(colors::ORANGE)
+                .field("Time", &delivery.event_time, false)
+                .field(
+                    "Report",
+                    "N.I.N.A. completed autofocus, but the saved report could not be retrieved.",
+                    false,
+                );
+                if let Some(filter) = delivery.filter.as_deref() {
+                    message = message.field("Filter", filter, true);
+                }
+                if let Some(position) = delivery.position {
+                    message = message.field("Position", &format!("{position:.0}"), true);
+                }
+                if let Some(temperature) = delivery.temperature {
+                    message = message.field("Temperature", &format!("{temperature:.1} °C"), true);
+                }
+                self.chat_manager
+                    .send_message(&message, &self.chat_target)
+                    .await;
+            }
             return;
         }
 
@@ -2279,6 +2734,7 @@ impl ChatUpdater {
         &mut self,
         projection: Option<(String, bool)>,
     ) -> Option<(Option<TargetInfo>, TargetInfo)> {
+        self.expire_target_scheduler_target(Utc::now());
         let (target_name, chat_enabled) = projection?;
         if !chat_enabled {
             self.state.current_target = None;
@@ -2299,6 +2755,7 @@ impl ChatUpdater {
             coordinates: None,
             project: None,
             rotation: None,
+            target_end_time: None,
         };
         let old_target = self.state.current_target.clone();
         if old_target
@@ -2310,6 +2767,20 @@ impl ChatUpdater {
 
         self.state.current_target = Some(new_target.clone());
         Some((old_target, new_target))
+    }
+
+    fn expire_target_scheduler_target(&mut self, now: DateTime<Utc>) -> bool {
+        let expired = self.state.current_target.as_ref().is_some_and(|target| {
+            target.source == TargetSource::TsTargetStart
+                && target
+                    .target_end_time
+                    .is_some_and(|end| end.with_timezone(&Utc) <= now)
+        });
+        if expired {
+            self.state.current_target = None;
+            self.state.last_status_fingerprint = None;
+        }
+        expired
     }
 
     /// Returns whether the Direct source responded (see [`Self::poll_events`]).
@@ -2513,6 +2984,18 @@ impl ChatUpdater {
     fn format_startup_status(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
 
+        if let Some(end) = self
+            .state
+            .current_target
+            .as_ref()
+            .and_then(|target| target.target_end_time)
+        {
+            parts.push(format!(
+                "🎯 Target scheduled until {}",
+                end.format("%Y-%m-%d %H:%M %Z")
+            ));
+        }
+
         let mut operations = self
             .state
             .sequence_operations
@@ -2551,6 +3034,18 @@ impl ChatUpdater {
                         );
                     parts.push(format!("❄️ Camera cooling ({detail})"));
                 }
+                SequenceOperationKind::CameraWarming { minimum_duration } => {
+                    let mut detail = tracked
+                        .camera
+                        .as_ref()
+                        .filter(|camera| camera.temperature.is_finite())
+                        .map(|camera| format!("{:.1} °C", camera.temperature))
+                        .unwrap_or_else(|| "temperature unavailable".to_string());
+                    if let Some(duration) = minimum_duration {
+                        detail.push_str(&format!(", minimum {}", format_duration(*duration)));
+                    }
+                    parts.push(format!("🌡️ Camera warming ({detail})"));
+                }
                 SequenceOperationKind::TimeWait { .. } => {
                     if let Some(end) = tracked.estimated_end {
                         let remaining = end
@@ -2564,6 +3059,37 @@ impl ChatUpdater {
                     } else {
                         parts.push("⏳ Timed wait in progress".to_string());
                     }
+                }
+                SequenceOperationKind::AstronomicalWait {
+                    target_altitude_degrees,
+                    current_altitude_degrees,
+                    comparator,
+                    expected_time,
+                } => {
+                    let current =
+                        current_altitude_degrees.map(|value| format!("current {value:.2}°"));
+                    let target = target_altitude_degrees.map(|value| {
+                        format!(
+                            "target {}{value:.2}°",
+                            comparator
+                                .as_deref()
+                                .map(|comparison| format!("{comparison} "))
+                                .unwrap_or_default()
+                        )
+                    });
+                    let expected = expected_time
+                        .as_deref()
+                        .map(|value| format!("expected {value}"));
+                    let details = [current, target, expected]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    parts.push(if details.is_empty() {
+                        format!("🌌 {}", tracked.operation.name)
+                    } else {
+                        format!("🌌 {} ({details})", tracked.operation.name)
+                    });
                 }
                 SequenceOperationKind::SafetyWait {
                     is_safe,
@@ -2618,6 +3144,28 @@ impl ChatUpdater {
                         });
                     parts.push(format!("🎯 Centering{target}{solve}"));
                 }
+                SequenceOperationKind::PlateSolve {
+                    coordinates,
+                    output,
+                    ..
+                } => {
+                    let target = coordinates
+                        .as_ref()
+                        .map_or_else(String::new, |coordinates| {
+                            format!(" near {}", coordinates.display())
+                        });
+                    let result = output
+                        .as_ref()
+                        .and_then(|output| output.success)
+                        .map_or_else(String::new, |success| {
+                            if success {
+                                "; latest result succeeded".to_string()
+                            } else {
+                                "; latest result failed".to_string()
+                            }
+                        });
+                    parts.push(format!("🔎 Plate solving{target}{result}"));
+                }
             }
         }
 
@@ -2638,6 +3186,121 @@ impl ChatUpdater {
 
         if self.state.sequence_running {
             parts.push("▶️ Sequence running".to_string());
+        } else if self.state.sequence_failure.is_none() {
+            match self.state.sequence_outcome.as_deref() {
+                Some("completed") => parts.push("🏁 Sequence completed".to_string()),
+                Some("stopped") => parts.push("⏹️ Sequence stopped".to_string()),
+                Some("cancelled_or_not_started") => {
+                    parts.push("⏹️ Sequence cancelled or not started".to_string())
+                }
+                Some("ended") => parts.push("🏁 Sequence ended".to_string()),
+                _ => {}
+            }
+        }
+        if let Some(failure) = &self.state.sequence_failure {
+            let entity = if failure.entity.trim().is_empty() {
+                "Sequence item"
+            } else {
+                &failure.entity
+            };
+            parts.push(format!(
+                "❌ {} failed: {}",
+                truncate_chat_title(entity),
+                truncate_chat_value(&failure.error)
+            ));
+        }
+
+        if let Some(safety) = self.state.safety_state.status_text() {
+            parts.push(safety.to_string());
+        }
+
+        let mut dome_detail = Vec::new();
+        if let Some(connected) = self.state.dome_connected {
+            dome_detail.push(
+                if connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                }
+                .to_string(),
+            );
+        }
+        if let Some(open) = self.state.dome_shutter_open {
+            dome_detail.push(
+                if open {
+                    "shutter open"
+                } else {
+                    "shutter closed"
+                }
+                .to_string(),
+            );
+        }
+        if self.state.dome_parked == Some(true) {
+            dome_detail.push("parked".to_string());
+        } else if self.state.dome_homed == Some(true) {
+            dome_detail.push("homed".to_string());
+        }
+        if let Some(azimuth) = self.state.dome_azimuth {
+            dome_detail.push(format!("azimuth {azimuth:.2}°"));
+        }
+        if !dome_detail.is_empty() {
+            let icon = if self.state.dome_connected == Some(false) {
+                "⚠️"
+            } else {
+                "🏠"
+            };
+            parts.push(format!("{icon} Dome · {}", dome_detail.join(", ")));
+        }
+
+        let mut flat_detail = Vec::new();
+        if let Some(connected) = self.state.flat_connected {
+            flat_detail.push(
+                if connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                }
+                .to_string(),
+            );
+        }
+        if let Some(cover) = self.state.flat_cover_state.as_deref() {
+            flat_detail.push(format!("cover {cover}"));
+        }
+        if let Some(on) = self.state.flat_light_on {
+            flat_detail.push(if on { "light on" } else { "light off" }.to_string());
+        }
+        if let Some(brightness) = self.state.flat_brightness {
+            flat_detail.push(format!("brightness {brightness}"));
+        }
+        if !flat_detail.is_empty() {
+            let icon = if self.state.flat_connected == Some(false) {
+                "⚠️"
+            } else {
+                "💡"
+            };
+            parts.push(format!("{icon} Flat panel · {}", flat_detail.join(", ")));
+        }
+        if let Some(connected) = self.state.weather_connected {
+            parts.push(format!(
+                "{} Weather station {}",
+                if connected { "🌦️" } else { "⚠️" },
+                if connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                }
+            ));
+        }
+        if let Some(connected) = self.state.switch_connected {
+            parts.push(format!(
+                "{} Switch device {}",
+                if connected { "🔌" } else { "⚠️" },
+                if connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                }
+            ));
         }
 
         if let Some(ev) = &self.state.last_mount_event {
@@ -2689,6 +3352,13 @@ impl ChatUpdater {
         if let Some(rotation) = &new_target.rotation {
             message = message.field("Rotation", &format!("{}°", rotation), true);
         }
+        if let Some(end) = new_target.target_end_time {
+            message = message.field(
+                "Scheduled End",
+                &end.format("%Y-%m-%d %H:%M %Z").to_string(),
+                true,
+            );
+        }
 
         self.add_meridian_flip_info(&mut message);
         self.add_mount_info(&mut message).await;
@@ -2714,6 +3384,13 @@ impl ChatUpdater {
 
         if let Some(rotation) = &target.rotation {
             message = message.field("Rotation", &format!("{}°", rotation), true);
+        }
+        if let Some(end) = target.target_end_time {
+            message = message.field(
+                "Scheduled End",
+                &end.format("%Y-%m-%d %H:%M %Z").to_string(),
+                true,
+            );
         }
 
         self.add_meridian_flip_info(&mut message);
@@ -2822,6 +3499,7 @@ impl ChatUpdater {
             event_types::MOUNT_UNPARKED => ("🔭 Mount Unparked", colors::YELLOW),
             event_types::MOUNT_HOMED => ("🏠 Mount Homed", colors::CYAN),
             event_types::MOUNT_CENTER => ("🎯 Centering Started", colors::CYAN),
+            event_types::MOUNT_SLEWED => ("🔭 Mount Slew Completed", colors::CYAN),
             _ => ("🔭 Mount Event", colors::GRAY),
         };
 
@@ -2832,6 +3510,12 @@ impl ChatUpdater {
 
         if let Some(target) = &self.state.current_target {
             message = message.field("Current Target", &target.name, true);
+        }
+        if let Some(EventDetails::MountSlewed { from, to }) = &event.details {
+            message =
+                message
+                    .field("From", &from.display(), false)
+                    .field("To", &to.display(), false);
         }
 
         self.add_mount_info(&mut message).await;
@@ -2892,7 +3576,41 @@ impl ChatUpdater {
     async fn send_sequence_event_notification(&self, event: &Event) {
         let (title, color) = match event.event.as_str() {
             event_types::SEQUENCE_STARTING => ("▶️ Sequence Starting", colors::CYAN),
-            event_types::SEQUENCE_FINISHED => ("🏁 Sequence Finished", colors::GREEN),
+            event_types::SEQUENCE_FINISHED
+                if matches!(
+                    &event.details,
+                    Some(EventDetails::SequenceFinished {
+                        outcome,
+                        had_failures: false,
+                        ..
+                    }) if outcome == "completed"
+                ) =>
+            {
+                ("🏁 Sequence Completed", colors::GREEN)
+            }
+            event_types::SEQUENCE_FINISHED
+                if matches!(
+                    &event.details,
+                    Some(EventDetails::SequenceFinished { outcome, .. })
+                        if outcome == "stopped"
+                ) =>
+            {
+                ("⏹️ Sequence Stopped", colors::YELLOW)
+            }
+            event_types::SEQUENCE_FINISHED
+                if matches!(
+                    &event.details,
+                    Some(EventDetails::SequenceFinished { outcome, .. })
+                        if outcome == "cancelled_or_not_started"
+                ) =>
+            {
+                ("⏹️ Sequence Cancelled or Not Started", colors::GRAY)
+            }
+            event_types::SEQUENCE_FINISHED if self.state.sequence_failure.is_some() => {
+                ("❌ Sequence Ended After a Failure", colors::RED)
+            }
+            event_types::SEQUENCE_FINISHED => ("🏁 Sequence Ended", colors::CYAN),
+            event_types::SEQUENCE_ENTITY_FAILED => ("❌ Sequence Item Failed", colors::RED),
             _ => ("📋 Sequence Event", colors::GRAY),
         };
 
@@ -2918,6 +3636,38 @@ impl ChatUpdater {
                 &format!("{total} total / {running} running"),
                 true,
             );
+        }
+        if let Some(EventDetails::SequenceEntityFailed {
+            entity,
+            entity_type,
+            error,
+        }) = &event.details
+        {
+            message = message
+                .field("Item", &truncate_chat_value(entity), true)
+                .field("Type", &truncate_chat_value(entity_type), true)
+                .field("Error", &truncate_chat_value(error), false);
+        } else if event.event == event_types::SEQUENCE_FINISHED
+            && let Some(failure) = &self.state.sequence_failure
+        {
+            message = message
+                .field("Failed Item", &truncate_chat_value(&failure.entity), true)
+                .field("Error", &truncate_chat_value(&failure.error), false);
+        }
+        if let Some(EventDetails::SequenceFinished {
+            outcome,
+            status,
+            had_failures,
+        }) = &event.details
+        {
+            message = message
+                .field("Outcome", &outcome.replace('_', " "), true)
+                .field("N.I.N.A. status", status, true)
+                .field(
+                    "Reported failures",
+                    if *had_failures { "Yes" } else { "No" },
+                    true,
+                );
         }
 
         self.chat_manager
@@ -3071,6 +3821,69 @@ impl ChatUpdater {
                         .field("To", &format!("{to:.2}°"), true)
                         .field("Δ", &format!("{:+.2}°", to - from), true);
                 }
+                EventDetails::MountSlewed { from, to } => {
+                    message = message.field("From", &from.display(), false).field(
+                        "To",
+                        &to.display(),
+                        false,
+                    );
+                }
+                EventDetails::DomeSlewed { from, to } => {
+                    message = message
+                        .field("From azimuth", &format!("{from:.2}°"), true)
+                        .field("To azimuth", &format!("{to:.2}°"), true)
+                        .field("Δ", &format!("{:+.2}°", to - from), true);
+                }
+                EventDetails::SequenceEntityFailed {
+                    entity,
+                    entity_type,
+                    error,
+                } => {
+                    message = message
+                        .field("Item", &truncate_chat_value(entity), true)
+                        .field("Type", &truncate_chat_value(entity_type), true)
+                        .field("Error", &truncate_chat_value(error), false);
+                }
+                EventDetails::SequenceFinished {
+                    outcome,
+                    status,
+                    had_failures,
+                } => {
+                    message = message
+                        .field("Outcome", &outcome.replace('_', " "), true)
+                        .field("N.I.N.A. status", status, true)
+                        .field(
+                            "Reported failures",
+                            if *had_failures { "Yes" } else { "No" },
+                            true,
+                        );
+                }
+                EventDetails::ImageSaveFailed {
+                    stage,
+                    disk_full,
+                    error,
+                } => {
+                    message = message
+                        .field("Stage", &truncate_chat_value(stage), true)
+                        .field("Disk full", if *disk_full { "Yes" } else { "No" }, true)
+                        .field("Error", &truncate_chat_value(error), false);
+                }
+                EventDetails::FlatBrightnessChanged { previous, new } => {
+                    message = message
+                        .field("Previous", &previous.to_string(), true)
+                        .field("New", &new.to_string(), true);
+                }
+                EventDetails::FlatLightToggled { on } => {
+                    message = message.field(
+                        "Light",
+                        match on {
+                            Some(true) => "On",
+                            Some(false) => "Off",
+                            None => "State unavailable",
+                        },
+                        true,
+                    );
+                }
                 EventDetails::CommandFailed { command, error } => {
                     message = message
                         .field("Command", &truncate_chat_value(command), true)
@@ -3105,6 +3918,7 @@ impl ChatUpdater {
                         .field("Source", &truncate_chat_value(&location), true)
                         .field("Message", &truncate_chat_value(log_message), false);
                 }
+                EventDetails::Unknown(_) => {}
             }
         }
 
@@ -3283,6 +4097,7 @@ fn get_event_color(event: &str) -> u32 {
         // Camera events
         event_types::CAMERA_CONNECTED => colors::GREEN,
         event_types::CAMERA_DISCONNECTED => colors::RED,
+        event_types::CAMERA_DOWNLOAD_TIMEOUT | event_types::IMAGE_SAVE_FAILED => colors::RED,
 
         // Filterwheel events
         event_types::FILTERWHEEL_CONNECTED => colors::BLUE,
@@ -3296,6 +4111,7 @@ fn get_event_color(event: &str) -> u32 {
         event_types::MOUNT_UNPARKED => colors::YELLOW,
         event_types::MOUNT_HOMED => colors::CYAN,
         event_types::MOUNT_CENTER => colors::CYAN,
+        event_types::MOUNT_SLEWED => colors::CYAN,
 
         // Focuser events
         event_types::FOCUSER_CONNECTED => colors::GREEN,
@@ -3322,7 +4138,7 @@ fn get_event_color(event: &str) -> u32 {
 
         // Sequence events
         event_types::SEQUENCE_STARTING => colors::CYAN,
-        event_types::SEQUENCE_FINISHED => colors::GREEN,
+        event_types::SEQUENCE_FINISHED => colors::CYAN,
         event_types::SEQUENCE_ENTITY_FAILED => colors::RED,
         event_types::CHATSTRONOMY_COMMAND_FAILED => colors::RED,
 
@@ -3335,9 +4151,19 @@ fn get_event_color(event: &str) -> u32 {
         event_types::FLAT_CONNECTED
         | event_types::WEATHER_CONNECTED
         | event_types::SWITCH_CONNECTED
+        | event_types::DOME_CONNECTED
         | event_types::SAFETY_CONNECTED => colors::GREEN,
+        event_types::DOME_SHUTTER_OPENED
+        | event_types::DOME_SHUTTER_CLOSED
+        | event_types::DOME_HOMED
+        | event_types::DOME_PARKED
+        | event_types::DOME_SLEWED
+        | event_types::DOME_SYNCED
+        | event_types::FLAT_COVER_OPENED
+        | event_types::FLAT_COVER_CLOSED
+        | event_types::FLAT_BRIGHTNESS_CHANGED => colors::CYAN,
+        event_types::FLAT_LIGHT_TOGGLED => colors::YELLOW,
         event_types::SAFETY_CHANGED => colors::ORANGE,
-        event_types::CAMERA_DOWNLOAD_TIMEOUT => colors::RED,
         event_types::ERROR_PLATESOLVE => colors::RED,
 
         // Target events
@@ -3366,19 +4192,45 @@ fn nina_level_color(level: &str) -> u32 {
 ///
 /// Most carry an offset and parse as RFC 3339. A `DateTime` with
 /// `DateTimeKind.Unspecified` serializes without one, and those used to be
-/// dropped silently — leaving the sequence "waiting until" state unset. Treat
-/// an offset-less stamp as observatory-local, which is what it is.
-fn parse_nina_timestamp(value: &str) -> Option<DateTime<FixedOffset>> {
+/// dropped silently — leaving the sequence "waiting until" state unset. Use
+/// an explicit companion event offset when available; otherwise preserve the
+/// legacy ninaAPI convention deterministically as UTC.
+fn parse_nina_timestamp_with_context(
+    value: &str,
+    context_event_time: Option<&str>,
+) -> Option<DateTime<FixedOffset>> {
     if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
         return Some(parsed);
     }
     let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
         .ok()?;
-    Local
+
+    // Older N.I.N.A. payloads serialize some local DateTimes without an
+    // offset. The event timestamp still carries the observatory offset, so
+    // use it rather than the Hub host's timezone. Fixed offsets are
+    // unambiguous; explicit offsets above always take precedence.
+    if let Some(context) = context_event_time.and_then(|time| {
+        DateTime::parse_from_rfc3339(time)
+            .ok()
+            .map(|parsed| *parsed.offset())
+    }) {
+        return context.from_local_datetime(&naive).single();
+    }
+
+    // Legacy ninaAPI/Target Scheduler payloads also emitted both timestamps
+    // without offsets, but those values were UTC (see the checked-in event
+    // history fixtures). Current plugin payloads always carry an explicit
+    // offset. UTC is therefore the only deterministic compatibility fallback;
+    // using `Local` here would reinterpret the same telescope payload
+    // differently on each Hub host.
+    FixedOffset::east_opt(0)?
         .from_local_datetime(&naive)
-        .earliest()
-        .map(|local| local.fixed_offset())
+        .single()
+}
+
+fn parse_nina_timestamp(value: &str) -> Option<DateTime<FixedOffset>> {
+    parse_nina_timestamp_with_context(value, None)
 }
 
 fn autofocus_report_matches(expected: Option<&str>, actual: &str) -> bool {
@@ -3427,6 +4279,30 @@ fn get_event_title(event: &str) -> String {
         event_types::AUTOFOCUS_POINT_ADDED => "📈 Autofocus Point".to_string(),
         event_types::ROTATOR_MOVED => "🧭 Rotator Moved".to_string(),
         event_types::ROTATOR_MOVED_MECHANICAL => "🧭 Rotator Moved (Mech.)".to_string(),
+        event_types::MOUNT_SLEWED => "🔭 Mount slew completed".to_string(),
+        event_types::SEQUENCE_STARTING => "▶️ Sequence starting".to_string(),
+        event_types::SEQUENCE_FINISHED => "🏁 Sequence ended".to_string(),
+        event_types::SEQUENCE_ENTITY_FAILED => "❌ Sequence item failed".to_string(),
+        event_types::IMAGE_SAVE_FAILED => "❌ Image save failed".to_string(),
+        event_types::CAMERA_DOWNLOAD_TIMEOUT => "❌ Camera download timed out".to_string(),
+        event_types::DOME_CONNECTED => "🏠 Dome connected".to_string(),
+        event_types::DOME_DISCONNECTED => "⚠️ Dome disconnected".to_string(),
+        event_types::DOME_SHUTTER_OPENED => "🏠 Dome shutter opened".to_string(),
+        event_types::DOME_SHUTTER_CLOSED => "🏠 Dome shutter closed".to_string(),
+        event_types::DOME_HOMED => "🏠 Dome homed".to_string(),
+        event_types::DOME_PARKED => "🏠 Dome parked".to_string(),
+        event_types::DOME_SLEWED => "🏠 Dome slew completed".to_string(),
+        event_types::DOME_SYNCED => "🏠 Dome synchronized".to_string(),
+        event_types::FLAT_CONNECTED => "💡 Flat panel connected".to_string(),
+        event_types::FLAT_DISCONNECTED => "⚠️ Flat panel disconnected".to_string(),
+        event_types::FLAT_COVER_OPENED => "💡 Flat-panel cover opened".to_string(),
+        event_types::FLAT_COVER_CLOSED => "💡 Flat-panel cover closed".to_string(),
+        event_types::FLAT_LIGHT_TOGGLED => "💡 Flat-panel light changed".to_string(),
+        event_types::FLAT_BRIGHTNESS_CHANGED => "💡 Flat-panel brightness changed".to_string(),
+        event_types::WEATHER_CONNECTED => "🌦️ Weather station connected".to_string(),
+        event_types::WEATHER_DISCONNECTED => "⚠️ Weather station disconnected".to_string(),
+        event_types::SWITCH_CONNECTED => "🔌 Switch device connected".to_string(),
+        event_types::SWITCH_DISCONNECTED => "⚠️ Switch device disconnected".to_string(),
         event_types::NINA_NOTIFICATION => "🔔 N.I.N.A. notification".to_string(),
         event_types::NINA_LOG => "📝 N.I.N.A. log".to_string(),
         event_types::CHATSTRONOMY_COMMAND_FAILED => "❌ Telescope command failed".to_string(),
@@ -3897,7 +4773,17 @@ mod tests {
 
         assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 2);
         assert!(updater.pending_autofocus_deliveries.is_empty());
-        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let (message, attachments) = &deliveries[0];
+        assert!(message.title.contains("Report Unavailable"));
+        assert!(attachments.is_empty());
+        assert!(
+            message
+                .fields
+                .iter()
+                .any(|field| { field.name == "Filter" && field.value == "L" })
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4418,6 +5304,7 @@ mod tests {
             coordinates: None,
             project: None,
             rotation: None,
+            target_end_time: None,
         });
         assert!(
             updater
@@ -4508,6 +5395,40 @@ mod tests {
         assert!(!retained.estimated_end_from_target_scheduler);
     }
 
+    #[tokio::test]
+    async fn new_time_wait_keeps_its_intrinsic_target_over_scheduler_state() {
+        let mut updater = state_test_updater();
+        let scheduler_end =
+            DateTime::parse_from_rfc3339("2099-08-26T08:00:00Z").expect("scheduler end");
+        let intrinsic_end =
+            DateTime::parse_from_rfc3339("2099-08-26T04:00:00-07:00").expect("item target");
+        updater.state.wait_until = Some(scheduler_end);
+
+        updater
+            .reconcile_sequence_operations(
+                vec![operation(SequenceOperationKind::TimeWait {
+                    target_time: Some(intrinsic_end),
+                    configured_duration: None,
+                })],
+                HashSet::new(),
+                None,
+                false,
+            )
+            .await;
+
+        let tracked = updater
+            .state
+            .sequence_operations
+            .values()
+            .next()
+            .expect("tracked time wait");
+        assert_eq!(
+            tracked.estimated_end,
+            Some(intrinsic_end.with_timezone(&Utc))
+        );
+        assert!(!tracked.estimated_end_from_target_scheduler);
+    }
+
     #[test]
     fn nina_timestamps_parse_with_and_without_an_offset() {
         assert!(parse_nina_timestamp("2026-08-17T04:00:00-07:00").is_some());
@@ -4516,6 +5437,58 @@ mod tests {
         assert!(parse_nina_timestamp("2026-08-17T04:00:00").is_some());
         assert!(parse_nina_timestamp("2026-08-17T04:00:00.1234567").is_some());
         assert!(parse_nina_timestamp("not a timestamp").is_none());
+    }
+
+    #[test]
+    fn fully_offsetless_legacy_scheduler_timestamps_are_deterministic_utc() {
+        // This is the exact timestamp shape retained in
+        // example_event-history_2.json by the legacy ninaAPI Target Scheduler
+        // integration: both the event and scheduled end omit an offset.
+        let parsed = parse_nina_timestamp_with_context(
+            "2025-08-17T05:51:20.6380468",
+            Some("2025-08-17T05:23:53.1567244"),
+        )
+        .expect("legacy scheduler timestamp");
+        let expected = DateTime::parse_from_rfc3339("2025-08-17T05:51:20.6380468Z")
+            .expect("expected UTC timestamp");
+
+        assert_eq!(parsed, expected);
+        assert_eq!(parsed.offset().local_minus_utc(), 0);
+    }
+
+    #[test]
+    fn offsetless_nina_timestamps_use_the_event_observatory_offset() {
+        let contextual = parse_nina_timestamp_with_context(
+            "2026-08-26T04:00:00",
+            Some("2026-08-25T23:00:00-07:00"),
+        )
+        .expect("contextual timestamp");
+        assert_eq!(contextual.offset().local_minus_utc(), -7 * 60 * 60);
+        assert_eq!(contextual.to_rfc3339(), "2026-08-26T04:00:00-07:00");
+
+        // An explicit value is authoritative even when the event used a
+        // different observatory offset.
+        let explicit = parse_nina_timestamp_with_context(
+            "2026-08-26T04:00:00+02:00",
+            Some("2026-08-25T23:00:00-07:00"),
+        )
+        .expect("explicit timestamp");
+        assert_eq!(explicit.offset().local_minus_utc(), 2 * 60 * 60);
+    }
+
+    #[test]
+    fn scheduler_wait_uses_event_observatory_offset() {
+        let mut updater = state_test_updater();
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2099-08-25T23:00:00-07:00",
+            "Event": "TS-WAITSTART",
+            "WaitEndTime": "2099-08-26T04:00:00"
+        }))
+        .unwrap();
+        updater.apply_event_state(&event);
+        let wait_until = updater.state.wait_until.expect("scheduler wait end");
+        assert_eq!(wait_until.offset().local_minus_utc(), -7 * 60 * 60);
+        assert_eq!(wait_until.to_rfc3339(), "2099-08-26T04:00:00-07:00");
     }
 
     #[test]
@@ -4675,6 +5648,418 @@ mod tests {
 
         assert_eq!(tracked.progress_percent(now), Some(50));
         assert_eq!(tracked.next_milestone(now), Some(50));
+    }
+
+    fn state_test_updater() -> ChatUpdater {
+        let event = Event {
+            time: "2026-08-26T00:00:00Z".to_string(),
+            event: event_types::CAMERA_CONNECTED.to_string(),
+            chat_enabled: true,
+            details: None,
+        };
+        ChatUpdater::new(
+            Arc::new(FlakyAutofocusSource::unavailable_for(event, 0)),
+            "State Test".to_string(),
+            ChatTarget::default(),
+            Arc::new(ChatServiceManager::new()),
+        )
+    }
+
+    fn recording_test_updater() -> (ChatUpdater, Arc<RecordingChatState>) {
+        let event = Event {
+            time: "2026-08-26T00:00:00Z".to_string(),
+            event: event_types::CAMERA_CONNECTED.to_string(),
+            chat_enabled: true,
+            details: None,
+        };
+        let state = Arc::new(RecordingChatState::default());
+        let mut manager = ChatServiceManager::new();
+        manager.add_service(Box::new(RecordingChatService {
+            state: state.clone(),
+        }));
+        (
+            ChatUpdater::new(
+                Arc::new(FlakyAutofocusSource::unavailable_for(event, 0)),
+                "State Test".to_string(),
+                ChatTarget::default(),
+                Arc::new(manager),
+            ),
+            state,
+        )
+    }
+
+    #[tokio::test]
+    async fn astronomical_wait_and_plate_solve_have_lifecycle_and_dedup_delivery() {
+        let (mut updater, chat_state) = recording_test_updater();
+
+        let astronomical = operation(SequenceOperationKind::AstronomicalWait {
+            target_altitude_degrees: Some(30.0),
+            current_altitude_degrees: Some(18.5),
+            comparator: Some("GREATER_THAN".to_string()),
+            expected_time: Some("2026-08-26T04:30:00-07:00".to_string()),
+        });
+        updater
+            .reconcile_sequence_operations(vec![astronomical.clone()], HashSet::new(), None, true)
+            .await;
+        assert!(
+            updater
+                .format_startup_status()
+                .contains("🌌 Test operation")
+        );
+        assert!(
+            updater
+                .format_startup_status()
+                .contains("target GREATER_THAN 30.00°")
+        );
+        let mut astronomical_finished = astronomical;
+        astronomical_finished.status = "FINISHED".to_string();
+        updater
+            .reconcile_sequence_operations(vec![astronomical_finished], HashSet::new(), None, true)
+            .await;
+
+        let output = PlateSolveOutput {
+            solve_time: Some("2026-08-26T11:30:00Z".to_string()),
+            success: Some(true),
+            coordinates: None,
+            position_angle: Some(91.45),
+            pixel_scale: Some(1.25),
+            radius_degrees: None,
+            separation_arcseconds: Some(2.4),
+            ra_error: None,
+            dec_error: None,
+            ra_pixel_error: None,
+            dec_pixel_error: None,
+            flipped: None,
+            thumbnail: Some(vec![1, 2, 3]),
+            thumbnail_media_type: Some("image/jpeg".to_string()),
+        };
+        let plate_solve = operation(SequenceOperationKind::PlateSolve {
+            coordinates: None,
+            rotation: Some(91.5),
+            output: Some(Box::new(output)),
+        });
+
+        // A local privacy tombstone neither renders nor consumes this solve's
+        // output identity, so enabling the operation later still delivers it.
+        updater
+            .reconcile_sequence_operations(
+                Vec::new(),
+                HashSet::from([plate_solve.key.clone()]),
+                None,
+                true,
+            )
+            .await;
+        let before_solve = chat_state.deliveries.lock().unwrap().len();
+        updater
+            .reconcile_sequence_operations(vec![plate_solve.clone()], HashSet::new(), None, true)
+            .await;
+        let after_first_solve = chat_state.deliveries.lock().unwrap().len();
+        assert_eq!(after_first_solve, before_solve + 2);
+
+        updater
+            .reconcile_sequence_operations(vec![plate_solve.clone()], HashSet::new(), None, true)
+            .await;
+        assert_eq!(
+            chat_state.deliveries.lock().unwrap().len(),
+            after_first_solve
+        );
+
+        let mut plate_solve_finished = plate_solve;
+        plate_solve_finished.status = "FINISHED".to_string();
+        updater
+            .reconcile_sequence_operations(vec![plate_solve_finished], HashSet::new(), None, true)
+            .await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert!(
+            deliveries
+                .iter()
+                .any(|(message, _)| message.title.contains("Astronomical wait started"))
+        );
+        assert!(
+            deliveries
+                .iter()
+                .any(|(message, _)| message.title.contains("Astronomical condition reached"))
+        );
+        assert!(
+            deliveries
+                .iter()
+                .any(|(message, _)| message.title.contains("Plate solve started"))
+        );
+        let solve_results = deliveries
+            .iter()
+            .filter(|(message, _)| message.title.contains("Plate solve result"))
+            .collect::<Vec<_>>();
+        assert_eq!(solve_results.len(), 1);
+        assert_eq!(solve_results[0].1.len(), 1);
+        assert!(deliveries.iter().any(|(message, attachments)| {
+            message.title.contains("Plate solve finished") && attachments.is_empty()
+        }));
+        assert!(updater.state.sequence_operations.is_empty());
+    }
+
+    #[test]
+    fn safety_and_observatory_state_survive_baseline_without_colliding() {
+        let mut updater = state_test_updater();
+        let events = [
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:00:00Z", "Event": "SAFETY-CONNECTED"
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:00:01Z", "Event": "SAFETY-CHANGED", "IsSafe": false
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:00:02Z", "Event": "DOME-CONNECTED"
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:00:03Z", "Event": "DOME-SHUTTER-OPENED"
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:00:04Z", "Event": "DOME-SLEWED",
+                "FromAzimuth": 20.0, "ToAzimuth": 40.0
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:00:05Z", "Event": "DOME-SYNCED"
+            }))
+            .unwrap(),
+        ];
+
+        updater.process_baseline_events(&events);
+        assert_eq!(updater.state.safety_state, SafetyState::Unsafe);
+        assert_eq!(updater.state.dome_connected, Some(true));
+        assert_eq!(updater.state.dome_shutter_open, Some(true));
+        assert_eq!(updater.state.dome_azimuth, None);
+        let status = updater.format_startup_status();
+        assert!(status.contains("Conditions unsafe"));
+        assert!(status.contains("shutter open"));
+        assert!(!status.contains("azimuth 40.00°"));
+    }
+
+    #[test]
+    fn observatory_lifecycle_status_does_not_require_connection_events() {
+        let mut updater = state_test_updater();
+        updater.state.dome_shutter_open = Some(true);
+        updater.state.dome_parked = Some(true);
+        updater.state.flat_cover_state = Some("Closed".to_string());
+        updater.state.flat_light_on = Some(true);
+        updater.state.flat_brightness = Some(42);
+
+        let status = updater.format_startup_status();
+        assert!(status.contains("Dome · shutter open, parked"));
+        assert!(status.contains("Flat panel · cover Closed, light on, brightness 42"));
+        assert!(!status.contains("connected"));
+        assert!(!status.contains("disconnected"));
+    }
+
+    #[test]
+    fn dome_terminal_positions_clear_stale_azimuth_and_sync_preserves_flags() {
+        let mut updater = state_test_updater();
+        updater.state.dome_shutter_open = Some(true);
+        updater.state.dome_parked = Some(false);
+        updater.state.dome_homed = Some(true);
+        updater.state.dome_azimuth = Some(123.0);
+
+        updater.apply_event_state(&Event {
+            time: "2026-08-26T00:00:00Z".to_string(),
+            event: event_types::DOME_SYNCED.to_string(),
+            chat_enabled: true,
+            details: None,
+        });
+        assert_eq!(updater.state.dome_azimuth, None);
+        assert_eq!(updater.state.dome_shutter_open, Some(true));
+        assert_eq!(updater.state.dome_homed, Some(true));
+        assert_eq!(updater.state.dome_parked, Some(false));
+
+        updater.state.dome_azimuth = Some(90.0);
+        updater.apply_event_state(&Event {
+            time: "2026-08-26T00:01:00Z".to_string(),
+            event: event_types::DOME_PARKED.to_string(),
+            chat_enabled: true,
+            details: None,
+        });
+        assert_eq!(updater.state.dome_azimuth, None);
+        assert_eq!(updater.state.dome_parked, Some(true));
+        assert_eq!(updater.state.dome_homed, Some(false));
+
+        updater.state.dome_azimuth = Some(45.0);
+        updater.apply_event_state(&Event {
+            time: "2026-08-26T00:02:00Z".to_string(),
+            event: event_types::DOME_HOMED.to_string(),
+            chat_enabled: true,
+            details: None,
+        });
+        assert_eq!(updater.state.dome_azimuth, None);
+        assert_eq!(updater.state.dome_homed, Some(true));
+        assert_eq!(updater.state.dome_parked, Some(false));
+    }
+
+    #[test]
+    fn unknown_flat_light_payload_clears_stale_state() {
+        let mut updater = state_test_updater();
+        updater.state.flat_light_on = Some(true);
+        for payload in [
+            serde_json::json!({
+                "Time": "2026-08-26T00:00:00Z",
+                "Event": "FLAT-LIGHT-TOGGLED",
+                "On": null
+            }),
+            serde_json::json!({
+                "Time": "2026-08-26T00:01:00Z",
+                "Event": "FLAT-LIGHT-TOGGLED"
+            }),
+        ] {
+            updater.state.flat_light_on = Some(true);
+            let event: Event = serde_json::from_value(payload).unwrap();
+            updater.apply_event_state(&event);
+            assert_eq!(updater.state.flat_light_on, None);
+        }
+    }
+
+    #[test]
+    fn observatory_and_connection_tombstones_revoke_only_their_scope() {
+        let mut updater = state_test_updater();
+        updater.state.dome_connected = Some(true);
+        updater.state.dome_shutter_open = Some(true);
+        updater.state.dome_azimuth = Some(30.0);
+
+        updater.revoke_state_for_disabled_event(event_types::DOME_SLEWED);
+        assert_eq!(updater.state.dome_connected, Some(true));
+        assert_eq!(updater.state.dome_shutter_open, None);
+        assert_eq!(updater.state.dome_azimuth, None);
+
+        updater.state.dome_shutter_open = Some(false);
+        updater.revoke_state_for_disabled_event(event_types::DOME_DISCONNECTED);
+        assert_eq!(updater.state.dome_connected, None);
+        assert_eq!(updater.state.dome_shutter_open, Some(false));
+    }
+
+    #[test]
+    fn dither_and_flip_events_do_not_replace_stable_status_state() {
+        let mut updater = state_test_updater();
+        updater.state.last_mount_event = Some(event_types::MOUNT_UNPARKED.to_string());
+        updater.state.last_guider_event = Some(event_types::GUIDER_START.to_string());
+        for event_type in [
+            event_types::MOUNT_BEFORE_FLIP,
+            event_types::MOUNT_AFTER_FLIP,
+            event_types::GUIDER_DITHER,
+        ] {
+            updater.apply_event_state(&Event {
+                time: "2026-08-26T00:00:00Z".to_string(),
+                event: event_type.to_string(),
+                chat_enabled: true,
+                details: None,
+            });
+        }
+        assert_eq!(
+            updater.state.last_mount_event.as_deref(),
+            Some(event_types::MOUNT_UNPARKED)
+        );
+        assert_eq!(
+            updater.state.last_guider_event.as_deref(),
+            Some(event_types::GUIDER_START)
+        );
+    }
+
+    #[test]
+    fn baseline_uses_parsed_target_times_and_retains_scheduled_end() {
+        let mut updater = state_test_updater();
+        let events = [
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:30:00+01:00",
+                "Event": "TS-TARGETSTART",
+                "TargetName": "Earlier instant"
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-25T23:45:00Z",
+                "Event": "TS-TARGETSTART",
+                "TargetName": "Later instant",
+                "TargetEndTime": "2026-08-26T02:00:00Z"
+            }))
+            .unwrap(),
+        ];
+        updater.process_baseline_events(&events);
+        let target = updater.state.current_target.as_ref().unwrap();
+        assert_eq!(target.name, "Later instant");
+        assert_eq!(target.target_end_time.unwrap().timestamp(), 1_787_709_600);
+    }
+
+    #[test]
+    fn target_end_uses_event_offset_and_expiry_releases_sequence_target() {
+        let mut updater = state_test_updater();
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2099-08-25T23:00:00-07:00",
+            "Event": "TS-TARGETSTART",
+            "TargetName": "Scheduler target",
+            "TargetEndTime": "2099-08-26T04:00:00"
+        }))
+        .unwrap();
+        updater.process_baseline_events(&[event]);
+        let target_end = updater
+            .state
+            .current_target
+            .as_ref()
+            .and_then(|target| target.target_end_time)
+            .expect("scheduled target end");
+        assert_eq!(target_end.offset().local_minus_utc(), -7 * 60 * 60);
+        assert_eq!(target_end.to_rfc3339(), "2099-08-26T04:00:00-07:00");
+
+        let observatory_offset = FixedOffset::west_opt(7 * 60 * 60).unwrap();
+        updater
+            .state
+            .current_target
+            .as_mut()
+            .unwrap()
+            .target_end_time =
+            Some((Utc::now() - chrono::Duration::minutes(1)).with_timezone(&observatory_offset));
+        let reconciliation = updater
+            .reconcile_sequence_target(Some(("Sequence target".to_string(), true)))
+            .expect("expired scheduler target should release sequence reconciliation");
+        assert_eq!(reconciliation.1.name, "Sequence target");
+        assert_eq!(
+            updater
+                .state
+                .current_target
+                .as_ref()
+                .map(|target| &target.source),
+            Some(&TargetSource::Sequence)
+        );
+    }
+
+    #[test]
+    fn typed_sequence_outcome_does_not_claim_legacy_success() {
+        let mut updater = state_test_updater();
+        let failed: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T00:00:00Z",
+            "Event": "SEQUENCE-FINISHED",
+            "Outcome": "completed_with_failures",
+            "Status": "FINISHED",
+            "HadFailures": true
+        }))
+        .unwrap();
+        updater.apply_event_state(&failed);
+        assert!(updater.state.sequence_failure.is_some());
+        assert!(updater.format_startup_status().contains("failed"));
+
+        updater.apply_event_state(&Event {
+            time: "2026-08-26T00:01:00Z".to_string(),
+            event: event_types::SEQUENCE_STARTING.to_string(),
+            chat_enabled: true,
+            details: None,
+        });
+        let legacy_finished = Event {
+            time: "2026-08-26T00:02:00Z".to_string(),
+            event: event_types::SEQUENCE_FINISHED.to_string(),
+            chat_enabled: true,
+            details: None,
+        };
+        updater.apply_event_state(&legacy_finished);
+        assert!(!updater.format_startup_status().contains("completed"));
     }
 
     #[test]

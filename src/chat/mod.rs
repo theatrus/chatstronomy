@@ -11,9 +11,27 @@ pub use rig_resolver::{CommandContext, RigResolver, StaticRigResolver};
 pub use status_state::{StatusMessage, StatusState};
 
 use crate::error::ChatError;
-use crate::source::SharedRigSource;
+use crate::source::{RigSourceError, SharedRigSource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+// N.I.N.A. publishes image metadata before its background JPEG encoder has
+// necessarily populated the thumbnail. Retry only that explicit readiness
+// response: transport and protocol failures can each consume their own longer
+// timeout and should degrade immediately instead of holding up chat delivery.
+const THUMBNAIL_READY_MAX_ATTEMPTS: usize = 6;
+const THUMBNAIL_READY_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+fn thumbnail_is_still_preparing(error: &RigSourceError) -> bool {
+    let RigSourceError::Rejected { reason, .. } = error else {
+        return false;
+    };
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("thumbnail")
+        && reason.contains("still")
+        && (reason.contains("prepar") || reason.contains("encod"))
+}
 
 /// Represents a field in a chat message
 #[derive(Debug, Clone)]
@@ -498,7 +516,20 @@ impl ChatServiceManager {
         extra_attachments: Vec<ChatAttachment>,
     ) {
         let mut attachments = Vec::new();
-        match source.get_thumbnail(image_index).await {
+        let mut attempt = 1;
+        let thumbnail = loop {
+            match source.get_thumbnail(image_index).await {
+                Err(error)
+                    if attempt < THUMBNAIL_READY_MAX_ATTEMPTS
+                        && thumbnail_is_still_preparing(&error) =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(THUMBNAIL_READY_RETRY_DELAY).await;
+                }
+                result => break result,
+            }
+        };
+        match thumbnail {
             Ok(thumbnail_data) => {
                 attachments.push(ChatAttachment {
                     data: thumbnail_data.data,
@@ -553,5 +584,294 @@ impl ChatServiceManager {
 impl Default for ChatServiceManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod thumbnail_retry_tests {
+    use super::*;
+    use crate::api_types::CommandResponse;
+    use crate::autofocus::AutofocusResponse;
+    use crate::camera::CameraInfoResponse;
+    use crate::events::EventHistoryResponse;
+    use crate::filterwheel::FilterWheelInfoResponse;
+    use crate::focuser::FocuserInfoResponse;
+    use crate::guider::{GuiderGraphResponse, GuiderInfoResponse};
+    use crate::images::{ImageHistoryResponse, ThumbnailResponse};
+    use crate::mount::MountInfoResponse;
+    use crate::rotator::RotatorInfoResponse;
+    use crate::sequence::SequenceResponse;
+    use crate::source::{RigCapabilities, RigCommand, RigSource, RigSourceKind, RigSourceResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::time::Instant;
+
+    #[derive(Clone, Copy)]
+    enum ThumbnailBehavior {
+        ReadyAfter(usize),
+        AlwaysPreparing,
+        TerminalFailure,
+    }
+
+    struct ThumbnailSource {
+        behavior: ThumbnailBehavior,
+        attempts: AtomicUsize,
+    }
+
+    impl ThumbnailSource {
+        fn new(behavior: ThumbnailBehavior) -> Self {
+            Self {
+                behavior,
+                attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn unexpected<T>() -> RigSourceResult<T> {
+            panic!("unexpected RigSource query in thumbnail retry test")
+        }
+
+        fn still_preparing() -> RigSourceError {
+            RigSourceError::Rejected {
+                kind: RigSourceKind::NinaDirect,
+                reason: "The image thumbnail is still being prepared.".to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RigSource for ThumbnailSource {
+        fn kind(&self) -> RigSourceKind {
+            RigSourceKind::NinaDirect
+        }
+
+        fn capabilities(&self) -> RigCapabilities {
+            let mut capabilities = RigCapabilities::none();
+            capabilities.thumbnails = true;
+            capabilities
+        }
+
+        async fn get_event_history(&self) -> RigSourceResult<EventHistoryResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_all_image_history(&self) -> RigSourceResult<ImageHistoryResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_sequence(&self) -> RigSourceResult<SequenceResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_thumbnail(&self, _index: u32) -> RigSourceResult<ThumbnailResponse> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            match self.behavior {
+                ThumbnailBehavior::ReadyAfter(pending_attempts) if attempt <= pending_attempts => {
+                    Err(Self::still_preparing())
+                }
+                ThumbnailBehavior::AlwaysPreparing => Err(Self::still_preparing()),
+                ThumbnailBehavior::TerminalFailure => Err(RigSourceError::InvalidResponse {
+                    kind: RigSourceKind::NinaDirect,
+                    reason: "malformed thumbnail payload".to_string(),
+                }),
+                ThumbnailBehavior::ReadyAfter(_) => Ok(ThumbnailResponse {
+                    data: vec![1, 2, 3, 4],
+                    content_type: "image/jpeg".to_string(),
+                    status_code: 200,
+                }),
+            }
+        }
+
+        async fn get_last_autofocus(&self) -> RigSourceResult<AutofocusResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_mount_info(&self) -> RigSourceResult<MountInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_camera_info(&self) -> RigSourceResult<CameraInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_filterwheel_info(&self) -> RigSourceResult<FilterWheelInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_guider_info(&self) -> RigSourceResult<GuiderInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_guider_graph(&self) -> RigSourceResult<GuiderGraphResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_rotator_info(&self) -> RigSourceResult<RotatorInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn get_focuser_info(&self) -> RigSourceResult<FocuserInfoResponse> {
+            Self::unexpected()
+        }
+
+        async fn execute_command(&self, _command: RigCommand) -> RigSourceResult<CommandResponse> {
+            Self::unexpected()
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingChatState {
+        deliveries: Mutex<Vec<Vec<ChatAttachment>>>,
+    }
+
+    struct RecordingChatService {
+        state: Arc<RecordingChatState>,
+    }
+
+    impl RecordingChatService {
+        fn record(&self, attachments: Vec<ChatAttachment>) {
+            self.state.deliveries.lock().unwrap().push(attachments);
+        }
+    }
+
+    #[async_trait]
+    impl ChatService for RecordingChatService {
+        async fn send_message(
+            &self,
+            _message: &ChatMessage,
+            _target: &ChatTarget,
+        ) -> Result<(), ChatError> {
+            self.record(Vec::new());
+            Ok(())
+        }
+
+        async fn send_message_with_image(
+            &self,
+            _message: &ChatMessage,
+            _target: &ChatTarget,
+            image_data: &[u8],
+            filename: &str,
+        ) -> Result<(), ChatError> {
+            self.record(vec![ChatAttachment {
+                data: image_data.to_vec(),
+                filename: filename.to_string(),
+            }]);
+            Ok(())
+        }
+
+        async fn send_message_with_attachments(
+            &self,
+            _message: &ChatMessage,
+            _target: &ChatTarget,
+            attachments: &[ChatAttachment],
+        ) -> Result<(), ChatError> {
+            self.record(attachments.to_vec());
+            Ok(())
+        }
+
+        fn service_name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn can_route(&self, _target: &ChatTarget) -> bool {
+            true
+        }
+    }
+
+    fn manager_with_recording_service() -> (ChatServiceManager, Arc<RecordingChatState>) {
+        let state = Arc::new(RecordingChatState::default());
+        let mut manager = ChatServiceManager::new();
+        manager.add_service(Box::new(RecordingChatService {
+            state: state.clone(),
+        }));
+        (manager, state)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn thumbnail_readiness_retries_attach_eventual_thumbnail() {
+        let source = Arc::new(ThumbnailSource::new(ThumbnailBehavior::ReadyAfter(2)));
+        let shared_source: SharedRigSource = source.clone();
+        let (manager, state) = manager_with_recording_service();
+        let started = Instant::now();
+
+        manager
+            .send_message_with_image(
+                &ChatMessage::new("Image ready"),
+                &ChatTarget::default(),
+                &shared_source,
+                7,
+                vec![ChatAttachment {
+                    data: vec![9, 8],
+                    filename: "guiding.png".to_string(),
+                }],
+            )
+            .await;
+
+        assert_eq!(source.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(started.elapsed(), THUMBNAIL_READY_RETRY_DELAY * 2);
+        let deliveries = state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].len(), 2);
+        assert_eq!(deliveries[0][0].filename, "thumbnail_7.jpg");
+        assert_eq!(deliveries[0][0].data, vec![1, 2, 3, 4]);
+        assert_eq!(deliveries[0][1].filename, "guiding.png");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn thumbnail_readiness_exhaustion_is_bounded_and_degrades() {
+        let source = Arc::new(ThumbnailSource::new(ThumbnailBehavior::AlwaysPreparing));
+        let shared_source: SharedRigSource = source.clone();
+        let (manager, state) = manager_with_recording_service();
+        let started = Instant::now();
+
+        manager
+            .send_message_with_image(
+                &ChatMessage::new("Image without thumbnail"),
+                &ChatTarget::default(),
+                &shared_source,
+                11,
+                vec![ChatAttachment {
+                    data: vec![6, 5],
+                    filename: "guiding.png".to_string(),
+                }],
+            )
+            .await;
+
+        assert_eq!(
+            source.attempts.load(Ordering::SeqCst),
+            THUMBNAIL_READY_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            started.elapsed(),
+            THUMBNAIL_READY_RETRY_DELAY * (THUMBNAIL_READY_MAX_ATTEMPTS as u32 - 1)
+        );
+        let deliveries = state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].len(), 1);
+        assert_eq!(deliveries[0][0].filename, "guiding.png");
+        assert_eq!(deliveries[0][0].data, vec![6, 5]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_thumbnail_failure_degrades_without_retrying() {
+        let source = Arc::new(ThumbnailSource::new(ThumbnailBehavior::TerminalFailure));
+        let shared_source: SharedRigSource = source.clone();
+        let (manager, state) = manager_with_recording_service();
+        let started = Instant::now();
+
+        manager
+            .send_message_with_image(
+                &ChatMessage::new("Image without attachment"),
+                &ChatTarget::default(),
+                &shared_source,
+                3,
+                Vec::new(),
+            )
+            .await;
+
+        assert_eq!(source.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        let deliveries = state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].is_empty());
     }
 }

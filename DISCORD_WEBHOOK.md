@@ -8,10 +8,9 @@ Chatstronomy plugin over its private Direct named pipe.
 
 In **N.I.N.A. > Options > Plugins > Chatstronomy**:
 
-1. Select **Local** delivery.
-2. Select **Discord webhook**.
-3. Paste an HTTPS Discord webhook URL.
-4. Choose the event families to send and save the profile.
+1. Select **Discord webhook — simple local notifications**.
+2. Paste an HTTPS Discord webhook URL.
+3. Choose the event families to send and save the profile.
 
 The plugin creates the local runtime bootstrap configuration and starts the
 bundled runtime. There is no separate observatory URL or background service to

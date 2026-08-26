@@ -557,7 +557,11 @@ async fn status(
         let operations = active_chat_operations(&seq);
         if !operations.is_empty() {
             let camera = if operations.iter().any(|operation| {
-                matches!(operation.kind, SequenceOperationKind::CameraCooling { .. })
+                matches!(
+                    operation.kind,
+                    SequenceOperationKind::CameraCooling { .. }
+                        | SequenceOperationKind::CameraWarming { .. }
+                )
             }) {
                 client
                     .get_camera_info()
@@ -616,10 +620,13 @@ async fn sequence(
         .map(crate::sequence::meridian_flip_time_formatted_with_clock)
         .unwrap_or_else(|| "(n/a)".to_string());
     let operations = active_chat_operations(&seq);
-    let camera = if operations
-        .iter()
-        .any(|operation| matches!(operation.kind, SequenceOperationKind::CameraCooling { .. }))
-    {
+    let camera = if operations.iter().any(|operation| {
+        matches!(
+            operation.kind,
+            SequenceOperationKind::CameraCooling { .. }
+                | SequenceOperationKind::CameraWarming { .. }
+        )
+    }) {
         client
             .get_camera_info()
             .await
@@ -686,6 +693,17 @@ fn sequence_operation_summary(
                     },
                 )
         }
+        SequenceOperationKind::CameraWarming { minimum_duration } => {
+            let minimum = minimum_duration
+                .map(|duration| format!(", minimum {}", short_duration(duration)))
+                .unwrap_or_default();
+            camera
+                .filter(|camera| camera.temperature.is_finite())
+                .map_or_else(
+                    || format!("🌡️ Camera warming{minimum}"),
+                    |camera| format!("🌡️ Camera warming at {:.1} °C{minimum}", camera.temperature),
+                )
+        }
         SequenceOperationKind::TimeWait {
             target_time,
             configured_duration,
@@ -704,6 +722,36 @@ fn sequence_operation_summary(
                 format!("⏳ Timed wait ({} configured)", short_duration(*duration))
             } else {
                 "⏳ Timed wait".to_string()
+            }
+        }
+        SequenceOperationKind::AstronomicalWait {
+            target_altitude_degrees,
+            current_altitude_degrees,
+            comparator,
+            expected_time,
+        } => {
+            let current = current_altitude_degrees.map(|value| format!("current {value:.2}°"));
+            let target = target_altitude_degrees.map(|value| {
+                format!(
+                    "target {}{value:.2}°",
+                    comparator
+                        .as_deref()
+                        .map(|comparison| format!("{comparison} "))
+                        .unwrap_or_default()
+                )
+            });
+            let expected = expected_time
+                .as_deref()
+                .map(|value| format!("expected {value}"));
+            let details = [current, target, expected]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if details.is_empty() {
+                format!("🌌 {}", operation.name)
+            } else {
+                format!("🌌 {} ({details})", operation.name)
             }
         }
         SequenceOperationKind::SafetyWait {
@@ -758,6 +806,31 @@ fn sequence_operation_summary(
                 })
                 .unwrap_or_default();
             format!("🎯 Centering{target}{rotation}{solve}")
+        }
+        SequenceOperationKind::PlateSolve {
+            coordinates,
+            rotation,
+            output,
+        } => {
+            let target = coordinates
+                .as_ref()
+                .map(|coordinates| format!(" near {}", coordinates.display()))
+                .unwrap_or_default();
+            let rotation = rotation
+                .map(|rotation| format!(" at {rotation:.1}°"))
+                .unwrap_or_default();
+            let result = output
+                .as_ref()
+                .and_then(|output| output.success)
+                .map(|success| {
+                    if success {
+                        "; result succeeded"
+                    } else {
+                        "; result failed"
+                    }
+                })
+                .unwrap_or_default();
+            format!("🔎 Plate solving{target}{rotation}{result}")
         }
     }
 }
@@ -870,6 +943,46 @@ mod sequence_operation_summary_tests {
             "⏳ Waiting for a sequence condition (checking every 13s)"
         );
         assert_eq!(manual, "⏸️ Waiting for manual sequence resume");
+    }
+
+    #[test]
+    fn astronomical_wait_and_plate_solve_have_slash_command_summaries() {
+        let astronomical = sequence_operation_summary(
+            &operation(SequenceOperationKind::AstronomicalWait {
+                target_altitude_degrees: Some(-12.0),
+                current_altitude_degrees: Some(-8.5),
+                comparator: Some("LESS_THAN_OR_EQUAL".to_string()),
+                expected_time: Some("2026-08-26T21:30:00-07:00".to_string()),
+            }),
+            None,
+        );
+        assert!(astronomical.contains("current -8.50°"));
+        assert!(astronomical.contains("target LESS_THAN_OR_EQUAL -12.00°"));
+
+        let solve = sequence_operation_summary(
+            &operation(SequenceOperationKind::PlateSolve {
+                coordinates: None,
+                rotation: Some(31.5),
+                output: Some(Box::new(crate::sequence::PlateSolveOutput {
+                    solve_time: Some("2026-08-26T21:30:00-07:00".to_string()),
+                    success: Some(true),
+                    coordinates: None,
+                    position_angle: Some(31.5),
+                    pixel_scale: None,
+                    radius_degrees: None,
+                    separation_arcseconds: None,
+                    ra_error: None,
+                    dec_error: None,
+                    ra_pixel_error: None,
+                    dec_pixel_error: None,
+                    flipped: None,
+                    thumbnail: None,
+                    thumbnail_media_type: None,
+                })),
+            }),
+            None,
+        );
+        assert_eq!(solve, "🔎 Plate solving at 31.5°; result succeeded");
     }
 
     #[test]
