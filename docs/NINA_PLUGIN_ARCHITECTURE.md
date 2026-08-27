@@ -39,6 +39,8 @@ rendering, Discord slash commands, and Matrix/Discord delivery. It includes:
 - durable safety-monitor state and active safety-wait state;
 - mount-slew completion; dome/shutter and flat-panel lifecycle; and connection
   state for weather and switch devices;
+- opt-in, unit-explicit observing-condition changes and high-wind
+  alert/recovery state;
 - image-save failures and sequence-item failures with explicit sequence
   completion outcomes;
 - typed commands such as park, guide, cool, autofocus, and sequence control.
@@ -103,10 +105,26 @@ neutrally rather than being presented as a successful completion.
 Dome/shutter actions and flat-panel cover, light, and brightness changes are
 governed by the plugin's dedicated **Observatory and flat panel** switch.
 Connect/disconnect events for dome, flat-panel, weather, and switch devices are
-governed by **Equipment connections**. The contract does not expose weather
-measurements, switch values, or LiveStack data as structured telemetry. Enabled
-popup notifications and opt-in raw N.I.N.A. logs remain unstructured text and
-may contain operational details.
+governed by **Equipment connections**. Weather measurements have two independent
+controls that both start off: **Weather changes** and **High-wind alerts**.
+`WEATHER-CHANGED` carries a complete snapshot of the available unit-explicit
+numeric readings plus the display labels for fields that changed. The plugin
+learns the first snapshot silently, publishes only meaningful deltas, and
+rate-limits routine changes to one every five minutes while allowing rain-start
+events immediately. `WEATHER-HIGH-WIND` compares the greater available
+wind speed or gust with the profile's threshold and publishes explicit
+high/recovered state; recovery uses hysteresis of at least 1 m/s or 10 percent.
+Its payload is restricted to wind speed, gust, threshold, and alert state.
+Threshold changes and station reconnects can refresh an active Hub latch, while
+the updater suppresses a duplicate chat alert when the state remains high;
+missing sensor readings cannot prove recovery. The two event families have
+separate privacy-revocation scopes. Neither carries a device identity, raw
+driver object, or site location. Weather output is informational, can be
+delayed, missing, or inaccurate, and does not replace N.I.N.A.'s safety monitor
+or physical interlocks. The contract still does not expose switch
+values or LiveStack data as structured telemetry. Enabled popup notifications
+and opt-in raw N.I.N.A. logs remain unstructured text and may contain
+operational details.
 
 For mixed payload-v3 deployments, changing mount, sequence, or safety delivery
 invalidates the existing Direct session before the plugin publishes the new

@@ -24,7 +24,8 @@ while its N.I.N.A. plugin has an authenticated Direct WebSocket connection.
 4. Mint a single-use `cspt_…` pairing token.
 5. In the N.I.N.A. plugin, review **Security and privacy** and **Event delivery**
    before pairing. Most event categories, including images, start enabled;
-   hardware control, observatory location sharing, and log forwarding start off.
+   weather changes, high-wind alerts, hardware control, observatory location
+   sharing, and log forwarding start off.
 6. Choose Hosted Hub, confirm
    `https://hub.chatstronomy.com`, enter the token, and connect.
 7. The plugin stores its pairing token and returned credential in Windows
@@ -114,9 +115,25 @@ dome/shutter and flat-panel lifecycle, and weather/switch connection state.
 The dedicated **Observatory and flat panel** switch controls dome/shutter
 actions and flat cover, light, and brightness changes; **Equipment connections**
 controls the corresponding connection events and weather/switch connectivity.
-Structured weather measurements, switch values, and LiveStack data are not
-captured. Enabled popup notifications and opt-in raw N.I.N.A. logs remain
-unstructured text and may contain operational details.
+Two independent controls, **Weather changes** and **High-wind alerts**, expose
+structured observing conditions and both start off. Weather-change events carry
+only available, unit-explicit readings: ambient and sky temperature, dew point,
+humidity, pressure, cloud cover, rain rate, wind speed, gust, direction,
+sky brightness, sky quality, and star FWHM. Routine changes require a meaningful
+sensor delta and are limited to one post per five minutes; rain starting bypasses
+that interval. High-wind alerts use the greater available wind speed or gust
+speed, a locally configured threshold, and recovery hysteresis of at least
+1 m/s or 10 percent. Alert and recovery edges are both reported. The payload
+contains only wind speed, gust, threshold, and alert state. An active alert may
+be resent after a reconnect or threshold change so durable Hub status remains
+accurate without producing a duplicate chat alert. Missing sensor values do not
+prove recovery. Neither weather event contains a weather-device identity, raw
+driver object, or observatory location. Weather posts may be delayed, missing,
+or inaccurate and do not replace N.I.N.A.'s safety monitor or physical
+interlocks.
+Switch values and LiveStack data are not captured. Enabled popup notifications
+and opt-in raw N.I.N.A. logs remain unstructured text and may contain
+operational details.
 Autofocus graphs use the report matched to the completed run, and graph delivery
 tolerates bounded transient query failures. Guider
 graph failures remain non-fatal and the image notification is sent without the

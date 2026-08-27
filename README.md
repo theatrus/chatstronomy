@@ -43,9 +43,24 @@ remain inside N.I.N.A.
 Dome/shutter actions and flat-panel cover, light, and brightness changes use a
 dedicated local **Observatory and flat panel** event switch. Connect/disconnect
 state for dome, flat-panel, weather, and switch devices uses **Equipment
-connections**. Structured weather measurements, switch values, and LiveStack
-data are not captured. Enabled popup notifications and opt-in raw N.I.N.A. logs
-remain unstructured text and may contain operational details.
+connections**. Structured observing conditions use two independent controls,
+**Weather changes** and **High-wind alerts**, and both start off. Weather-change
+posts contain only available, unit-labelled readings such as temperature, dew
+point, humidity, pressure, cloud cover, rain rate, wind, sky conditions, and
+seeing. They are limited to meaningful changes and at most one routine post per
+five minutes; rain starting is delivered immediately. High-wind alerts compare
+the greater available wind speed or gust with the locally configured
+threshold and send both alert and recovered transitions with hysteresis.
+High-wind records contain only wind speed, gust, threshold, and alert state;
+an active alert can be resent after reconnecting or changing the threshold to
+synchronize status without another chat alert. Missing readings do not clear an
+active alert. These events contain no weather-device identity or observatory
+location. Weather chat is informational and may be delayed, missing, or
+inaccurate; it does not replace N.I.N.A.'s safety monitor or hardware
+interlocks. Switch
+values and LiveStack data are not captured. Enabled popup notifications and
+opt-in raw N.I.N.A. logs remain unstructured text and may contain operational
+details.
 
 Per-profile event controls are a hard transmission and privacy boundary:
 disabled event families never reach the hosted Hub or local runtime, including

@@ -40,6 +40,18 @@ where
     }
 }
 
+/// Optional `f64` field using the same N.I.N.A. sentinel handling as
+/// [`de_f64_tolerant`]. Missing fields are handled by `#[serde(default)]` at
+/// the call site; explicit `null`, `[]`, `"NaN"`, and infinities become
+/// `None` so unavailable device readings never reach chat rendering.
+pub fn de_optional_finite_f64<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = de_f64_tolerant(d)?;
+    Ok(value.is_finite().then_some(value))
+}
+
 /// `String` field that may also arrive as an empty array `[]` — empty
 /// arrays become the empty string.
 pub fn de_string_tolerant<'de, D>(d: D) -> Result<String, D::Error>
@@ -97,6 +109,8 @@ mod tests {
     struct S(#[serde(deserialize_with = "de_string_tolerant")] String);
     #[derive(Deserialize)]
     struct I(#[serde(deserialize_with = "de_i32_tolerant")] i32);
+    #[derive(Deserialize)]
+    struct O(#[serde(deserialize_with = "de_optional_finite_f64")] Option<f64>);
 
     #[test]
     fn f64_number() {
@@ -128,6 +142,16 @@ mod tests {
     fn f64_null_is_nan() {
         let F(v) = serde_json::from_str("null").unwrap();
         assert!(v.is_nan());
+    }
+
+    #[test]
+    fn optional_finite_f64_discards_nina_unknown_sentinels() {
+        let O(value) = serde_json::from_str("12.5").unwrap();
+        assert_eq!(value, Some(12.5));
+        for json in ["null", "[]", "\"NaN\"", "\"Infinity\"", "\"-Infinity\""] {
+            let O(value) = serde_json::from_str(json).unwrap();
+            assert_eq!(value, None, "sentinel {json}");
+        }
     }
 
     #[test]

@@ -1,4 +1,6 @@
-use crate::serde_helpers::{de_f64_tolerant, de_i32_tolerant, de_string_tolerant};
+use crate::serde_helpers::{
+    de_f64_tolerant, de_i32_tolerant, de_optional_finite_f64, de_string_tolerant,
+};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::{Map, Value};
 
@@ -26,6 +28,163 @@ pub struct Event {
 
 fn default_true() -> bool {
     true
+}
+
+/// Unit-explicit weather readings copied from N.I.N.A.'s `WeatherDataInfo`.
+/// Every sensor is optional because observing-conditions drivers advertise
+/// different subsets; the plugin omits N.I.N.A.'s `double.NaN` sentinel and
+/// this decoder also accepts older string/array sentinels as unavailable.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct WeatherConditions {
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wind_speed_meters_per_second: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wind_gust_meters_per_second: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wind_direction_degrees: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub temperature_celsius: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dew_point_celsius: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub humidity_percent: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pressure_hectopascals: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cloud_cover_percent: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rain_rate_millimeters_per_hour: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sky_temperature_celsius: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sky_brightness_lux: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sky_quality_magnitudes_per_square_arcsecond: Option<f64>,
+    #[serde(
+        rename = "StarFwhmArcseconds",
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub star_fwhm_arcseconds: Option<f64>,
+}
+
+impl WeatherConditions {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.wind_speed_meters_per_second.is_none()
+            && self.wind_gust_meters_per_second.is_none()
+            && self.wind_direction_degrees.is_none()
+            && self.temperature_celsius.is_none()
+            && self.dew_point_celsius.is_none()
+            && self.humidity_percent.is_none()
+            && self.pressure_hectopascals.is_none()
+            && self.cloud_cover_percent.is_none()
+            && self.rain_rate_millimeters_per_hour.is_none()
+            && self.sky_temperature_celsius.is_none()
+            && self.sky_brightness_lux.is_none()
+            && self.sky_quality_magnitudes_per_square_arcsecond.is_none()
+            && self.star_fwhm_arcseconds.is_none()
+    }
+
+    pub(crate) fn has_wind_reading(&self) -> bool {
+        self.wind_speed_meters_per_second.is_some() || self.wind_gust_meters_per_second.is_some()
+    }
+
+    /// Drop physically impossible or unbounded values from an untrusted
+    /// remote payload. Bounds are intentionally much wider than terrestrial
+    /// observing conditions, but keep one malformed driver value from
+    /// producing an oversized chat/status payload.
+    pub(crate) fn sanitized(mut self) -> Self {
+        self.wind_speed_meters_per_second = self
+            .wind_speed_meters_per_second
+            .filter(|value| (0.0..=1_000.0).contains(value));
+        self.wind_gust_meters_per_second = self
+            .wind_gust_meters_per_second
+            .filter(|value| (0.0..=1_000.0).contains(value));
+        self.wind_direction_degrees = self
+            .wind_direction_degrees
+            .filter(|value| (0.0..=360.0).contains(value));
+        self.temperature_celsius = self
+            .temperature_celsius
+            .filter(|value| (-273.15..=1_000.0).contains(value));
+        self.dew_point_celsius = self
+            .dew_point_celsius
+            .filter(|value| (-273.15..=1_000.0).contains(value));
+        self.humidity_percent = self
+            .humidity_percent
+            .filter(|value| (0.0..=100.0).contains(value));
+        self.pressure_hectopascals = self
+            .pressure_hectopascals
+            .filter(|value| *value > 0.0 && *value <= 2_000.0);
+        self.cloud_cover_percent = self
+            .cloud_cover_percent
+            .filter(|value| (0.0..=100.0).contains(value));
+        self.rain_rate_millimeters_per_hour = self
+            .rain_rate_millimeters_per_hour
+            .filter(|value| (0.0..=1_000_000.0).contains(value));
+        self.sky_temperature_celsius = self
+            .sky_temperature_celsius
+            .filter(|value| (-273.15..=1_000.0).contains(value));
+        self.sky_brightness_lux = self
+            .sky_brightness_lux
+            .filter(|value| (0.0..=1_000_000_000_000.0).contains(value));
+        self.sky_quality_magnitudes_per_square_arcsecond = self
+            .sky_quality_magnitudes_per_square_arcsecond
+            .filter(|value| (-100.0..=100.0).contains(value));
+        self.star_fwhm_arcseconds = self
+            .star_fwhm_arcseconds
+            .filter(|value| (0.0..=1_000_000.0).contains(value));
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +244,29 @@ pub enum EventDetails {
     SafetyChanged {
         #[serde(rename = "IsSafe")]
         is_safe: bool,
+    },
+    /// A rate-limited, opt-in snapshot of current observing conditions.
+    WeatherChanged {
+        #[serde(rename = "ChangedFields")]
+        changed_fields: String,
+        #[serde(rename = "Summary", default)]
+        summary: Option<String>,
+        #[serde(flatten)]
+        conditions: WeatherConditions,
+    },
+    /// High-wind threshold transition. `false` is the recovery edge, allowing
+    /// the Hub to clear durable alert state rather than leaving it latched.
+    WeatherHighWind {
+        #[serde(rename = "IsHighWind")]
+        is_high_wind: bool,
+        #[serde(
+            rename = "ThresholdMetersPerSecond",
+            default,
+            deserialize_with = "de_optional_finite_f64"
+        )]
+        threshold_meters_per_second: Option<f64>,
+        #[serde(flatten)]
+        conditions: WeatherConditions,
     },
     /// Rotator moved. Emitted for both ROTATOR-MOVED and
     /// ROTATOR-MOVED-MECHANICAL — both share `{From, To}` in degrees.
@@ -278,6 +460,49 @@ wire_details!(AutofocusFinishedWire {
     temperature: Option<f64>,
 });
 wire_details!(SafetyChangedWire { is_safe: bool });
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WeatherChangedWire {
+    #[serde(deserialize_with = "de_weather_changed_fields")]
+    changed_fields: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(flatten)]
+    conditions: WeatherConditions,
+}
+
+fn de_weather_changed_fields<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::String(value) => Ok(value),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(value) => Ok(value),
+                other => Err(D::Error::custom(format!(
+                    "weather ChangedFields entries must be strings; got {other}"
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| values.join(", ")),
+        other => Err(D::Error::custom(format!(
+            "weather ChangedFields must be a string or string array; got {other}"
+        ))),
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WeatherHighWindWire {
+    is_high_wind: bool,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    threshold_meters_per_second: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    wind_speed_meters_per_second: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    wind_gust_meters_per_second: Option<f64>,
+}
 wire_details!(NumericMoveWire { from: f64, to: f64 });
 wire_details!(MountSlewedWire {
     from: EventCoordinates,
@@ -388,6 +613,35 @@ fn decode_event_details(event: &str, fields: Map<String, Value>) -> Option<Event
                 is_safe: wire.is_safe,
             })
         }
+        event_types::WEATHER_CHANGED => {
+            decode_wire::<WeatherChangedWire>(&fields).and_then(|wire| {
+                let conditions = wire.conditions.sanitized();
+                (!conditions.is_empty()).then_some(EventDetails::WeatherChanged {
+                    changed_fields: wire.changed_fields,
+                    summary: wire.summary,
+                    conditions,
+                })
+            })
+        }
+        event_types::WEATHER_HIGH_WIND => {
+            decode_wire::<WeatherHighWindWire>(&fields).and_then(|wire| {
+                let conditions = WeatherConditions {
+                    wind_speed_meters_per_second: wire.wind_speed_meters_per_second,
+                    wind_gust_meters_per_second: wire.wind_gust_meters_per_second,
+                    ..WeatherConditions::default()
+                }
+                .sanitized();
+                conditions
+                    .has_wind_reading()
+                    .then_some(EventDetails::WeatherHighWind {
+                        is_high_wind: wire.is_high_wind,
+                        threshold_meters_per_second: wire
+                            .threshold_meters_per_second
+                            .filter(|value| (0.0..=1_000.0).contains(value)),
+                        conditions,
+                    })
+            })
+        }
         event_types::ROTATOR_MOVED | event_types::ROTATOR_MOVED_MECHANICAL => {
             decode_wire::<NumericMoveWire>(&fields).map(|wire| EventDetails::RotatorMoved {
                 from: wire.from,
@@ -462,7 +716,16 @@ fn decode_event_details(event: &str, fields: Map<String, Value>) -> Option<Event
         _ => None,
     };
 
-    details.or_else(|| unknown_details(fields))
+    if details.is_some()
+        || matches!(
+            event,
+            event_types::WEATHER_CHANGED | event_types::WEATHER_HIGH_WIND
+        )
+    {
+        details
+    } else {
+        unknown_details(fields)
+    }
 }
 
 impl<'de> Deserialize<'de> for Event {
@@ -575,6 +838,8 @@ pub mod event_types {
     pub const FLAT_COVER_CLOSED: &str = "FLAT-COVER-CLOSED";
     pub const WEATHER_CONNECTED: &str = "WEATHER-CONNECTED";
     pub const WEATHER_DISCONNECTED: &str = "WEATHER-DISCONNECTED";
+    pub const WEATHER_CHANGED: &str = "WEATHER-CHANGED";
+    pub const WEATHER_HIGH_WIND: &str = "WEATHER-HIGH-WIND";
     pub const SWITCH_CONNECTED: &str = "SWITCH-CONNECTED";
     pub const SWITCH_DISCONNECTED: &str = "SWITCH-DISCONNECTED";
     pub const DOME_CONNECTED: &str = "DOME-CONNECTED";
@@ -620,6 +885,8 @@ pub(crate) enum EventDeliveryScope {
     Mount,
     Sequence,
     Safety,
+    WeatherChanges,
+    HighWindAlerts,
     TargetScheduler,
     FilterFocuserRotator,
     EquipmentConnections,
@@ -645,6 +912,12 @@ pub(crate) fn event_delivery_scope(event: &str) -> EventDeliveryScope {
     }
     if event.starts_with("SAFETY-") {
         return EventDeliveryScope::Safety;
+    }
+    if event == event_types::WEATHER_CHANGED {
+        return EventDeliveryScope::WeatherChanges;
+    }
+    if event == event_types::WEATHER_HIGH_WIND {
+        return EventDeliveryScope::HighWindAlerts;
     }
     if event == event_types::CHATSTRONOMY_COMMAND_FAILED {
         return EventDeliveryScope::CommandFailures;
@@ -805,6 +1078,130 @@ mod tests {
             event.details,
             Some(EventDetails::SafetyChanged { is_safe: false })
         ));
+    }
+
+    #[test]
+    fn unit_explicit_weather_change_parses_optional_readings_and_sentinels() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T04:20:00Z",
+            "Event": "WEATHER-CHANGED",
+            "ChatEnabled": true,
+            "ChangedFields": "wind, humidity",
+            "Summary": "Wind increased; humidity fell",
+            "WindSpeedMetersPerSecond": 5.25,
+            "WindGustMetersPerSecond": 8.75,
+            "TemperatureCelsius": 11.2,
+            "HumidityPercent": 61.0,
+            "PressureHectopascals": 1012.4,
+            "CloudCoverPercent": 14.0,
+            "RainRateMillimetersPerHour": 0.0,
+            "DewPointCelsius": "NaN",
+            "SkyTemperatureCelsius": null,
+            "WindDirectionDegrees": 420.0
+        }))
+        .unwrap();
+
+        match event.details {
+            Some(EventDetails::WeatherChanged {
+                changed_fields,
+                summary,
+                conditions,
+            }) => {
+                assert_eq!(changed_fields, "wind, humidity");
+                assert_eq!(summary.as_deref(), Some("Wind increased; humidity fell"));
+                assert_eq!(conditions.wind_speed_meters_per_second, Some(5.25));
+                assert_eq!(conditions.wind_gust_meters_per_second, Some(8.75));
+                assert_eq!(conditions.temperature_celsius, Some(11.2));
+                assert_eq!(conditions.humidity_percent, Some(61.0));
+                assert_eq!(conditions.pressure_hectopascals, Some(1012.4));
+                assert_eq!(conditions.cloud_cover_percent, Some(14.0));
+                assert_eq!(conditions.rain_rate_millimeters_per_hour, Some(0.0));
+                assert_eq!(conditions.dew_point_celsius, None);
+                assert_eq!(conditions.sky_temperature_celsius, None);
+                assert_eq!(conditions.wind_direction_degrees, None);
+            }
+            other => panic!("expected typed weather change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn high_wind_transition_parses_alert_and_recovery() {
+        for (is_high_wind, speed, gust) in [(true, 9.5, 13.2), (false, 4.0, 6.1)] {
+            let event: Event = serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T04:21:00Z",
+                "Event": "WEATHER-HIGH-WIND",
+                "IsHighWind": is_high_wind,
+                "WindSpeedMetersPerSecond": speed,
+                "WindGustMetersPerSecond": gust,
+                "ThresholdMetersPerSecond": 9.0,
+                "TemperatureCelsius": { "malformed": true },
+                "HumidityPercent": [99.0],
+                "WindDirectionDegrees": 270.0
+            }))
+            .unwrap();
+
+            let Some(EventDetails::WeatherHighWind {
+                is_high_wind: actual,
+                threshold_meters_per_second: Some(9.0),
+                conditions,
+            }) = event.details
+            else {
+                panic!("expected typed high-wind transition");
+            };
+            assert_eq!(actual, is_high_wind);
+            assert_eq!(conditions.wind_speed_meters_per_second, Some(speed));
+            assert_eq!(conditions.wind_gust_meters_per_second, Some(gust));
+            assert_eq!(conditions.temperature_celsius, None);
+            assert_eq!(conditions.humidity_percent, None);
+            assert_eq!(conditions.wind_direction_degrees, None);
+
+            let serialized = serde_json::to_value(Event {
+                time: "2026-08-26T04:21:00Z".to_string(),
+                event: event_types::WEATHER_HIGH_WIND.to_string(),
+                chat_enabled: true,
+                details: Some(EventDetails::WeatherHighWind {
+                    is_high_wind: actual,
+                    threshold_meters_per_second: Some(9.0),
+                    conditions,
+                }),
+            })
+            .unwrap();
+            assert!(serialized.get("WindSpeedMetersPerSecond").is_some());
+            assert!(serialized.get("WindGustMetersPerSecond").is_some());
+            assert!(serialized.get("TemperatureCelsius").is_none());
+            assert!(serialized.get("HumidityPercent").is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_or_empty_known_weather_details_are_dropped() {
+        for payload in [
+            serde_json::json!({
+                "Time": "2026-08-26T04:21:00Z",
+                "Event": "WEATHER-HIGH-WIND",
+                "TemperatureCelsius": 42.0
+            }),
+            serde_json::json!({
+                "Time": "2026-08-26T04:21:01Z",
+                "Event": "WEATHER-HIGH-WIND",
+                "IsHighWind": true,
+                "WindSpeedMetersPerSecond": -1.0,
+                "HumidityPercent": 99.0
+            }),
+            serde_json::json!({
+                "Time": "2026-08-26T04:21:02Z",
+                "Event": "WEATHER-CHANGED",
+                "ChangedFields": "temperature",
+                "TemperatureCelsius": "NaN"
+            }),
+        ] {
+            let event: Event = serde_json::from_value(payload).unwrap();
+            assert!(event.details.is_none());
+            let serialized = serde_json::to_value(event).unwrap();
+            assert!(serialized.get("TemperatureCelsius").is_none());
+            assert!(serialized.get("HumidityPercent").is_none());
+            assert!(serialized.get("WindSpeedMetersPerSecond").is_none());
+        }
     }
 
     #[test]
@@ -1346,6 +1743,18 @@ mod tests {
         assert_eq!(
             event_delivery_scope(event_types::CHATSTRONOMY_COMMAND_FAILED),
             EventDeliveryScope::CommandFailures
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::WEATHER_CHANGED),
+            EventDeliveryScope::WeatherChanges
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::WEATHER_HIGH_WIND),
+            EventDeliveryScope::HighWindAlerts
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::WEATHER_CONNECTED),
+            EventDeliveryScope::EquipmentConnections
         );
     }
 

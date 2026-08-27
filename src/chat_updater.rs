@@ -3,8 +3,8 @@ use crate::camera::CameraInfo;
 use crate::chat::{ChatAttachment, ChatField, ChatMessage, ChatServiceManager, ChatTarget};
 use crate::discord::colors;
 use crate::events::{
-    Event, EventDeliveryScope, EventDetails, FilterInfo, TargetCoordinates, event_delivery_scope,
-    event_types,
+    Event, EventDeliveryScope, EventDetails, FilterInfo, TargetCoordinates, WeatherConditions,
+    event_delivery_scope, event_types,
 };
 use crate::images::ImageMetadata;
 use crate::sequence::{
@@ -118,6 +118,133 @@ impl SafetyState {
             Self::Unsafe => Some("⚠️ Conditions unsafe"),
             Self::Disconnected => Some("⚠️ Safety monitor disconnected"),
         }
+    }
+}
+
+fn has_usable_weather_details(event: &Event) -> bool {
+    match (event.event.as_str(), &event.details) {
+        (event_types::WEATHER_CHANGED, Some(EventDetails::WeatherChanged { conditions, .. })) => {
+            !conditions.is_empty()
+        }
+        (
+            event_types::WEATHER_HIGH_WIND,
+            Some(EventDetails::WeatherHighWind { conditions, .. }),
+        ) => conditions.has_wind_reading(),
+        (event_types::WEATHER_CHANGED | event_types::WEATHER_HIGH_WIND, _) => false,
+        _ => true,
+    }
+}
+
+impl WeatherConditions {
+    /// High-wind transitions intentionally carry only wind readings. Merge
+    /// those available values into the last full WEATHER-CHANGED snapshot so
+    /// temperature/cloud state is not erased by an alert edge.
+    fn merge_available(&mut self, update: &Self) {
+        macro_rules! replace_some {
+            ($field:ident) => {
+                if update.$field.is_some() {
+                    self.$field = update.$field;
+                }
+            };
+        }
+        replace_some!(wind_speed_meters_per_second);
+        replace_some!(wind_gust_meters_per_second);
+        replace_some!(wind_direction_degrees);
+        replace_some!(temperature_celsius);
+        replace_some!(dew_point_celsius);
+        replace_some!(humidity_percent);
+        replace_some!(pressure_hectopascals);
+        replace_some!(cloud_cover_percent);
+        replace_some!(rain_rate_millimeters_per_hour);
+        replace_some!(sky_temperature_celsius);
+        replace_some!(sky_brightness_lux);
+        replace_some!(sky_quality_magnitudes_per_square_arcsecond);
+        replace_some!(star_fwhm_arcseconds);
+    }
+
+    /// Compact Discord groups with units in every value. Grouping keeps a
+    /// complete snapshot below Discord's field-count limit.
+    fn chat_fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = Vec::new();
+
+        let mut wind = Vec::new();
+        if let Some(value) = self.wind_speed_meters_per_second {
+            wind.push(format!("{value:.1} m/s speed"));
+        }
+        if let Some(value) = self.wind_gust_meters_per_second {
+            wind.push(format!("{value:.1} m/s gust"));
+        }
+        if let Some(value) = self.wind_direction_degrees {
+            wind.push(format!("{value:.0}°"));
+        }
+        if !wind.is_empty() {
+            fields.push(("Wind", wind.join(" · ")));
+        }
+
+        let mut atmosphere = Vec::new();
+        if let Some(value) = self.temperature_celsius {
+            atmosphere.push(format!("{value:.1} °C"));
+        }
+        if let Some(value) = self.dew_point_celsius {
+            atmosphere.push(format!("dew point {value:.1} °C"));
+        }
+        if let Some(value) = self.humidity_percent {
+            atmosphere.push(format!("{value:.0}% RH"));
+        }
+        if let Some(value) = self.pressure_hectopascals {
+            atmosphere.push(format!("{value:.1} hPa"));
+        }
+        if !atmosphere.is_empty() {
+            fields.push(("Atmosphere", atmosphere.join(" · ")));
+        }
+
+        let mut sky = Vec::new();
+        if let Some(value) = self.cloud_cover_percent {
+            sky.push(format!("{value:.0}% cloud"));
+        }
+        if let Some(value) = self.sky_temperature_celsius {
+            sky.push(format!("sky {value:.1} °C"));
+        }
+        if let Some(value) = self.sky_brightness_lux {
+            sky.push(format!("{value:.2} lux"));
+        }
+        if let Some(value) = self.sky_quality_magnitudes_per_square_arcsecond {
+            sky.push(format!("{value:.2} mag/arcsec²"));
+        }
+        if let Some(value) = self.star_fwhm_arcseconds {
+            sky.push(format!("{value:.2}″ FWHM"));
+        }
+        if !sky.is_empty() {
+            fields.push(("Sky", sky.join(" · ")));
+        }
+
+        if let Some(value) = self.rain_rate_millimeters_per_hour {
+            fields.push(("Rain", format!("{value:.2} mm/h")));
+        }
+        fields
+    }
+
+    fn status_summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(value) = self.wind_speed_meters_per_second {
+            parts.push(format!("wind {value:.1} m/s"));
+        }
+        if let Some(value) = self.wind_gust_meters_per_second {
+            parts.push(format!("gust {value:.1} m/s"));
+        }
+        if let Some(value) = self.temperature_celsius {
+            parts.push(format!("{value:.1} °C"));
+        }
+        if let Some(value) = self.humidity_percent {
+            parts.push(format!("{value:.0}% RH"));
+        }
+        if let Some(value) = self.cloud_cover_percent {
+            parts.push(format!("{value:.0}% cloud"));
+        }
+        if let Some(value) = self.rain_rate_millimeters_per_hour {
+            parts.push(format!("rain {value:.2} mm/h"));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
     }
 }
 
@@ -497,6 +624,15 @@ struct UpdaterState {
     flat_light_on: Option<bool>,
     flat_brightness: Option<i32>,
     weather_connected: Option<bool>,
+    /// Latest opt-in observing-conditions snapshot. It contains only numeric
+    /// measurements with explicit units — never a device identity, site
+    /// coordinate, or raw driver payload.
+    weather_conditions: Option<WeatherConditions>,
+    weather_conditions_at: Option<DateTime<Utc>>,
+    weather_high_wind: Option<bool>,
+    weather_high_wind_conditions: Option<WeatherConditions>,
+    weather_high_wind_conditions_at: Option<DateTime<Utc>>,
+    weather_high_wind_threshold_meters_per_second: Option<f64>,
     switch_connected: Option<bool>,
     /// A recent legacy signal that the otherwise-ambiguous coordinate
     /// operation is a center rather than a plain slew.
@@ -550,6 +686,12 @@ impl UpdaterState {
             flat_light_on: None,
             flat_brightness: None,
             weather_connected: None,
+            weather_conditions: None,
+            weather_conditions_at: None,
+            weather_high_wind: None,
+            weather_high_wind_conditions: None,
+            weather_high_wind_conditions_at: None,
+            weather_high_wind_threshold_meters_per_second: None,
             switch_connected: None,
             center_event_seen_at: None,
             sequence_operations: HashMap::new(),
@@ -682,7 +824,7 @@ impl UpdaterState {
             .as_ref()
             .map_or("", |failure| failure.error.as_str());
         format!(
-            "t={target}|te={target_end}|f={filter}|m={mount}|g={guider}|w={wait_minutes}|sr={}|sf={failure}|so={:?}|safe={:?}|dc={:?}|dso={:?}|daz={:?}|dp={:?}|dh={:?}|fc={:?}|fcs={:?}|fl={:?}|fb={:?}|wc={:?}|sw={:?}|flip={flip_minutes}|ops={}",
+            "t={target}|te={target_end}|f={filter}|m={mount}|g={guider}|w={wait_minutes}|sr={}|sf={failure}|so={:?}|safe={:?}|dc={:?}|dso={:?}|daz={:?}|dp={:?}|dh={:?}|fc={:?}|fcs={:?}|fl={:?}|fb={:?}|wc={:?}|wx={:?}|wh={:?}|whx={:?}|wht={:?}|sw={:?}|flip={flip_minutes}|ops={}",
             self.sequence_running,
             self.sequence_outcome,
             self.safety_state,
@@ -696,6 +838,10 @@ impl UpdaterState {
             self.flat_light_on,
             self.flat_brightness,
             self.weather_connected,
+            self.weather_conditions,
+            self.weather_high_wind,
+            self.weather_high_wind_conditions,
+            self.weather_high_wind_threshold_meters_per_second,
             self.switch_connected,
             operations.join(",")
         )
@@ -1898,6 +2044,16 @@ impl ChatUpdater {
                     )
                 });
             }
+            EventDeliveryScope::WeatherChanges => {
+                self.state.weather_conditions = None;
+                self.state.weather_conditions_at = None;
+            }
+            EventDeliveryScope::HighWindAlerts => {
+                self.state.weather_high_wind = None;
+                self.state.weather_high_wind_conditions = None;
+                self.state.weather_high_wind_conditions_at = None;
+                self.state.weather_high_wind_threshold_meters_per_second = None;
+            }
             EventDeliveryScope::Autofocus => {
                 self.pending_autofocus_deliveries.clear();
             }
@@ -1929,6 +2085,9 @@ impl ChatUpdater {
     }
 
     fn apply_event_state(&mut self, event: &Event) {
+        if !has_usable_weather_details(event) {
+            return;
+        }
         match event.event.as_str() {
             event_types::MOUNT_PARKED
             | event_types::MOUNT_UNPARKED
@@ -2092,13 +2251,66 @@ impl ChatUpdater {
                     self.state.flat_brightness = Some(*new);
                 }
             }
-            event_types::WEATHER_CONNECTED => self.state.weather_connected = Some(true),
-            event_types::WEATHER_DISCONNECTED => self.state.weather_connected = Some(false),
+            event_types::WEATHER_CONNECTED => {
+                self.state.weather_connected = Some(true);
+                self.clear_weather_connection_epoch();
+            }
+            event_types::WEATHER_DISCONNECTED => {
+                self.state.weather_connected = Some(false);
+                self.clear_weather_connection_epoch();
+            }
+            event_types::WEATHER_CHANGED => {
+                if let Some(EventDetails::WeatherChanged { conditions, .. }) = &event.details {
+                    self.state.weather_conditions =
+                        (!conditions.is_empty()).then(|| conditions.clone());
+                    self.state.weather_conditions_at = self
+                        .state
+                        .weather_conditions
+                        .as_ref()
+                        .and_then(|_| parse_nina_timestamp(&event.time))
+                        .map(|time| time.with_timezone(&Utc));
+                }
+            }
+            event_types::WEATHER_HIGH_WIND => {
+                if let Some(EventDetails::WeatherHighWind {
+                    is_high_wind,
+                    threshold_meters_per_second,
+                    conditions,
+                }) = &event.details
+                {
+                    self.state.weather_high_wind = Some(*is_high_wind);
+                    self.state.weather_high_wind_threshold_meters_per_second =
+                        *threshold_meters_per_second;
+                    self.state.weather_high_wind_conditions =
+                        (!conditions.is_empty()).then(|| conditions.clone());
+                    self.state.weather_high_wind_conditions_at = self
+                        .state
+                        .weather_high_wind_conditions
+                        .as_ref()
+                        .and_then(|_| parse_nina_timestamp(&event.time))
+                        .map(|time| time.with_timezone(&Utc));
+                }
+            }
             event_types::SWITCH_CONNECTED => self.state.switch_connected = Some(true),
             event_types::SWITCH_DISCONNECTED => self.state.switch_connected = Some(false),
             _ => {}
         }
         self.state.last_status_fingerprint = None;
+    }
+
+    fn clear_weather_connection_epoch(&mut self) {
+        self.state.weather_conditions = None;
+        self.state.weather_conditions_at = None;
+        // A disconnected or newly connected station cannot prove that an
+        // active alert recovered, so retain that latch. A prior recovery is
+        // not durable across the new observation epoch; clear its old safe
+        // reading and threshold instead of presenting them as current.
+        if self.state.weather_high_wind != Some(true) {
+            self.state.weather_high_wind = None;
+            self.state.weather_high_wind_conditions = None;
+            self.state.weather_high_wind_conditions_at = None;
+            self.state.weather_high_wind_threshold_meters_per_second = None;
+        }
     }
 
     fn process_baseline_events(&mut self, events: &[Event]) {
@@ -2274,6 +2486,12 @@ impl ChatUpdater {
             return true;
         }
 
+        // These names drive durable state and user-visible alerts. Never
+        // guess from absent, malformed, or sensor-empty typed details.
+        if !has_usable_weather_details(event) {
+            return false;
+        }
+
         // Skip redundant filterwheel events, but only when both filters are
         // known — empty/unknown payloads need to be enriched, not dropped.
         if event.event == event_types::FILTERWHEEL_CHANGED
@@ -2287,6 +2505,9 @@ impl ChatUpdater {
     }
 
     async fn handle_event(&mut self, event: &Event) {
+        if !has_usable_weather_details(event) {
+            return;
+        }
         if !event.chat_enabled {
             if !self.state.has_seen_disabled_event(event) {
                 self.revoke_state_for_disabled_event(&event.event);
@@ -2294,7 +2515,22 @@ impl ChatUpdater {
             return;
         }
 
+        // The plugin republishes WEATHER-HIGH-WIND after a threshold setting
+        // changes so durable Hub state receives the new limit. When the rig
+        // was already high and remains high this is a state refresh, not a
+        // second alert; update state but do not post duplicate chat noise.
+        let suppress_high_wind_refresh = matches!(
+            &event.details,
+            Some(EventDetails::WeatherHighWind {
+                is_high_wind: true,
+                ..
+            }) if self.state.weather_high_wind == Some(true)
+        );
+
         self.apply_event_state(event);
+        if suppress_high_wind_refresh {
+            return;
+        }
 
         match event.event.as_str() {
             event_types::TS_TARGETSTART | event_types::TS_NEWTARGETSTART => {
@@ -3280,16 +3516,64 @@ impl ChatUpdater {
             };
             parts.push(format!("{icon} Flat panel · {}", flat_detail.join(", ")));
         }
+        let mut weather_detail = Vec::new();
         if let Some(connected) = self.state.weather_connected {
-            parts.push(format!(
-                "{} Weather station {}",
-                if connected { "🌦️" } else { "⚠️" },
+            weather_detail.push(
                 if connected {
                     "connected"
                 } else {
                     "disconnected"
                 }
-            ));
+                .to_string(),
+            );
+        }
+        if self.state.weather_high_wind == Some(true) {
+            weather_detail.push(
+                match self.state.weather_high_wind_threshold_meters_per_second {
+                    Some(threshold) => format!("HIGH WIND (limit {threshold:.1} m/s)"),
+                    None => "HIGH WIND".to_string(),
+                },
+            );
+        }
+        let mut current_weather = self.state.weather_conditions.clone().unwrap_or_default();
+        let weather_has_wind = self
+            .state
+            .weather_conditions
+            .as_ref()
+            .is_some_and(WeatherConditions::has_wind_reading);
+        let high_wind_has_wind = self
+            .state
+            .weather_high_wind_conditions
+            .as_ref()
+            .is_some_and(WeatherConditions::has_wind_reading);
+        let high_wind_reading_is_current = high_wind_has_wind
+            && (!weather_has_wind
+                || match (
+                    self.state.weather_conditions_at,
+                    self.state.weather_high_wind_conditions_at,
+                ) {
+                    (Some(weather), Some(high_wind)) => high_wind >= weather,
+                    (None, Some(_)) => true,
+                    (Some(_), None) => false,
+                    (None, None) => self.state.weather_high_wind == Some(true),
+                });
+        if high_wind_reading_is_current
+            && let Some(high_wind_conditions) = &self.state.weather_high_wind_conditions
+        {
+            current_weather.merge_available(high_wind_conditions);
+        }
+        if let Some(summary) = current_weather.status_summary() {
+            weather_detail.push(format!("last report: {summary}"));
+        }
+        if !weather_detail.is_empty() {
+            let icon = if self.state.weather_connected == Some(false)
+                || self.state.weather_high_wind == Some(true)
+            {
+                "⚠️"
+            } else {
+                "🌦️"
+            };
+            parts.push(format!("{icon} Weather · {}", weather_detail.join(", ")));
         }
         if let Some(connected) = self.state.switch_connected {
             parts.push(format!(
@@ -3756,6 +4040,18 @@ impl ChatUpdater {
                     "⚠️ Safety monitor reports unsafe".to_string()
                 },
             ),
+            Some(EventDetails::WeatherHighWind { is_high_wind, .. }) => (
+                if *is_high_wind {
+                    colors::RED
+                } else {
+                    colors::GREEN
+                },
+                if *is_high_wind {
+                    "⚠️ High wind reported".to_string()
+                } else {
+                    "✅ Wind conditions recovered".to_string()
+                },
+            ),
             _ => (get_event_color(&event.event), get_event_title(&event.event)),
         };
 
@@ -3814,6 +4110,49 @@ impl ChatUpdater {
                 EventDetails::SafetyChanged { is_safe } => {
                     message =
                         message.field("State", if *is_safe { "Safe" } else { "Unsafe" }, true);
+                }
+                EventDetails::WeatherChanged {
+                    changed_fields,
+                    summary,
+                    conditions,
+                } => {
+                    if !changed_fields.trim().is_empty() {
+                        message =
+                            message.field("Changed", &truncate_chat_value(changed_fields), false);
+                    }
+                    if let Some(summary) =
+                        summary.as_deref().filter(|value| !value.trim().is_empty())
+                    {
+                        message = message.field("Summary", &truncate_chat_value(summary), false);
+                    }
+                    for (name, value) in conditions.chat_fields() {
+                        message = message.field(name, &truncate_chat_value(&value), false);
+                    }
+                }
+                EventDetails::WeatherHighWind {
+                    is_high_wind,
+                    threshold_meters_per_second,
+                    conditions,
+                } => {
+                    message = message.field(
+                        "State",
+                        if *is_high_wind {
+                            "Above high-wind threshold"
+                        } else {
+                            "Below high-wind threshold"
+                        },
+                        false,
+                    );
+                    for (name, value) in conditions.chat_fields() {
+                        message = message.field(name, &truncate_chat_value(&value), false);
+                    }
+                    if let Some(threshold) = threshold_meters_per_second {
+                        message = message.field(
+                            "Configured threshold",
+                            &format!("{threshold:.1} m/s"),
+                            true,
+                        );
+                    }
                 }
                 EventDetails::RotatorMoved { from, to } => {
                     message = message
@@ -4153,6 +4492,8 @@ fn get_event_color(event: &str) -> u32 {
         | event_types::SWITCH_CONNECTED
         | event_types::DOME_CONNECTED
         | event_types::SAFETY_CONNECTED => colors::GREEN,
+        event_types::WEATHER_CHANGED => colors::CYAN,
+        event_types::WEATHER_HIGH_WIND => colors::ORANGE,
         event_types::DOME_SHUTTER_OPENED
         | event_types::DOME_SHUTTER_CLOSED
         | event_types::DOME_HOMED
@@ -4301,6 +4642,8 @@ fn get_event_title(event: &str) -> String {
         event_types::FLAT_BRIGHTNESS_CHANGED => "💡 Flat-panel brightness changed".to_string(),
         event_types::WEATHER_CONNECTED => "🌦️ Weather station connected".to_string(),
         event_types::WEATHER_DISCONNECTED => "⚠️ Weather station disconnected".to_string(),
+        event_types::WEATHER_CHANGED => "🌦️ Weather changed".to_string(),
+        event_types::WEATHER_HIGH_WIND => "⚠️ High wind reported".to_string(),
         event_types::SWITCH_CONNECTED => "🔌 Switch device connected".to_string(),
         event_types::SWITCH_DISCONNECTED => "⚠️ Switch device disconnected".to_string(),
         event_types::NINA_NOTIFICATION => "🔔 N.I.N.A. notification".to_string(),
@@ -5838,6 +6181,306 @@ mod tests {
         assert!(status.contains("Conditions unsafe"));
         assert!(status.contains("shutter open"));
         assert!(!status.contains("azimuth 40.00°"));
+    }
+
+    #[test]
+    fn weather_change_and_high_wind_state_have_independent_privacy_scopes() {
+        let mut updater = state_test_updater();
+        let unusable = [
+            Event {
+                time: "2026-08-25T23:59:58Z".to_string(),
+                event: event_types::WEATHER_CHANGED.to_string(),
+                chat_enabled: true,
+                details: Some(EventDetails::WeatherChanged {
+                    changed_fields: "temperature".to_string(),
+                    summary: None,
+                    conditions: WeatherConditions::default(),
+                }),
+            },
+            Event {
+                time: "2026-08-25T23:59:59Z".to_string(),
+                event: event_types::WEATHER_HIGH_WIND.to_string(),
+                chat_enabled: true,
+                details: Some(EventDetails::WeatherHighWind {
+                    is_high_wind: true,
+                    threshold_meters_per_second: Some(9.0),
+                    conditions: WeatherConditions::default(),
+                }),
+            },
+        ];
+        updater.process_baseline_events(&unusable);
+        assert_eq!(updater.state.weather_conditions, None);
+        assert_eq!(updater.state.weather_high_wind, None);
+
+        let events = [
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:00:00Z",
+                "Event": "WEATHER-CONNECTED"
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:00:01Z",
+                "Event": "WEATHER-CHANGED",
+                "ChangedFields": "temperature, humidity",
+                "TemperatureCelsius": 9.4,
+                "HumidityPercent": 67.0,
+                "CloudCoverPercent": 22.0
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T00:00:02Z",
+                "Event": "WEATHER-HIGH-WIND",
+                "IsHighWind": true,
+                "WindSpeedMetersPerSecond": 9.5,
+                "WindGustMetersPerSecond": 13.2,
+                "ThresholdMetersPerSecond": 9.0
+            }))
+            .unwrap(),
+        ];
+
+        updater.process_baseline_events(&events);
+        let status = updater.format_startup_status();
+        assert!(status.contains("Weather · connected, HIGH WIND (limit 9.0 m/s)"));
+        assert!(status.contains("wind 9.5 m/s"));
+        assert!(status.contains("gust 13.2 m/s"));
+        assert!(status.contains("9.4 °C"));
+
+        updater.revoke_state_for_disabled_event(event_types::WEATHER_CHANGED);
+        assert_eq!(updater.state.weather_conditions, None);
+        assert_eq!(updater.state.weather_high_wind, Some(true));
+        let high_wind_only = updater.format_startup_status();
+        assert!(high_wind_only.contains("HIGH WIND"));
+        assert!(high_wind_only.contains("wind 9.5 m/s"));
+        assert!(!high_wind_only.contains("9.4 °C"));
+
+        updater.revoke_state_for_disabled_event(event_types::WEATHER_HIGH_WIND);
+        assert_eq!(updater.state.weather_connected, Some(true));
+        assert_eq!(updater.state.weather_high_wind, None);
+        assert_eq!(updater.state.weather_high_wind_conditions, None);
+        assert_eq!(
+            updater.state.weather_high_wind_threshold_meters_per_second,
+            None
+        );
+        assert_eq!(updater.format_startup_status(), "🌦️ Weather · connected");
+    }
+
+    #[tokio::test]
+    async fn weather_notifications_are_compact_and_high_wind_refreshes_are_silent() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let changed: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T00:00:01Z",
+            "Event": "WEATHER-CHANGED",
+            "ChangedFields": "wind, temperature, humidity",
+            "Summary": "Wind increased and humidity fell",
+            "WindSpeedMetersPerSecond": 5.2,
+            "WindGustMetersPerSecond": 7.8,
+            "TemperatureCelsius": 10.4,
+            "HumidityPercent": 62.0,
+            "PressureHectopascals": 1011.8,
+            "CloudCoverPercent": 18.0,
+            "RainRateMillimetersPerHour": 0.0
+        }))
+        .unwrap();
+        let alert: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T00:00:02Z",
+            "Event": "WEATHER-HIGH-WIND",
+            "IsHighWind": true,
+            "WindSpeedMetersPerSecond": 9.5,
+            "WindGustMetersPerSecond": 13.2,
+            "ThresholdMetersPerSecond": 9.0
+        }))
+        .unwrap();
+        let refresh: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T00:00:03Z",
+            "Event": "WEATHER-HIGH-WIND",
+            "IsHighWind": true,
+            "WindSpeedMetersPerSecond": 9.5,
+            "WindGustMetersPerSecond": 13.2,
+            "ThresholdMetersPerSecond": 8.5
+        }))
+        .unwrap();
+        let recovery: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T00:00:04Z",
+            "Event": "WEATHER-HIGH-WIND",
+            "IsHighWind": false,
+            "WindSpeedMetersPerSecond": 4.0,
+            "WindGustMetersPerSecond": 6.1,
+            "ThresholdMetersPerSecond": 8.5
+        }))
+        .unwrap();
+        let malformed: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T00:00:05Z",
+            "Event": "WEATHER-HIGH-WIND",
+            "WindSpeedMetersPerSecond": 30.0
+        }))
+        .unwrap();
+        let connected = Event {
+            time: "2026-08-26T00:00:02.5Z".to_string(),
+            event: event_types::WEATHER_CONNECTED.to_string(),
+            chat_enabled: true,
+            details: None,
+        };
+
+        updater.handle_event(&changed).await;
+        updater.handle_event(&alert).await;
+        updater.apply_event_state(&connected);
+        assert_eq!(updater.state.weather_high_wind, Some(true));
+        updater.handle_event(&refresh).await;
+        assert_eq!(
+            updater.state.weather_high_wind_threshold_meters_per_second,
+            Some(8.5)
+        );
+        updater.handle_event(&recovery).await;
+        updater.process_live_events(vec![malformed]).await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(
+            deliveries.len(),
+            3,
+            "same-state refresh and malformed transitions stay silent"
+        );
+        let changed_message = &deliveries[0].0;
+        assert!(changed_message.title.contains("Weather changed"));
+        assert!(changed_message.fields.iter().any(|field| {
+            field.name == "Changed" && field.value == "wind, temperature, humidity"
+        }));
+        assert!(
+            changed_message
+                .fields
+                .iter()
+                .any(|field| field.name == "Wind" && field.value.contains("5.2 m/s speed"))
+        );
+        assert!(changed_message.fields.iter().any(|field| {
+            field.name == "Atmosphere"
+                && field.value.contains("10.4 °C")
+                && field.value.contains("62% RH")
+                && field.value.contains("1011.8 hPa")
+        }));
+
+        assert!(deliveries[1].0.title.contains("High wind reported"));
+        assert_eq!(deliveries[1].0.color, Some(colors::RED));
+        assert!(deliveries[2].0.title.contains("Wind conditions recovered"));
+        assert_eq!(deliveries[2].0.color, Some(colors::GREEN));
+        assert_eq!(updater.state.weather_high_wind, Some(false));
+        let status = updater.format_startup_status();
+        assert!(!status.contains("HIGH WIND"));
+        assert!(status.contains("wind 4.0 m/s"));
+        assert!(!status.contains("10.4 °C"));
+    }
+
+    #[test]
+    fn weather_reconnect_clears_measurements_but_preserves_latched_alert() {
+        let mut updater = state_test_updater();
+        updater.state.weather_connected = Some(true);
+        updater.state.weather_conditions = Some(WeatherConditions {
+            temperature_celsius: Some(12.0),
+            ..WeatherConditions::default()
+        });
+        updater.state.weather_high_wind = Some(true);
+        updater.state.weather_high_wind_conditions = Some(WeatherConditions {
+            wind_speed_meters_per_second: Some(10.0),
+            ..WeatherConditions::default()
+        });
+        updater.state.weather_high_wind_threshold_meters_per_second = Some(9.0);
+
+        updater.apply_event_state(&Event {
+            time: "2026-08-26T00:01:00Z".to_string(),
+            event: event_types::WEATHER_DISCONNECTED.to_string(),
+            chat_enabled: true,
+            details: None,
+        });
+
+        assert_eq!(updater.state.weather_connected, Some(false));
+        assert_eq!(updater.state.weather_conditions, None);
+        assert_eq!(updater.state.weather_high_wind, Some(true));
+        assert_eq!(
+            updater
+                .state
+                .weather_high_wind_conditions
+                .as_ref()
+                .and_then(|conditions| conditions.wind_speed_meters_per_second),
+            Some(10.0)
+        );
+        assert_eq!(
+            updater.state.weather_high_wind_threshold_meters_per_second,
+            Some(9.0)
+        );
+        let disconnected = updater.format_startup_status();
+        assert!(disconnected.contains("Weather · disconnected, HIGH WIND"));
+
+        updater.apply_event_state(&Event {
+            time: "2026-08-26T00:02:00Z".to_string(),
+            event: event_types::WEATHER_CONNECTED.to_string(),
+            chat_enabled: true,
+            details: None,
+        });
+        assert_eq!(updater.state.weather_connected, Some(true));
+        assert_eq!(updater.state.weather_high_wind, Some(true));
+        assert!(
+            updater
+                .format_startup_status()
+                .contains("Weather · connected, HIGH WIND")
+        );
+
+        updater.state.weather_high_wind = Some(false);
+        updater.state.weather_high_wind_conditions = Some(WeatherConditions {
+            wind_speed_meters_per_second: Some(4.0),
+            ..WeatherConditions::default()
+        });
+        updater.state.weather_high_wind_conditions_at = Some(Utc::now());
+        updater.state.weather_high_wind_threshold_meters_per_second = Some(9.0);
+        updater.apply_event_state(&Event {
+            time: "2026-08-26T00:03:00Z".to_string(),
+            event: event_types::WEATHER_DISCONNECTED.to_string(),
+            chat_enabled: true,
+            details: None,
+        });
+        assert_eq!(updater.state.weather_high_wind, None);
+        assert_eq!(updater.state.weather_high_wind_conditions, None);
+        assert_eq!(
+            updater.state.weather_high_wind_threshold_meters_per_second,
+            None
+        );
+    }
+
+    #[test]
+    fn weather_status_uses_the_newest_permitted_wind_reading() {
+        let mut updater = state_test_updater();
+        let recovery: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T00:00:04Z",
+            "Event": "WEATHER-HIGH-WIND",
+            "IsHighWind": false,
+            "WindSpeedMetersPerSecond": 4.0,
+            "ThresholdMetersPerSecond": 8.5
+        }))
+        .unwrap();
+        updater.apply_event_state(&recovery);
+        assert!(updater.format_startup_status().contains("wind 4.0 m/s"));
+
+        let later_weather: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T00:00:05Z",
+            "Event": "WEATHER-CHANGED",
+            "ChangedFields": "wind speed",
+            "WindSpeedMetersPerSecond": 3.0,
+            "TemperatureCelsius": 10.0
+        }))
+        .unwrap();
+        updater.apply_event_state(&later_weather);
+        let status = updater.format_startup_status();
+        assert!(status.contains("wind 3.0 m/s"));
+        assert!(!status.contains("wind 4.0 m/s"));
+
+        let newest_without_wind: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T00:00:06Z",
+            "Event": "WEATHER-CHANGED",
+            "ChangedFields": "temperature",
+            "TemperatureCelsius": 11.0
+        }))
+        .unwrap();
+        updater.apply_event_state(&newest_without_wind);
+        let status = updater.format_startup_status();
+        assert!(status.contains("wind 4.0 m/s"));
+        assert!(status.contains("11.0 °C"));
     }
 
     #[test]
