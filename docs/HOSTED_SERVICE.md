@@ -24,7 +24,8 @@ while its N.I.N.A. plugin has an authenticated Direct WebSocket connection.
 4. Mint a single-use `cspt_…` pairing token.
 5. In the N.I.N.A. plugin, review **Security and privacy** and **Event delivery**
    before pairing. Most event categories, including images, start enabled;
-   hardware control, observatory location sharing, and log forwarding start off.
+   weather changes, high-wind alerts, hardware control, observatory location
+   sharing, and log forwarding start off.
 6. Choose Hosted Hub, confirm
    `https://hub.chatstronomy.com`, enter the token, and connect.
 7. The plugin stores its pairing token and returned credential in Windows
@@ -50,8 +51,9 @@ only restrict operations already permitted by the N.I.N.A. profile.
 The Hub labels online rigs as locally locked until at least one operation is
 approved. If a caller requests a different operation, the plugin rejects it
 before touching any N.I.N.A. mediator. Asynchronous commands report that they
-were accepted; later failures are posted to the configured chat channels only
-while the profile's **Other N.I.N.A. events** category remains enabled.
+were accepted; if an accepted operation later fails, that terminal failure is
+always posted as part of the command exchange and is not controlled by optional
+event switches.
 
 ## Locally enforced event transmission and privacy
 
@@ -59,7 +61,9 @@ Event switches in the N.I.N.A. plugin are transmission and privacy controls, not
 just notification preferences. Disabled event categories never leave N.I.N.A.
 for the hosted Hub or a local runtime, even when those events were buffered
 before the category was disabled. There is no exception for reconstructing Hub
-state or reporting command failures.
+state. A terminal failure for a locally permitted command that N.I.N.A. already
+accepted remains part of that command exchange and is delivered independently
+of optional event categories.
 
 Turning off image delivery also blocks existing image history and historical
 thumbnail requests. Images captured while delivery is disabled cannot be
@@ -77,7 +81,10 @@ and stable device identifiers are not forwarded by default. The owner can
 explicitly opt in to location sharing in the same N.I.N.A. profile; device
 identifiers remain private. Enabled images, notifications, target names, and
 selected log lines can still reveal identifying information and should be
-reviewed before sharing.
+reviewed before sharing. Enabled sequence sharing can also include user-authored
+annotation and message text. Failure summaries can contain sanitized N.I.N.A.
+operational error text; local path-shaped strings are redacted before
+transmission.
 
 ## Self-hosting
 
@@ -99,8 +106,39 @@ Use HTTPS/WSS at the public edge. Health is exposed at `/healthz`.
 
 The plugin answers independently permitted event, image, sequence, chart,
 equipment, and typed-command queries. Hub updaters reconstruct available target,
-sequence, wait, cooling, guider, mount, and image state from enabled event
-families and permitted status snapshots; disabled events or images can make
-that state incomplete. Only approved notifications are routed to attached
-Discord channels. Disconnects remove the live source; reconnecting with the
-stored credential replaces the stale session for the same rig identity.
+sequence, built-in timed and astronomical waits, supported Sequencer+ waits,
+durable safety and active safety-wait state, camera cooling and warming, guider,
+mount, and image state from enabled event families and permitted status
+snapshots. They also report mount-slew completion, sequence-item and image-save
+failures, explicit sequence outcomes, center and plate-solve results,
+dome/shutter and flat-panel lifecycle, and weather/switch connection state.
+The dedicated **Observatory and flat panel** switch controls dome/shutter
+actions and flat cover, light, and brightness changes; **Equipment connections**
+controls the corresponding connection events and weather/switch connectivity.
+Two independent controls, **Weather changes** and **High-wind alerts**, expose
+structured observing conditions and both start off. Weather-change events carry
+only available, unit-explicit readings: ambient and sky temperature, dew point,
+humidity, pressure, cloud cover, rain rate, wind speed, gust, direction,
+sky brightness, sky quality, and star FWHM. Routine changes require a meaningful
+sensor delta and are limited to one post per five minutes; rain starting bypasses
+that interval. High-wind alerts use the greater available wind speed or gust
+speed, a locally configured threshold, and recovery hysteresis of at least
+1 m/s or 10 percent. Alert and recovery edges are both reported. The payload
+contains only wind speed, gust, threshold, and alert state. An active alert may
+be resent after a reconnect or threshold change so durable Hub status remains
+accurate without producing a duplicate chat alert. Missing sensor values do not
+prove recovery. Neither weather event contains a weather-device identity, raw
+driver object, or observatory location. Weather posts may be delayed, missing,
+or inaccurate and do not replace N.I.N.A.'s safety monitor or physical
+interlocks.
+Switch values and LiveStack data are not captured. Enabled popup notifications
+and opt-in raw N.I.N.A. logs remain unstructured text and may contain
+operational details.
+Autofocus graphs use the report matched to the completed run, and graph delivery
+tolerates bounded transient query failures. Guider
+graph failures remain non-fatal and the image notification is sent without the
+graph.
+Disabled events or images can make state incomplete. Only approved
+notifications are routed to attached Discord channels. Disconnects remove the
+live source; reconnecting with the stored credential replaces the stale session
+for the same rig identity.

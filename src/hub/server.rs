@@ -17,7 +17,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 fn discord_bot_install_permissions() -> poise::serenity_prelude::Permissions {
     use poise::serenity_prelude::Permissions;
@@ -67,6 +67,10 @@ pub struct HubState {
     pub guild_checker: Option<Arc<dyn GuildChecker>>,
     /// Live rig connections from `/v1/direct`.
     pub rig_connections: Arc<super::direct_server::RigConnections>,
+    /// Registered when the central chat service is running. Route and trust
+    /// removals use the weak handle to cancel stale pending deliveries before
+    /// their HTTP mutation returns.
+    updater_manager: Arc<Mutex<Option<Weak<super::updaters::UpdaterManager>>>>,
     /// Per-IP rate limits for abuse-prone endpoints.
     pub limits: Arc<HubLimits>,
 }
@@ -96,8 +100,54 @@ impl HubState {
             oauth,
             guild_checker,
             rig_connections: Arc::new(super::direct_server::RigConnections::default()),
+            updater_manager: Arc::new(Mutex::new(None)),
             limits: Arc::new(HubLimits::default()),
         })
+    }
+
+    pub(crate) async fn refresh_updater(&self, telescope_id: i64) {
+        // Rebuilding an updater loses its in-memory dedup state. Remove the
+        // physical socket first so the N.I.N.A. plugin replays its last Direct
+        // delta instead of advancing past a response consumed by the retiring
+        // task. The logical lifecycle generation deliberately stays intact.
+        if let Some(connection) = self.rig_connections.disconnect_for_replay(telescope_id) {
+            connection.request_close(
+                "Hub delivery configuration changed; reconnecting safely",
+                true,
+            );
+        }
+        let updater = self
+            .updater_manager
+            .lock()
+            .ok()
+            .and_then(|registered| registered.as_ref().and_then(Weak::upgrade));
+        if let Some(updater) = updater {
+            updater.refresh_telescope(telescope_id).await;
+        }
+    }
+
+    pub(crate) async fn adopt_updater_identity(
+        &self,
+        telescope_id: i64,
+        session_id: uuid::Uuid,
+        profile_id: uuid::Uuid,
+        lifecycle_generation: u64,
+    ) {
+        let updater = self
+            .updater_manager
+            .lock()
+            .ok()
+            .and_then(|registered| registered.as_ref().and_then(Weak::upgrade));
+        if let Some(updater) = updater {
+            updater
+                .adopt_connection_identity(
+                    telescope_id,
+                    session_id,
+                    profile_id,
+                    lifecycle_generation,
+                )
+                .await;
+        }
     }
 }
 
@@ -788,6 +838,7 @@ async fn api_update_telescope(
         if let Err(e) = state.db.set_telescope_cooldown(telescope.id, cooldown) {
             return internal_error(e);
         }
+        state.refresh_updater(telescope.id).await;
     }
     match state.db.get_telescope(telescope.id) {
         Ok(Some(updated)) => Json(telescope_json(&updated)).into_response(),
@@ -809,9 +860,10 @@ async fn api_delete_telescope(
         Ok(()) => {
             // Attachments, routes, credentials, and tokens cascade; the
             // live connection and updater need explicit teardown.
-            if let Some(connection) = state.rig_connections.remove(telescope.id) {
+            if let Some(connection) = state.rig_connections.revoke(telescope.id) {
                 connection.request_close("telescope deleted by its owner", false);
             }
+            state.refresh_updater(telescope.id).await;
             state.db.audit(
                 session.discord_user_id,
                 0,
@@ -897,13 +949,14 @@ async fn api_revoke_credentials(
         Ok(revoked) => revoked,
         Err(e) => return internal_error(e),
     };
-    let disconnected = match state.rig_connections.remove(telescope.id) {
+    let disconnected = match state.rig_connections.revoke(telescope.id) {
         Some(connection) => {
             connection.request_close("credentials revoked by the telescope owner", false);
             true
         }
         None => false,
     };
+    state.refresh_updater(telescope.id).await;
     state.db.audit(
         session.discord_user_id,
         0,
@@ -1163,6 +1216,7 @@ async fn api_detach_telescope(
     if let Err(e) = state.db.detach_telescope(attachment.id) {
         return internal_error(e);
     }
+    state.refresh_updater(attachment.telescope_id).await;
     if let Some(session) = session {
         state.db.audit(
             session.discord_user_id,
@@ -1221,6 +1275,7 @@ async fn api_add_channel_route(
         session.discord_user_id,
     ) {
         Ok(route) => {
+            state.refresh_updater(attachment.telescope_id).await;
             state.db.audit(
                 session.discord_user_id,
                 attachment.guild_id,
@@ -1284,6 +1339,7 @@ async fn api_delete_channel_route(
     if let Err(e) = state.db.delete_route(route.id) {
         return internal_error(e);
     }
+    state.refresh_updater(attachment.telescope_id).await;
     if let Some(session) = session {
         state.db.audit(
             session.discord_user_id,
@@ -1382,6 +1438,7 @@ async fn api_subscribe_share(
         session.discord_user_id,
     ) {
         Ok(route) => {
+            state.refresh_updater(telescope.id).await;
             state.db.audit(
                 session.discord_user_id,
                 guild_id,
@@ -1573,6 +1630,9 @@ pub async fn serve(
             state.rig_connections.clone(),
             Arc::new(manager),
         ));
+        if let Ok(mut registered) = state.updater_manager.lock() {
+            *registered = Some(Arc::downgrade(&updaters));
+        }
         tokio::spawn(updaters.run());
         println!("Central Discord bot and chat updater manager started");
     }

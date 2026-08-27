@@ -1,5 +1,8 @@
-use crate::serde_helpers::{de_f64_tolerant, de_i32_tolerant, de_string_tolerant};
-use serde::{Deserialize, Serialize};
+use crate::serde_helpers::{
+    de_f64_tolerant, de_i32_tolerant, de_optional_finite_f64, de_string_tolerant,
+};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde_json::{Map, Value};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -12,7 +15,7 @@ pub struct EventHistoryResponse {
     pub response_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Event {
     pub time: String,
@@ -27,8 +30,166 @@ fn default_true() -> bool {
     true
 }
 
+/// Unit-explicit weather readings copied from N.I.N.A.'s `WeatherDataInfo`.
+/// Every sensor is optional because observing-conditions drivers advertise
+/// different subsets; the plugin omits N.I.N.A.'s `double.NaN` sentinel and
+/// this decoder also accepts older string/array sentinels as unavailable.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct WeatherConditions {
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wind_speed_meters_per_second: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wind_gust_meters_per_second: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wind_direction_degrees: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub temperature_celsius: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dew_point_celsius: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub humidity_percent: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pressure_hectopascals: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cloud_cover_percent: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rain_rate_millimeters_per_hour: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sky_temperature_celsius: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sky_brightness_lux: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sky_quality_magnitudes_per_square_arcsecond: Option<f64>,
+    #[serde(
+        rename = "StarFwhmArcseconds",
+        default,
+        deserialize_with = "de_optional_finite_f64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub star_fwhm_arcseconds: Option<f64>,
+}
+
+impl WeatherConditions {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.wind_speed_meters_per_second.is_none()
+            && self.wind_gust_meters_per_second.is_none()
+            && self.wind_direction_degrees.is_none()
+            && self.temperature_celsius.is_none()
+            && self.dew_point_celsius.is_none()
+            && self.humidity_percent.is_none()
+            && self.pressure_hectopascals.is_none()
+            && self.cloud_cover_percent.is_none()
+            && self.rain_rate_millimeters_per_hour.is_none()
+            && self.sky_temperature_celsius.is_none()
+            && self.sky_brightness_lux.is_none()
+            && self.sky_quality_magnitudes_per_square_arcsecond.is_none()
+            && self.star_fwhm_arcseconds.is_none()
+    }
+
+    pub(crate) fn has_wind_reading(&self) -> bool {
+        self.wind_speed_meters_per_second.is_some() || self.wind_gust_meters_per_second.is_some()
+    }
+
+    /// Drop physically impossible or unbounded values from an untrusted
+    /// remote payload. Bounds are intentionally much wider than terrestrial
+    /// observing conditions, but keep one malformed driver value from
+    /// producing an oversized chat/status payload.
+    pub(crate) fn sanitized(mut self) -> Self {
+        self.wind_speed_meters_per_second = self
+            .wind_speed_meters_per_second
+            .filter(|value| (0.0..=1_000.0).contains(value));
+        self.wind_gust_meters_per_second = self
+            .wind_gust_meters_per_second
+            .filter(|value| (0.0..=1_000.0).contains(value));
+        self.wind_direction_degrees = self
+            .wind_direction_degrees
+            .filter(|value| (0.0..=360.0).contains(value));
+        self.temperature_celsius = self
+            .temperature_celsius
+            .filter(|value| (-273.15..=1_000.0).contains(value));
+        self.dew_point_celsius = self
+            .dew_point_celsius
+            .filter(|value| (-273.15..=1_000.0).contains(value));
+        self.humidity_percent = self
+            .humidity_percent
+            .filter(|value| (0.0..=100.0).contains(value));
+        self.pressure_hectopascals = self
+            .pressure_hectopascals
+            .filter(|value| *value > 0.0 && *value <= 2_000.0);
+        self.cloud_cover_percent = self
+            .cloud_cover_percent
+            .filter(|value| (0.0..=100.0).contains(value));
+        self.rain_rate_millimeters_per_hour = self
+            .rain_rate_millimeters_per_hour
+            .filter(|value| (0.0..=1_000_000.0).contains(value));
+        self.sky_temperature_celsius = self
+            .sky_temperature_celsius
+            .filter(|value| (-273.15..=1_000.0).contains(value));
+        self.sky_brightness_lux = self
+            .sky_brightness_lux
+            .filter(|value| (0.0..=1_000_000_000_000.0).contains(value));
+        self.sky_quality_magnitudes_per_square_arcsecond = self
+            .sky_quality_magnitudes_per_square_arcsecond
+            .filter(|value| (-100.0..=100.0).contains(value));
+        self.star_fwhm_arcseconds = self
+            .star_fwhm_arcseconds
+            .filter(|value| (0.0..=1_000_000.0).contains(value));
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum EventDetails {
     FilterWheelChange {
         #[serde(rename = "New")]
@@ -66,6 +227,47 @@ pub enum EventDetails {
         #[serde(rename = "HFR")]
         hfr: f64,
     },
+    /// A completed autofocus callback. The report timestamp is required to
+    /// keep this untagged arm distinct, while the other fields let newer
+    /// plugins identify the exact report without breaking older runtimes.
+    AutofocusFinished {
+        #[serde(rename = "ReportTimestamp")]
+        report_timestamp: String,
+        #[serde(rename = "Filter", default)]
+        filter: Option<String>,
+        #[serde(rename = "Position", default)]
+        position: Option<f64>,
+        #[serde(rename = "Temperature", default)]
+        temperature: Option<f64>,
+    },
+    /// Authoritative state from N.I.N.A.'s configured safety monitor.
+    SafetyChanged {
+        #[serde(rename = "IsSafe")]
+        is_safe: bool,
+    },
+    /// A rate-limited, opt-in snapshot of current observing conditions.
+    WeatherChanged {
+        #[serde(rename = "ChangedFields")]
+        changed_fields: String,
+        #[serde(rename = "Summary", default)]
+        summary: Option<String>,
+        #[serde(flatten)]
+        conditions: WeatherConditions,
+    },
+    /// High-wind threshold transition. `false` is the recovery edge, allowing
+    /// the Hub to clear durable alert state rather than leaving it latched.
+    WeatherHighWind {
+        #[serde(rename = "IsHighWind")]
+        is_high_wind: bool,
+        #[serde(
+            rename = "ThresholdMetersPerSecond",
+            default,
+            deserialize_with = "de_optional_finite_f64"
+        )]
+        threshold_meters_per_second: Option<f64>,
+        #[serde(flatten)]
+        conditions: WeatherConditions,
+    },
     /// Rotator moved. Emitted for both ROTATOR-MOVED and
     /// ROTATOR-MOVED-MECHANICAL — both share `{From, To}` in degrees.
     RotatorMoved {
@@ -73,6 +275,55 @@ pub enum EventDetails {
         from: f64,
         #[serde(rename = "To")]
         to: f64,
+    },
+    /// A completed telescope slew. Coordinates are deliberately kept in a
+    /// compact wire type instead of serializing N.I.N.A. objects.
+    MountSlewed {
+        #[serde(rename = "From")]
+        from: EventCoordinates,
+        #[serde(rename = "To")]
+        to: EventCoordinates,
+    },
+    /// A completed dome azimuth slew, in degrees.
+    DomeSlewed {
+        #[serde(rename = "From")]
+        from: f64,
+        #[serde(rename = "To")]
+        to: f64,
+    },
+    SequenceEntityFailed {
+        #[serde(rename = "Entity")]
+        entity: String,
+        #[serde(rename = "EntityType")]
+        entity_type: String,
+        #[serde(rename = "Error")]
+        error: String,
+    },
+    SequenceFinished {
+        #[serde(rename = "Outcome")]
+        outcome: String,
+        #[serde(rename = "Status")]
+        status: String,
+        #[serde(rename = "HadFailures")]
+        had_failures: bool,
+    },
+    ImageSaveFailed {
+        #[serde(rename = "Stage")]
+        stage: String,
+        #[serde(rename = "DiskFull")]
+        disk_full: bool,
+        #[serde(rename = "Error")]
+        error: String,
+    },
+    FlatBrightnessChanged {
+        #[serde(rename = "Previous")]
+        previous: i32,
+        #[serde(rename = "New")]
+        new: i32,
+    },
+    FlatLightToggled {
+        #[serde(rename = "On")]
+        on: Option<bool>,
     },
     /// An asynchronously accepted hardware command later failed in N.I.N.A.
     /// Both fields are required so the untagged shape cannot swallow another
@@ -103,6 +354,393 @@ pub enum EventDetails {
         #[serde(rename = "Message")]
         message: String,
     },
+    /// Fields from an event name this version does not understand. Keeping
+    /// them round-trippable makes mixed-version Hub connections tolerant
+    /// without guessing a typed shape from coincidentally matching keys.
+    Unknown(Map<String, Value>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+pub struct EventCoordinates {
+    #[serde(rename = "RA", default)]
+    pub ra: Option<f64>,
+    #[serde(rename = "RADegrees", default)]
+    pub ra_degrees: Option<f64>,
+    #[serde(rename = "RAString", default)]
+    pub ra_string: Option<String>,
+    #[serde(rename = "Dec", default)]
+    pub dec: Option<f64>,
+    #[serde(rename = "DecString", default)]
+    pub dec_string: Option<String>,
+    #[serde(rename = "Epoch", default)]
+    pub epoch: Option<String>,
+    #[serde(rename = "Altitude", default)]
+    pub altitude: Option<f64>,
+    #[serde(rename = "Azimuth", default)]
+    pub azimuth: Option<f64>,
+}
+
+impl EventCoordinates {
+    pub fn display(&self) -> String {
+        if self.altitude.is_some() || self.azimuth.is_some() {
+            return format!(
+                "Alt {} · Az {}",
+                self.altitude
+                    .map(|value| format!("{value:.2}°"))
+                    .unwrap_or_else(|| "--".to_string()),
+                self.azimuth
+                    .map(|value| format!("{value:.2}°"))
+                    .unwrap_or_else(|| "--".to_string())
+            );
+        }
+
+        let ra = self
+            .ra_string
+            .clone()
+            .or_else(|| self.ra.map(|value| format!("{value:.5} h")))
+            .or_else(|| self.ra_degrees.map(|value| format!("{value:.5}°")))
+            .unwrap_or_else(|| "--".to_string());
+        let dec = self
+            .dec_string
+            .clone()
+            .or_else(|| self.dec.map(|value| format!("{value:.5}°")))
+            .unwrap_or_else(|| "--".to_string());
+        match self.epoch.as_deref() {
+            Some(epoch) if !epoch.is_empty() => format!("RA {ra} · Dec {dec} ({epoch})"),
+            _ => format!("RA {ra} · Dec {dec}"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RawEvent {
+    time: String,
+    event: String,
+    #[serde(default = "default_true")]
+    chat_enabled: bool,
+    #[serde(flatten)]
+    fields: Map<String, Value>,
+}
+
+macro_rules! wire_details {
+    ($name:ident { $($field:ident : $ty:ty),+ $(,)? }) => {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct $name { $( $field: $ty ),+ }
+    };
+}
+
+wire_details!(FilterWheelChangeWire {
+    new: FilterInfo,
+    previous: FilterInfo
+});
+wire_details!(TargetStartWire {
+    target_name: String,
+    project_name: Option<String>,
+    rotation: Option<f64>,
+    target_end_time: Option<String>,
+    coordinates: Option<TargetCoordinates>,
+});
+wire_details!(WaitStartWire {
+    wait_end_time: String
+});
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AutofocusPointAddedWire {
+    position: i32,
+    #[serde(rename = "HFR")]
+    hfr: f64,
+}
+wire_details!(AutofocusFinishedWire {
+    report_timestamp: String,
+    filter: Option<String>,
+    position: Option<f64>,
+    temperature: Option<f64>,
+});
+wire_details!(SafetyChangedWire { is_safe: bool });
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WeatherChangedWire {
+    #[serde(deserialize_with = "de_weather_changed_fields")]
+    changed_fields: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(flatten)]
+    conditions: WeatherConditions,
+}
+
+fn de_weather_changed_fields<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::String(value) => Ok(value),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(value) => Ok(value),
+                other => Err(D::Error::custom(format!(
+                    "weather ChangedFields entries must be strings; got {other}"
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| values.join(", ")),
+        other => Err(D::Error::custom(format!(
+            "weather ChangedFields must be a string or string array; got {other}"
+        ))),
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WeatherHighWindWire {
+    is_high_wind: bool,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    threshold_meters_per_second: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    wind_speed_meters_per_second: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    wind_gust_meters_per_second: Option<f64>,
+}
+wire_details!(NumericMoveWire { from: f64, to: f64 });
+wire_details!(MountSlewedWire {
+    from: EventCoordinates,
+    to: EventCoordinates
+});
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DomeSlewedWire {
+    #[serde(alias = "From")]
+    from_azimuth: f64,
+    #[serde(alias = "To")]
+    to_azimuth: f64,
+}
+wire_details!(SequenceEntityFailedWire {
+    entity: String,
+    entity_type: String,
+    error: String
+});
+wire_details!(SequenceFinishedWire {
+    outcome: String,
+    status: String,
+    had_failures: bool
+});
+wire_details!(ImageSaveFailedWire {
+    stage: String,
+    disk_full: bool,
+    error: String
+});
+wire_details!(FlatBrightnessChangedWire {
+    previous: i32,
+    new: i32
+});
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct FlatLightToggledWire {
+    #[serde(default)]
+    on: Option<bool>,
+}
+wire_details!(CommandFailedWire {
+    command: String,
+    error: String
+});
+wire_details!(NinaNotificationWire {
+    level: String,
+    header: String,
+    message: String
+});
+wire_details!(NinaLogWire {
+    level: String,
+    source: String,
+    member: String,
+    line: i32,
+    message: String
+});
+
+fn decode_wire<T: for<'de> Deserialize<'de>>(fields: &Map<String, Value>) -> Option<T> {
+    serde_json::from_value(Value::Object(fields.clone())).ok()
+}
+
+fn unknown_details(fields: Map<String, Value>) -> Option<EventDetails> {
+    (!fields.is_empty()).then_some(EventDetails::Unknown(fields))
+}
+
+fn decode_event_details(event: &str, fields: Map<String, Value>) -> Option<EventDetails> {
+    let details = match event {
+        event_types::FILTERWHEEL_CHANGED => {
+            decode_wire::<FilterWheelChangeWire>(&fields).map(|wire| {
+                EventDetails::FilterWheelChange {
+                    new: wire.new,
+                    previous: wire.previous,
+                }
+            })
+        }
+        event_types::TS_TARGETSTART | event_types::TS_NEWTARGETSTART => {
+            decode_wire::<TargetStartWire>(&fields).map(|wire| EventDetails::TargetStart {
+                target_name: wire.target_name,
+                project_name: wire.project_name,
+                rotation: wire.rotation,
+                target_end_time: wire.target_end_time,
+                coordinates: wire.coordinates,
+            })
+        }
+        event_types::TS_WAITSTART => {
+            decode_wire::<WaitStartWire>(&fields).map(|wire| EventDetails::WaitStart {
+                wait_end_time: wire.wait_end_time,
+            })
+        }
+        event_types::AUTOFOCUS_POINT_ADDED => {
+            decode_wire::<AutofocusPointAddedWire>(&fields).map(|wire| {
+                EventDetails::AutofocusPointAdded {
+                    position: wire.position,
+                    hfr: wire.hfr,
+                }
+            })
+        }
+        event_types::AUTOFOCUS_FINISHED => {
+            decode_wire::<AutofocusFinishedWire>(&fields).map(|wire| {
+                EventDetails::AutofocusFinished {
+                    report_timestamp: wire.report_timestamp,
+                    filter: wire.filter,
+                    position: wire.position,
+                    temperature: wire.temperature,
+                }
+            })
+        }
+        event_types::SAFETY_CHANGED => {
+            decode_wire::<SafetyChangedWire>(&fields).map(|wire| EventDetails::SafetyChanged {
+                is_safe: wire.is_safe,
+            })
+        }
+        event_types::WEATHER_CHANGED => {
+            decode_wire::<WeatherChangedWire>(&fields).and_then(|wire| {
+                let conditions = wire.conditions.sanitized();
+                (!conditions.is_empty()).then_some(EventDetails::WeatherChanged {
+                    changed_fields: wire.changed_fields,
+                    summary: wire.summary,
+                    conditions,
+                })
+            })
+        }
+        event_types::WEATHER_HIGH_WIND => {
+            decode_wire::<WeatherHighWindWire>(&fields).and_then(|wire| {
+                let conditions = WeatherConditions {
+                    wind_speed_meters_per_second: wire.wind_speed_meters_per_second,
+                    wind_gust_meters_per_second: wire.wind_gust_meters_per_second,
+                    ..WeatherConditions::default()
+                }
+                .sanitized();
+                conditions
+                    .has_wind_reading()
+                    .then_some(EventDetails::WeatherHighWind {
+                        is_high_wind: wire.is_high_wind,
+                        threshold_meters_per_second: wire
+                            .threshold_meters_per_second
+                            .filter(|value| (0.0..=1_000.0).contains(value)),
+                        conditions,
+                    })
+            })
+        }
+        event_types::ROTATOR_MOVED | event_types::ROTATOR_MOVED_MECHANICAL => {
+            decode_wire::<NumericMoveWire>(&fields).map(|wire| EventDetails::RotatorMoved {
+                from: wire.from,
+                to: wire.to,
+            })
+        }
+        event_types::MOUNT_SLEWED => {
+            decode_wire::<MountSlewedWire>(&fields).map(|wire| EventDetails::MountSlewed {
+                from: wire.from,
+                to: wire.to,
+            })
+        }
+        event_types::DOME_SLEWED => {
+            decode_wire::<DomeSlewedWire>(&fields).map(|wire| EventDetails::DomeSlewed {
+                from: wire.from_azimuth,
+                to: wire.to_azimuth,
+            })
+        }
+        event_types::SEQUENCE_ENTITY_FAILED => decode_wire::<SequenceEntityFailedWire>(&fields)
+            .map(|wire| EventDetails::SequenceEntityFailed {
+                entity: wire.entity,
+                entity_type: wire.entity_type,
+                error: wire.error,
+            }),
+        event_types::SEQUENCE_FINISHED => {
+            decode_wire::<SequenceFinishedWire>(&fields).map(|wire| {
+                EventDetails::SequenceFinished {
+                    outcome: wire.outcome,
+                    status: wire.status,
+                    had_failures: wire.had_failures,
+                }
+            })
+        }
+        event_types::IMAGE_SAVE_FAILED => {
+            decode_wire::<ImageSaveFailedWire>(&fields).map(|wire| EventDetails::ImageSaveFailed {
+                stage: wire.stage,
+                disk_full: wire.disk_full,
+                error: wire.error,
+            })
+        }
+        event_types::FLAT_BRIGHTNESS_CHANGED => decode_wire::<FlatBrightnessChangedWire>(&fields)
+            .map(|wire| EventDetails::FlatBrightnessChanged {
+                previous: wire.previous,
+                new: wire.new,
+            }),
+        event_types::FLAT_LIGHT_TOGGLED => decode_wire::<FlatLightToggledWire>(&fields)
+            .map(|wire| EventDetails::FlatLightToggled { on: wire.on }),
+        event_types::CHATSTRONOMY_COMMAND_FAILED => {
+            decode_wire::<CommandFailedWire>(&fields).map(|wire| EventDetails::CommandFailed {
+                command: wire.command,
+                error: wire.error,
+            })
+        }
+        event_types::NINA_NOTIFICATION => {
+            decode_wire::<NinaNotificationWire>(&fields).map(|wire| {
+                EventDetails::NinaNotification {
+                    level: wire.level,
+                    header: wire.header,
+                    message: wire.message,
+                }
+            })
+        }
+        event_types::NINA_LOG => {
+            decode_wire::<NinaLogWire>(&fields).map(|wire| EventDetails::NinaLog {
+                level: wire.level,
+                source: wire.source,
+                member: wire.member,
+                line: wire.line,
+                message: wire.message,
+            })
+        }
+        _ => None,
+    };
+
+    if details.is_some()
+        || matches!(
+            event,
+            event_types::WEATHER_CHANGED | event_types::WEATHER_HIGH_WIND
+        )
+    {
+        details
+    } else {
+        unknown_details(fields)
+    }
+}
+
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawEvent::deserialize(deserializer).map_err(D::Error::custom)?;
+        Ok(Self {
+            details: decode_event_details(&raw.event, raw.fields),
+            time: raw.time,
+            event: raw.event,
+            chat_enabled: raw.chat_enabled,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +816,7 @@ pub mod event_types {
     pub const MOUNT_AFTER_FLIP: &str = "MOUNT-AFTER-FLIP";
     pub const MOUNT_HOMED: &str = "MOUNT-HOMED";
     pub const MOUNT_CENTER: &str = "MOUNT-CENTER";
+    pub const MOUNT_SLEWED: &str = "MOUNT-SLEWED";
     pub const FOCUSER_DISCONNECTED: &str = "FOCUSER-DISCONNECTED";
     pub const FOCUSER_CONNECTED: &str = "FOCUSER-CONNECTED";
     pub const FOCUSER_USER_FOCUSED: &str = "FOCUSER-USER-FOCUSED";
@@ -193,15 +832,29 @@ pub mod event_types {
     pub const GUIDER_DITHER: &str = "GUIDER-DITHER";
     pub const FLAT_CONNECTED: &str = "FLAT-CONNECTED";
     pub const FLAT_DISCONNECTED: &str = "FLAT-DISCONNECTED";
+    pub const FLAT_BRIGHTNESS_CHANGED: &str = "FLAT-BRIGHTNESS-CHANGED";
+    pub const FLAT_LIGHT_TOGGLED: &str = "FLAT-LIGHT-TOGGLED";
+    pub const FLAT_COVER_OPENED: &str = "FLAT-COVER-OPENED";
+    pub const FLAT_COVER_CLOSED: &str = "FLAT-COVER-CLOSED";
     pub const WEATHER_CONNECTED: &str = "WEATHER-CONNECTED";
     pub const WEATHER_DISCONNECTED: &str = "WEATHER-DISCONNECTED";
+    pub const WEATHER_CHANGED: &str = "WEATHER-CHANGED";
+    pub const WEATHER_HIGH_WIND: &str = "WEATHER-HIGH-WIND";
     pub const SWITCH_CONNECTED: &str = "SWITCH-CONNECTED";
     pub const SWITCH_DISCONNECTED: &str = "SWITCH-DISCONNECTED";
+    pub const DOME_CONNECTED: &str = "DOME-CONNECTED";
     pub const DOME_DISCONNECTED: &str = "DOME-DISCONNECTED";
+    pub const DOME_SHUTTER_OPENED: &str = "DOME-SHUTTER-OPENED";
+    pub const DOME_SHUTTER_CLOSED: &str = "DOME-SHUTTER-CLOSED";
+    pub const DOME_HOMED: &str = "DOME-HOMED";
+    pub const DOME_PARKED: &str = "DOME-PARKED";
+    pub const DOME_SLEWED: &str = "DOME-SLEWED";
+    pub const DOME_SYNCED: &str = "DOME-SYNCED";
     pub const SAFETY_CONNECTED: &str = "SAFETY-CONNECTED";
     pub const SAFETY_DISCONNECTED: &str = "SAFETY-DISCONNECTED";
     pub const SAFETY_CHANGED: &str = "SAFETY-CHANGED";
     pub const IMAGE_SAVE: &str = "IMAGE-SAVE";
+    pub const IMAGE_SAVE_FAILED: &str = "IMAGE-SAVE-FAILED";
     pub const IMAGE_PREPARED: &str = "IMAGE-PREPARED";
     pub const API_CAPTURE_FINISHED: &str = "API-CAPTURE-FINISHED";
     pub const AUTOFOCUS_STARTING: &str = "AUTOFOCUS-STARTING";
@@ -218,6 +871,85 @@ pub mod event_types {
     pub const NINA_NOTIFICATION: &str = "NINA-NOTIFICATION";
     pub const NINA_LOG: &str = "NINA-LOG";
     pub const CHATSTRONOMY_COMMAND_FAILED: &str = "CHATSTRONOMY-COMMAND-FAILED";
+}
+
+/// The local N.I.N.A. delivery switch that governs an event. Keeping this
+/// classification alongside the wire event names lets legacy payload-v3
+/// consumers treat `ChatEnabled: false` as a category revocation without
+/// inspecting or retaining the disabled event's details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EventDeliveryScope {
+    Images,
+    Autofocus,
+    Guiding,
+    Mount,
+    Sequence,
+    Safety,
+    WeatherChanges,
+    HighWindAlerts,
+    TargetScheduler,
+    FilterFocuserRotator,
+    EquipmentConnections,
+    Observatory,
+    CommandFailures,
+    NinaNotifications,
+    NinaLogs,
+    Other,
+}
+
+pub(crate) fn event_delivery_scope(event: &str) -> EventDeliveryScope {
+    if event == event_types::NINA_NOTIFICATION {
+        return EventDeliveryScope::NinaNotifications;
+    }
+    if event == event_types::NINA_LOG {
+        return EventDeliveryScope::NinaLogs;
+    }
+    if event.starts_with("TS-") {
+        return EventDeliveryScope::TargetScheduler;
+    }
+    if event.starts_with("SEQUENCE-") {
+        return EventDeliveryScope::Sequence;
+    }
+    if event.starts_with("SAFETY-") {
+        return EventDeliveryScope::Safety;
+    }
+    if event == event_types::WEATHER_CHANGED {
+        return EventDeliveryScope::WeatherChanges;
+    }
+    if event == event_types::WEATHER_HIGH_WIND {
+        return EventDeliveryScope::HighWindAlerts;
+    }
+    if event == event_types::CHATSTRONOMY_COMMAND_FAILED {
+        return EventDeliveryScope::CommandFailures;
+    }
+    if event.starts_with("IMAGE-")
+        || event == event_types::API_CAPTURE_FINISHED
+        || event == event_types::CAMERA_DOWNLOAD_TIMEOUT
+    {
+        return EventDeliveryScope::Images;
+    }
+    if event.starts_with("AUTOFOCUS-") || event == event_types::ERROR_AF {
+        return EventDeliveryScope::Autofocus;
+    }
+    if event.ends_with("-CONNECTED") || event.ends_with("-DISCONNECTED") {
+        return EventDeliveryScope::EquipmentConnections;
+    }
+    if event.starts_with("GUIDER-") {
+        return EventDeliveryScope::Guiding;
+    }
+    if event.starts_with("MOUNT-") || event == event_types::ERROR_PLATESOLVE {
+        return EventDeliveryScope::Mount;
+    }
+    if event.starts_with("FILTERWHEEL-")
+        || event.starts_with("ROTATOR-")
+        || event.starts_with("FOCUSER-")
+    {
+        return EventDeliveryScope::FilterFocuserRotator;
+    }
+    if event.starts_with("DOME-") || event.starts_with("FLAT-") {
+        return EventDeliveryScope::Observatory;
+    }
+    EventDeliveryScope::Other
 }
 
 impl EventHistoryResponse {
@@ -303,6 +1035,173 @@ mod tests {
         assert_eq!(event.event, event_types::AUTOFOCUS_FINISHED);
         assert!(event.chat_enabled);
         assert!(event.details.is_none());
+    }
+
+    #[test]
+    fn native_autofocus_completion_details_parse_without_breaking_legacy_events() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-25T04:15:01Z",
+            "Event": "AUTOFOCUS-FINISHED",
+            "ChatEnabled": true,
+            "Filter": "L",
+            "Position": 4068.0,
+            "Temperature": -8.5,
+            "ReportTimestamp": "2026-08-25T04:15:00Z"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event.details,
+            Some(EventDetails::AutofocusFinished {
+                report_timestamp,
+                filter: Some(filter),
+                position: Some(position),
+                temperature: Some(temperature),
+            }) if report_timestamp == "2026-08-25T04:15:00Z"
+                && filter == "L"
+                && position == 4068.0
+                && temperature == -8.5
+        ));
+    }
+
+    #[test]
+    fn native_safety_state_details_parse() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-25T04:20:00Z",
+            "Event": "SAFETY-CHANGED",
+            "ChatEnabled": true,
+            "IsSafe": false
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event.details,
+            Some(EventDetails::SafetyChanged { is_safe: false })
+        ));
+    }
+
+    #[test]
+    fn unit_explicit_weather_change_parses_optional_readings_and_sentinels() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T04:20:00Z",
+            "Event": "WEATHER-CHANGED",
+            "ChatEnabled": true,
+            "ChangedFields": "wind, humidity",
+            "Summary": "Wind increased; humidity fell",
+            "WindSpeedMetersPerSecond": 5.25,
+            "WindGustMetersPerSecond": 8.75,
+            "TemperatureCelsius": 11.2,
+            "HumidityPercent": 61.0,
+            "PressureHectopascals": 1012.4,
+            "CloudCoverPercent": 14.0,
+            "RainRateMillimetersPerHour": 0.0,
+            "DewPointCelsius": "NaN",
+            "SkyTemperatureCelsius": null,
+            "WindDirectionDegrees": 420.0
+        }))
+        .unwrap();
+
+        match event.details {
+            Some(EventDetails::WeatherChanged {
+                changed_fields,
+                summary,
+                conditions,
+            }) => {
+                assert_eq!(changed_fields, "wind, humidity");
+                assert_eq!(summary.as_deref(), Some("Wind increased; humidity fell"));
+                assert_eq!(conditions.wind_speed_meters_per_second, Some(5.25));
+                assert_eq!(conditions.wind_gust_meters_per_second, Some(8.75));
+                assert_eq!(conditions.temperature_celsius, Some(11.2));
+                assert_eq!(conditions.humidity_percent, Some(61.0));
+                assert_eq!(conditions.pressure_hectopascals, Some(1012.4));
+                assert_eq!(conditions.cloud_cover_percent, Some(14.0));
+                assert_eq!(conditions.rain_rate_millimeters_per_hour, Some(0.0));
+                assert_eq!(conditions.dew_point_celsius, None);
+                assert_eq!(conditions.sky_temperature_celsius, None);
+                assert_eq!(conditions.wind_direction_degrees, None);
+            }
+            other => panic!("expected typed weather change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn high_wind_transition_parses_alert_and_recovery() {
+        for (is_high_wind, speed, gust) in [(true, 9.5, 13.2), (false, 4.0, 6.1)] {
+            let event: Event = serde_json::from_value(serde_json::json!({
+                "Time": "2026-08-26T04:21:00Z",
+                "Event": "WEATHER-HIGH-WIND",
+                "IsHighWind": is_high_wind,
+                "WindSpeedMetersPerSecond": speed,
+                "WindGustMetersPerSecond": gust,
+                "ThresholdMetersPerSecond": 9.0,
+                "TemperatureCelsius": { "malformed": true },
+                "HumidityPercent": [99.0],
+                "WindDirectionDegrees": 270.0
+            }))
+            .unwrap();
+
+            let Some(EventDetails::WeatherHighWind {
+                is_high_wind: actual,
+                threshold_meters_per_second: Some(9.0),
+                conditions,
+            }) = event.details
+            else {
+                panic!("expected typed high-wind transition");
+            };
+            assert_eq!(actual, is_high_wind);
+            assert_eq!(conditions.wind_speed_meters_per_second, Some(speed));
+            assert_eq!(conditions.wind_gust_meters_per_second, Some(gust));
+            assert_eq!(conditions.temperature_celsius, None);
+            assert_eq!(conditions.humidity_percent, None);
+            assert_eq!(conditions.wind_direction_degrees, None);
+
+            let serialized = serde_json::to_value(Event {
+                time: "2026-08-26T04:21:00Z".to_string(),
+                event: event_types::WEATHER_HIGH_WIND.to_string(),
+                chat_enabled: true,
+                details: Some(EventDetails::WeatherHighWind {
+                    is_high_wind: actual,
+                    threshold_meters_per_second: Some(9.0),
+                    conditions,
+                }),
+            })
+            .unwrap();
+            assert!(serialized.get("WindSpeedMetersPerSecond").is_some());
+            assert!(serialized.get("WindGustMetersPerSecond").is_some());
+            assert!(serialized.get("TemperatureCelsius").is_none());
+            assert!(serialized.get("HumidityPercent").is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_or_empty_known_weather_details_are_dropped() {
+        for payload in [
+            serde_json::json!({
+                "Time": "2026-08-26T04:21:00Z",
+                "Event": "WEATHER-HIGH-WIND",
+                "TemperatureCelsius": 42.0
+            }),
+            serde_json::json!({
+                "Time": "2026-08-26T04:21:01Z",
+                "Event": "WEATHER-HIGH-WIND",
+                "IsHighWind": true,
+                "WindSpeedMetersPerSecond": -1.0,
+                "HumidityPercent": 99.0
+            }),
+            serde_json::json!({
+                "Time": "2026-08-26T04:21:02Z",
+                "Event": "WEATHER-CHANGED",
+                "ChangedFields": "temperature",
+                "TemperatureCelsius": "NaN"
+            }),
+        ] {
+            let event: Event = serde_json::from_value(payload).unwrap();
+            assert!(event.details.is_none());
+            let serialized = serde_json::to_value(event).unwrap();
+            assert!(serialized.get("TemperatureCelsius").is_none());
+            assert!(serialized.get("HumidityPercent").is_none());
+            assert!(serialized.get("WindSpeedMetersPerSecond").is_none());
+        }
     }
 
     #[test]
@@ -665,6 +1564,198 @@ mod tests {
             }
             other => panic!("expected WaitStart, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_to_payloads_are_typed_by_event_name() {
+        let rotator: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T01:00:00Z",
+            "Event": "ROTATOR-MOVED",
+            "From": 12.0,
+            "To": 15.5
+        }))
+        .unwrap();
+        assert!(matches!(
+            rotator.details,
+            Some(EventDetails::RotatorMoved {
+                from: 12.0,
+                to: 15.5
+            })
+        ));
+
+        let dome: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T01:00:01Z",
+            "Event": "DOME-SLEWED",
+            "FromAzimuth": 180.0,
+            "ToAzimuth": 225.0
+        }))
+        .unwrap();
+        assert!(matches!(
+            dome.details,
+            Some(EventDetails::DomeSlewed {
+                from: 180.0,
+                to: 225.0
+            })
+        ));
+
+        let mount: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T01:00:02Z",
+            "Event": "MOUNT-SLEWED",
+            "From": { "RA": 1.0, "Dec": 2.0, "Epoch": "J2000" },
+            "To": { "RA": 3.0, "Dec": 4.0, "Epoch": "J2000" }
+        }))
+        .unwrap();
+        match mount.details {
+            Some(EventDetails::MountSlewed { from, to }) => {
+                assert_eq!(from.ra, Some(1.0));
+                assert_eq!(to.dec, Some(4.0));
+            }
+            details => panic!("mount slew was not typed correctly: {details:?}"),
+        }
+    }
+
+    #[test]
+    fn dome_slew_accepts_legacy_numeric_field_names() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T01:00:00Z",
+            "Event": "DOME-SLEWED",
+            "From": 10,
+            "To": 20
+        }))
+        .unwrap();
+        assert!(matches!(
+            event.details,
+            Some(EventDetails::DomeSlewed {
+                from: 10.0,
+                to: 20.0
+            })
+        ));
+    }
+
+    #[test]
+    fn new_failure_and_flat_payloads_are_typed() {
+        let sequence: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T01:00:00Z",
+            "Event": "SEQUENCE-ENTITY-FAILED",
+            "Entity": "Wait until safe",
+            "EntityType": "SafetyMonitor",
+            "Error": "Monitor disconnected"
+        }))
+        .unwrap();
+        assert!(matches!(
+            sequence.details,
+            Some(EventDetails::SequenceEntityFailed { ref entity, ref error, .. })
+                if entity == "Wait until safe" && error == "Monitor disconnected"
+        ));
+
+        let image: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T01:00:00Z",
+            "Event": "IMAGE-SAVE-FAILED",
+            "Stage": "Write",
+            "DiskFull": true,
+            "Error": "No space left"
+        }))
+        .unwrap();
+        assert!(matches!(
+            image.details,
+            Some(EventDetails::ImageSaveFailed {
+                disk_full: true,
+                ..
+            })
+        ));
+
+        let flat: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T01:00:00Z",
+            "Event": "FLAT-BRIGHTNESS-CHANGED",
+            "Previous": 20,
+            "New": 40
+        }))
+        .unwrap();
+        assert!(matches!(
+            flat.details,
+            Some(EventDetails::FlatBrightnessChanged {
+                previous: 20,
+                new: 40
+            })
+        ));
+
+        let finished: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-26T01:00:01Z",
+            "Event": "SEQUENCE-FINISHED",
+            "Outcome": "completed_with_failures",
+            "Status": "FINISHED",
+            "HadFailures": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            finished.details,
+            Some(EventDetails::SequenceFinished {
+                ref outcome,
+                had_failures: true,
+                ..
+            }) if outcome == "completed_with_failures"
+        ));
+    }
+
+    #[test]
+    fn flat_light_unknown_state_remains_typed_and_clears_stale_state() {
+        for (payload, expected) in [
+            (serde_json::json!({ "On": true }), Some(true)),
+            (serde_json::json!({ "On": null }), None),
+            (serde_json::json!({}), None),
+        ] {
+            let mut object = payload.as_object().unwrap().clone();
+            object.insert(
+                "Time".to_string(),
+                serde_json::json!("2026-08-26T01:00:00Z"),
+            );
+            object.insert("Event".to_string(), serde_json::json!("FLAT-LIGHT-TOGGLED"));
+            let event: Event = serde_json::from_value(serde_json::Value::Object(object)).unwrap();
+            assert!(matches!(
+                event.details,
+                Some(EventDetails::FlatLightToggled { on }) if on == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn scopes_separate_observatory_connections_and_failures() {
+        assert_eq!(
+            event_delivery_scope(event_types::DOME_SLEWED),
+            EventDeliveryScope::Observatory
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::FLAT_LIGHT_TOGGLED),
+            EventDeliveryScope::Observatory
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::DOME_CONNECTED),
+            EventDeliveryScope::EquipmentConnections
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::CAMERA_DOWNLOAD_TIMEOUT),
+            EventDeliveryScope::Images
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::FOCUSER_USER_FOCUSED),
+            EventDeliveryScope::FilterFocuserRotator
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::CHATSTRONOMY_COMMAND_FAILED),
+            EventDeliveryScope::CommandFailures
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::WEATHER_CHANGED),
+            EventDeliveryScope::WeatherChanges
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::WEATHER_HIGH_WIND),
+            EventDeliveryScope::HighWindAlerts
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::WEATHER_CONNECTED),
+            EventDeliveryScope::EquipmentConnections
+        );
     }
 
     #[test]

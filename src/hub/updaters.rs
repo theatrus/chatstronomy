@@ -2,9 +2,9 @@
 //!
 //! A reconcile loop compares live `/v1/direct` connections against running
 //! `ChatUpdater` tasks: a connected telescope with a routed channel gets an
-//! updater; a disconnected or replaced one has its updater stopped. The
-//! server-issued connection ID distinguishes a reconnect from steady state;
-//! the client session ID deliberately survives reconnects.
+//! updater. That updater follows replacement Direct sockets and survives a
+//! disconnect, retaining delivery/dedup state while its source backs off. A
+//! route or delivery-configuration change still replaces the task.
 
 use super::db::Db;
 use super::direct_server::RigConnections;
@@ -45,7 +45,9 @@ pub struct PresenceEvent {
 }
 
 struct RunningUpdater {
-    connection_id: Uuid,
+    session_id: Uuid,
+    profile_id: Uuid,
+    lifecycle_generation: u64,
     /// The config the updater was built with. A change in the database
     /// (destinations added or removed, cooldown adjusted) restarts the
     /// updater, which otherwise freezes its config at construction.
@@ -59,6 +61,10 @@ pub struct UpdaterManager {
     connections: Arc<RigConnections>,
     chat_manager: Arc<ChatServiceManager>,
     running: Mutex<HashMap<i64, RunningUpdater>>,
+    /// Serialize periodic reconciliation with request-driven invalidation.
+    /// Route/trust mutation handlers wait for this gate, which makes every
+    /// retired updater task a real cancellation barrier before they return.
+    reconcile_gate: tokio::sync::Mutex<()>,
     presence: Mutex<HashMap<i64, Presence>>,
     offline_grace: Duration,
 }
@@ -74,6 +80,7 @@ impl UpdaterManager {
             connections,
             chat_manager,
             running: Mutex::new(HashMap::new()),
+            reconcile_gate: tokio::sync::Mutex::new(()),
             presence: Mutex::new(HashMap::new()),
             offline_grace: PRESENCE_OFFLINE_GRACE,
         }
@@ -204,35 +211,66 @@ impl UpdaterManager {
         channels
     }
 
-    /// One reconcile pass. Returns (started, stopped) counts.
-    pub fn reconcile_once(&self) -> (usize, usize) {
+    /// Reconcile while the caller owns `reconcile_gate`. `force_retire`
+    /// invalidates one telescope even when its persisted configuration still
+    /// compares equal (for example after a credential rotation).
+    async fn reconcile_under_gate(&self, force_retire: Option<i64>) -> (usize, usize) {
         let mut started = 0;
         let mut stopped = 0;
-        let Ok(mut running) = self.running.lock() else {
-            return (0, 0);
-        };
+        let mut retired = Vec::new();
 
-        // Stop updaters whose connection is gone or replaced, or whose
-        // database config no longer matches what they were built with.
-        running.retain(|telescope_id, updater| {
-            let connection_current = self
-                .connections
-                .get(*telescope_id)
-                .is_some_and(|connection| connection.connection_id == updater.connection_id);
-            let config_current = matches!(
-                self.db.get_telescope(*telescope_id),
-                Ok(Some(row)) if row.image_cooldown_seconds == updater.image_cooldown_seconds
-            ) && self.route_channels(*telescope_id) == updater.channels;
-            let keep = connection_current && config_current;
-            if !keep {
-                updater.handle.abort();
-                stopped += 1;
-                println!("Stopped chat updater for telescope {telescope_id}");
+        // A transport-only disconnect or replacement must not destroy updater
+        // state: an event/image can already have been returned by Direct while
+        // its chat post or autofocus graph is still pending. Stop only for a
+        // route/config change or an unexpectedly finished task.
+        {
+            let Ok(mut running) = self.running.lock() else {
+                return (0, 0);
+            };
+            let stale: Vec<i64> = running
+                .iter()
+                .filter_map(|(telescope_id, updater)| {
+                    let config_current = matches!(
+                        self.db.get_telescope(*telescope_id),
+                        Ok(Some(row)) if row.image_cooldown_seconds == updater.image_cooldown_seconds
+                    ) && self.route_channels(*telescope_id) == updater.channels;
+                    let session_current = self
+                        .connections
+                        .get(*telescope_id)
+                        .is_none_or(|connection| {
+                            connection.session_id == updater.session_id
+                                && connection.profile_id == updater.profile_id
+                        });
+                    let lifecycle_current = self.connections.lifecycle_generation(*telescope_id)
+                        == updater.lifecycle_generation;
+                    let keep = force_retire != Some(*telescope_id)
+                        && config_current
+                        && session_current
+                        && lifecycle_current
+                        && !updater.handle.is_finished();
+                    (!keep).then_some(*telescope_id)
+                })
+                .collect();
+            for telescope_id in stale {
+                if let Some(updater) = running.remove(&telescope_id) {
+                    updater.handle.abort();
+                    retired.push((telescope_id, updater.handle));
+                    stopped += 1;
+                }
             }
-            keep
-        });
+        }
+
+        // Do not hold the synchronous map lock while joining. Once this await
+        // completes, no retired task can still post a stale message.
+        for (telescope_id, handle) in retired {
+            let _ = handle.await;
+            println!("Stopped chat updater for telescope {telescope_id}");
+        }
 
         // Start updaters for connected telescopes with a routed channel.
+        let Ok(mut running) = self.running.lock() else {
+            return (started, stopped);
+        };
         for telescope_id in self.connections.connected_telescopes() {
             if running.contains_key(&telescope_id) {
                 continue;
@@ -250,8 +288,10 @@ impl UpdaterManager {
                 continue;
             }
 
-            let connection_id = connection.connection_id;
-            let source = Arc::new(DirectRigSource::new(connection));
+            let source = Arc::new(DirectRigSource::current(
+                self.connections.clone(),
+                connection.clone(),
+            ));
             let target = ChatTarget {
                 discord_webhook_url: None,
                 matrix_room_id: None,
@@ -265,16 +305,20 @@ impl UpdaterManager {
                 self.chat_manager.clone(),
             )
             .with_image_cooldown(telescope.image_cooldown_seconds.max(0) as u64)
-            // Hub updaters restart on every deploy, reconnect, and config
-            // change; presence is announced from connection state instead.
-            .with_lifecycle_announcements(false);
+            // Presence is announced from connection state instead. A shorter
+            // Hub retry window catches a replacement socket promptly without
+            // busy-polling N.I.N.A. while it is genuinely offline.
+            .with_lifecycle_announcements(false)
+            .with_reconnect_backoff(5, 60);
             let handle = tokio::spawn(async move {
                 updater.start_polling(UPDATER_POLL_INTERVAL).await;
             });
             running.insert(
                 telescope_id,
                 RunningUpdater {
-                    connection_id,
+                    session_id: connection.session_id,
+                    profile_id: connection.profile_id,
+                    lifecycle_generation: self.connections.lifecycle_generation(telescope_id),
                     channels,
                     image_cooldown_seconds: telescope.image_cooldown_seconds,
                     handle,
@@ -289,14 +333,61 @@ impl UpdaterManager {
         (started, stopped)
     }
 
+    /// One serialized reconcile pass. Returns (started, stopped) counts.
+    pub async fn reconcile_once(&self) -> (usize, usize) {
+        let _gate = self.reconcile_gate.lock().await;
+        self.reconcile_under_gate(None).await
+    }
+
     pub fn running_count(&self) -> usize {
         self.running.lock().map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// Immediately cancel every pending delivery owned by this telescope's
+    /// current route snapshot, then reconcile against the already-committed
+    /// database state. Privacy-sensitive removals call this before returning
+    /// so a stale channel cannot receive one more event during the periodic
+    /// reconcile interval.
+    pub async fn refresh_telescope(&self, telescope_id: i64) {
+        let _gate = self.reconcile_gate.lock().await;
+        self.reconcile_under_gate(Some(telescope_id)).await;
+    }
+
+    /// Adopt a newly authenticated logical identity immediately. A missing
+    /// predecessor socket is not evidence that its updater has gone away, so
+    /// compare against the running updater rather than only `insert`'s return.
+    pub async fn adopt_connection_identity(
+        &self,
+        telescope_id: i64,
+        session_id: Uuid,
+        profile_id: Uuid,
+        lifecycle_generation: u64,
+    ) {
+        let _gate = self.reconcile_gate.lock().await;
+        let running_identity = self.running.lock().ok().and_then(|running| {
+            running.get(&telescope_id).map(|updater| {
+                (
+                    updater.session_id,
+                    updater.profile_id,
+                    updater.lifecycle_generation,
+                )
+            })
+        });
+        match running_identity {
+            Some(identity) if identity != (session_id, profile_id, lifecycle_generation) => {
+                self.reconcile_under_gate(Some(telescope_id)).await;
+            }
+            None => {
+                self.reconcile_under_gate(None).await;
+            }
+            Some(_) => {}
+        }
     }
 
     /// Reconcile forever, announcing real presence transitions.
     pub async fn run(self: Arc<Self>) {
         loop {
-            self.reconcile_once();
+            self.reconcile_once().await;
             let events = self.presence_events();
             self.announce(events).await;
             tokio::time::sleep(RECONCILE_INTERVAL).await;
@@ -334,35 +425,113 @@ mod tests {
 
     fn connect(connections: &RigConnections, telescope_id: i64) -> Uuid {
         let session = Uuid::new_v4();
-        let (connection, rx) = RigConnection::stub(telescope_id, session);
+        connect_with_session(connections, telescope_id, session);
+        session
+    }
+
+    fn connect_with_session(
+        connections: &RigConnections,
+        telescope_id: i64,
+        session_id: Uuid,
+    ) -> Uuid {
+        connect_with_identity(connections, telescope_id, session_id, Uuid::nil())
+    }
+
+    fn connect_with_identity(
+        connections: &RigConnections,
+        telescope_id: i64,
+        session_id: Uuid,
+        profile_id: Uuid,
+    ) -> Uuid {
+        let connection_id = Uuid::new_v4();
+        let (connection, rx) =
+            RigConnection::stub_with_identity(telescope_id, connection_id, session_id, profile_id);
         std::mem::forget(rx);
         connections.insert(connection);
-        session
+        connection_id
     }
 
     #[tokio::test]
     async fn no_updater_without_channel_routing() {
         let (_db, connections, manager, id) = setup();
         connect(&connections, id);
-        assert_eq!(manager.reconcile_once(), (0, 0));
+        assert_eq!(manager.reconcile_once().await, (0, 0));
         assert_eq!(manager.running_count(), 0);
     }
 
     #[tokio::test]
-    async fn updater_started_and_stopped_with_connection() {
+    async fn updater_survives_a_transport_disconnect() {
         let (db, connections, manager, id) = setup();
         db.add_channel_route(id, 100, 42, "obs", "g", 1).unwrap();
 
         connect(&connections, id);
-        assert_eq!(manager.reconcile_once(), (1, 0));
+        assert_eq!(manager.reconcile_once().await, (1, 0));
         assert_eq!(manager.running_count(), 1);
         // Steady state: nothing changes.
-        assert_eq!(manager.reconcile_once(), (0, 0));
+        assert_eq!(manager.reconcile_once().await, (0, 0));
 
-        // Connection drops.
+        // Connection drops. The updater remains alive with its dedup and
+        // pending-delivery state while the live source waits for a replacement.
         let connection_id = connections.get(id).unwrap().connection_id;
         connections.remove_if_current(id, connection_id);
-        assert_eq!(manager.reconcile_once(), (0, 1));
+        assert_eq!(manager.reconcile_once().await, (0, 0));
+        assert_eq!(manager.running_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_revocation_stops_updater_even_if_identity_is_reused() {
+        let (db, connections, manager, id) = setup();
+        db.add_channel_route(id, 100, 42, "obs", "g", 1).unwrap();
+        let session_id = connect(&connections, id);
+        assert_eq!(manager.reconcile_once().await, (1, 0));
+
+        connections.revoke(id);
+        assert_eq!(manager.reconcile_once().await, (0, 1));
+        assert_eq!(manager.running_count(), 0);
+
+        connect_with_session(&connections, id, session_id);
+        assert_eq!(manager.reconcile_once().await, (1, 0));
+        assert_eq!(manager.running_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_removal_refresh_is_an_updater_cancellation_barrier() {
+        let (db, connections, manager, id) = setup();
+        let route = db.add_channel_route(id, 100, 42, "obs", "g", 1).unwrap();
+        connect(&connections, id);
+        assert_eq!(manager.reconcile_once().await, (1, 0));
+
+        db.delete_route(route.id).unwrap();
+        manager.refresh_telescope(id).await;
+        assert_eq!(manager.running_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn periodic_reconcile_winning_the_race_is_still_awaited_by_refresh() {
+        let (db, connections, manager, id) = setup();
+        let route = db.add_channel_route(id, 100, 42, "obs", "g", 1).unwrap();
+        connect(&connections, id);
+        let manager = Arc::new(manager);
+        assert_eq!(manager.reconcile_once().await, (1, 0));
+
+        // Queue the periodic pass first. Tokio's mutex is FIFO, so it observes
+        // the committed removal and owns retirement before the request-driven
+        // refresh gets the gate. The refresh must wait behind that join rather
+        // than return merely because the map entry is already gone.
+        let held = manager.reconcile_gate.lock().await;
+        db.delete_route(route.id).unwrap();
+        let periodic_manager = manager.clone();
+        let periodic = tokio::spawn(async move { periodic_manager.reconcile_once().await });
+        tokio::task::yield_now().await;
+        let refresh_manager = manager.clone();
+        let refresh = tokio::spawn(async move { refresh_manager.refresh_telescope(id).await });
+        tokio::task::yield_now().await;
+        assert!(!periodic.is_finished());
+        assert!(!refresh.is_finished());
+
+        drop(held);
+        assert_eq!(periodic.await.unwrap(), (0, 1));
+        refresh.await.unwrap();
         assert_eq!(manager.running_count(), 0);
     }
 
@@ -371,19 +540,19 @@ mod tests {
         let (db, connections, manager, id) = setup();
         let first = db.add_channel_route(id, 100, 42, "obs", "g", 1).unwrap();
         connect(&connections, id);
-        assert_eq!(manager.reconcile_once(), (1, 0));
+        assert_eq!(manager.reconcile_once().await, (1, 0));
 
         // Adding a second destination restarts the updater with both.
         let second = db.add_channel_route(id, 100, 43, "alerts", "g", 1).unwrap();
-        assert_eq!(manager.reconcile_once(), (1, 1));
+        assert_eq!(manager.reconcile_once().await, (1, 1));
 
         // Removing one destination restarts again.
         db.delete_route(second.id).unwrap();
-        assert_eq!(manager.reconcile_once(), (1, 1));
+        assert_eq!(manager.reconcile_once().await, (1, 1));
 
         // Removing the last destination stops it without a replacement.
         db.delete_route(first.id).unwrap();
-        assert_eq!(manager.reconcile_once(), (0, 1));
+        assert_eq!(manager.reconcile_once().await, (0, 1));
         assert_eq!(manager.running_count(), 0);
     }
 
@@ -458,16 +627,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_replaces_updater() {
+    async fn reconnect_keeps_updater_and_pending_delivery_state() {
+        let (db, connections, manager, id) = setup();
+        db.add_channel_route(id, 100, 42, "obs", "g", 1).unwrap();
+
+        let session_id = connect(&connections, id);
+        assert_eq!(manager.reconcile_once().await, (1, 0));
+
+        // A new WebSocket generation takes the slot (rig reconnected).
+        connect_with_session(&connections, id, session_id);
+        assert_eq!(manager.reconcile_once().await, (0, 0));
+        assert_eq!(manager.running_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn new_plugin_session_replaces_updater_state() {
         let (db, connections, manager, id) = setup();
         db.add_channel_route(id, 100, 42, "obs", "g", 1).unwrap();
 
         connect(&connections, id);
-        assert_eq!(manager.reconcile_once(), (1, 0));
+        assert_eq!(manager.reconcile_once().await, (1, 0));
 
-        // A new WebSocket generation takes the slot (rig reconnected).
+        // A genuine plugin/profile lifecycle gets a new client session and
+        // must not inherit targets, dedup keys, or pending chart delivery.
         connect(&connections, id);
-        assert_eq!(manager.reconcile_once(), (1, 1));
+        assert_eq!(manager.reconcile_once().await, (1, 1));
+        assert_eq!(manager.running_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn different_profile_replaces_updater_even_with_same_session_value() {
+        let (db, connections, manager, id) = setup();
+        db.add_channel_route(id, 100, 42, "obs", "g", 1).unwrap();
+        let session_id = Uuid::new_v4();
+        connect_with_identity(&connections, id, session_id, Uuid::new_v4());
+        assert_eq!(manager.reconcile_once().await, (1, 0));
+
+        connect_with_identity(&connections, id, session_id, Uuid::new_v4());
+        assert_eq!(manager.reconcile_once().await, (1, 1));
         assert_eq!(manager.running_count(), 1);
     }
 }

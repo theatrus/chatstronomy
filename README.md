@@ -29,13 +29,47 @@ installation, open **Options → Plugins → Chatstronomy**, and choose Hosted H
 a local delivery method. Before pairing or starting a local runtime, review the
 profile's **Security and privacy** and **Event delivery** selections.
 
-The plugin captures native equipment, image, autofocus, guider, sequence,
-cooling, wait, slew, center, and Target Scheduler state. Per-profile event
-controls are a hard transmission and privacy boundary: disabled event families
-never reach the hosted Hub or local runtime, including previously buffered
-events. There is no exception for state reconstruction or command-failure
-reporting. Disabling image delivery also blocks existing image history and
-thumbnails; images captured while sharing is off cannot be retrieved later.
+The plugin captures native equipment, image, autofocus, guider, durable
+safety-monitor, sequence, cooling and warming, wait, slew, center, plate-solve,
+and Target Scheduler state. It reports image-save and sequence-item failures,
+and distinguishes clean, failed, stopped, cancelled, and otherwise ended
+sequence outcomes instead of assuming every finish event means success.
+Autofocus graph input comes from the report matching the completed run.
+Supported built-in waits include time, altitude, Moon-altitude, Sun-altitude,
+horizon, and safety waits; supported long-running Sequencer+ waits include
+condition and manual waits. Private condition expressions and pause reasons
+remain inside N.I.N.A.
+
+Dome/shutter actions and flat-panel cover, light, and brightness changes use a
+dedicated local **Observatory and flat panel** event switch. Connect/disconnect
+state for dome, flat-panel, weather, and switch devices uses **Equipment
+connections**. Structured observing conditions use two independent controls,
+**Weather changes** and **High-wind alerts**, and both start off. Weather-change
+posts contain only available, unit-labelled readings such as temperature, dew
+point, humidity, pressure, cloud cover, rain rate, wind, sky conditions, and
+seeing. They are limited to meaningful changes and at most one routine post per
+five minutes; rain starting is delivered immediately. High-wind alerts compare
+the greater available wind speed or gust with the locally configured
+threshold and send both alert and recovered transitions with hysteresis.
+High-wind records contain only wind speed, gust, threshold, and alert state;
+an active alert can be resent after reconnecting or changing the threshold to
+synchronize status without another chat alert. Missing readings do not clear an
+active alert. These events contain no weather-device identity or observatory
+location. Weather chat is informational and may be delayed, missing, or
+inaccurate; it does not replace N.I.N.A.'s safety monitor or hardware
+interlocks. Switch
+values and LiveStack data are not captured. Enabled popup notifications and
+opt-in raw N.I.N.A. logs remain unstructured text and may contain operational
+details.
+
+Per-profile event controls are a hard transmission and privacy boundary:
+disabled event families never reach the hosted Hub or local runtime, including
+previously buffered events. There is no exception for state reconstruction.
+Once N.I.N.A. accepts a locally permitted command, however, its terminal
+failure is always delivered as part of that command exchange and is not hidden
+by optional event switches. Disabling image delivery also
+blocks existing image history and thumbnails; images captured while sharing is
+off cannot be retrieved later.
 Equipment and status snapshots remain available, but disabled events can leave
 historical or intermediate state incomplete. Most event families, including
 images and N.I.N.A. popup notifications, start enabled. Raw N.I.N.A. log levels
@@ -49,8 +83,8 @@ local master switch and separately approve each individual operation; sequence
 validation bypass requires an additional explicit permission. Discord server
 permissions can narrow that access but can never enable an operation that the
 N.I.N.A. profile has not approved. Asynchronous operations are reported as
-accepted, not completed; later hardware failures reach chat only when their
-**Other N.I.N.A. events** category remains enabled.
+accepted, not completed; if an accepted operation later fails, that terminal
+failure is always returned to chat as part of the command exchange.
 In local Discord-bot mode, only managers of the invoking Discord server can
 request approved operations unless an explicit user allowlist is configured;
 requests must come from the telescope's configured channel, and direct messages
@@ -61,7 +95,10 @@ sky coordinates, or stable equipment identifiers by default. An owner can
 explicitly opt in to sharing the observatory location for that N.I.N.A. profile;
 equipment identifiers remain private. Enabled images, notifications, target
 names, or log lines can still contain identifying details; review those choices
-before sharing. Review the hosted service's
+before sharing. Enabled sequence sharing can also include user-authored
+annotation and message text. Failure summaries can contain sanitized N.I.N.A.
+operational error text; local path-shaped strings are redacted before
+transmission. Review the hosted service's
 [privacy statement](https://chatstronomy.com/hub-privacy.html) and
 [terms of service](https://chatstronomy.com/hub-terms.html) before pairing.
 

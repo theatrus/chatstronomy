@@ -554,13 +554,14 @@ async fn status(
             ),
             false,
         );
-        let operations = crate::sequence::extract_sequence_operations(&seq)
-            .into_iter()
-            .filter(SequenceOperation::is_active)
-            .collect::<Vec<_>>();
+        let operations = active_chat_operations(&seq);
         if !operations.is_empty() {
             let camera = if operations.iter().any(|operation| {
-                matches!(operation.kind, SequenceOperationKind::CameraCooling { .. })
+                matches!(
+                    operation.kind,
+                    SequenceOperationKind::CameraCooling { .. }
+                        | SequenceOperationKind::CameraWarming { .. }
+                )
             }) {
                 client
                     .get_camera_info()
@@ -618,14 +619,14 @@ async fn sequence(
     let flip = crate::sequence::extract_meridian_flip_time(&seq)
         .map(crate::sequence::meridian_flip_time_formatted_with_clock)
         .unwrap_or_else(|| "(n/a)".to_string());
-    let operations = crate::sequence::extract_sequence_operations(&seq)
-        .into_iter()
-        .filter(SequenceOperation::is_active)
-        .collect::<Vec<_>>();
-    let camera = if operations
-        .iter()
-        .any(|operation| matches!(operation.kind, SequenceOperationKind::CameraCooling { .. }))
-    {
+    let operations = active_chat_operations(&seq);
+    let camera = if operations.iter().any(|operation| {
+        matches!(
+            operation.kind,
+            SequenceOperationKind::CameraCooling { .. }
+                | SequenceOperationKind::CameraWarming { .. }
+        )
+    }) {
         client
             .get_camera_info()
             .await
@@ -654,6 +655,13 @@ async fn sequence(
     }
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
+}
+
+fn active_chat_operations(sequence: &crate::sequence::SequenceResponse) -> Vec<SequenceOperation> {
+    crate::sequence::extract_sequence_operations(sequence)
+        .into_iter()
+        .filter(|operation| operation.chat_enabled && operation.is_active())
+        .collect()
 }
 
 fn sequence_operation_summary(
@@ -685,6 +693,17 @@ fn sequence_operation_summary(
                     },
                 )
         }
+        SequenceOperationKind::CameraWarming { minimum_duration } => {
+            let minimum = minimum_duration
+                .map(|duration| format!(", minimum {}", short_duration(duration)))
+                .unwrap_or_default();
+            camera
+                .filter(|camera| camera.temperature.is_finite())
+                .map_or_else(
+                    || format!("🌡️ Camera warming{minimum}"),
+                    |camera| format!("🌡️ Camera warming at {:.1} °C{minimum}", camera.temperature),
+                )
+        }
         SequenceOperationKind::TimeWait {
             target_time,
             configured_duration,
@@ -705,6 +724,60 @@ fn sequence_operation_summary(
                 "⏳ Timed wait".to_string()
             }
         }
+        SequenceOperationKind::AstronomicalWait {
+            target_altitude_degrees,
+            current_altitude_degrees,
+            comparator,
+            expected_time,
+        } => {
+            let current = current_altitude_degrees.map(|value| format!("current {value:.2}°"));
+            let target = target_altitude_degrees.map(|value| {
+                format!(
+                    "target {}{value:.2}°",
+                    comparator
+                        .as_deref()
+                        .map(|comparison| format!("{comparison} "))
+                        .unwrap_or_default()
+                )
+            });
+            let expected = expected_time
+                .as_deref()
+                .map(|value| format!("expected {value}"));
+            let details = [current, target, expected]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if details.is_empty() {
+                format!("🌌 {}", operation.name)
+            } else {
+                format!("🌌 {} ({details})", operation.name)
+            }
+        }
+        SequenceOperationKind::SafetyWait {
+            is_safe,
+            wait_interval,
+        } => {
+            let state = match is_safe {
+                Some(true) => "safe; resolving",
+                Some(false) => "unsafe",
+                None => "monitor disconnected",
+            };
+            let interval = wait_interval
+                .map(|duration| format!("; checking every {}", short_duration(duration)))
+                .unwrap_or_default();
+            format!("🛡️ Waiting for safe conditions ({state}{interval})")
+        }
+        SequenceOperationKind::ConditionWait { wait_interval } => wait_interval.map_or_else(
+            || "⏳ Waiting for a sequence condition".to_string(),
+            |duration| {
+                format!(
+                    "⏳ Waiting for a sequence condition (checking every {})",
+                    short_duration(duration)
+                )
+            },
+        ),
+        SequenceOperationKind::ManualWait => "⏸️ Waiting for manual sequence resume".to_string(),
         SequenceOperationKind::MountSlew { coordinates, .. } => coordinates.as_ref().map_or_else(
             || "🔭 Mount slew in progress".to_string(),
             |coordinates| format!("🔭 Slewing to {}", coordinates.display()),
@@ -734,6 +807,31 @@ fn sequence_operation_summary(
                 .unwrap_or_default();
             format!("🎯 Centering{target}{rotation}{solve}")
         }
+        SequenceOperationKind::PlateSolve {
+            coordinates,
+            rotation,
+            output,
+        } => {
+            let target = coordinates
+                .as_ref()
+                .map(|coordinates| format!(" near {}", coordinates.display()))
+                .unwrap_or_default();
+            let rotation = rotation
+                .map(|rotation| format!(" at {rotation:.1}°"))
+                .unwrap_or_default();
+            let result = output
+                .as_ref()
+                .and_then(|output| output.success)
+                .map(|success| {
+                    if success {
+                        "; result succeeded"
+                    } else {
+                        "; result failed"
+                    }
+                })
+                .unwrap_or_default();
+            format!("🔎 Plate solving{target}{rotation}{result}")
+        }
     }
 }
 
@@ -750,6 +848,275 @@ fn short_duration(duration: chrono::Duration) -> String {
     }
 }
 
+/// Events the local N.I.N.A. profile permitted for chat delivery. Keeping this
+/// filter shared prevents read-only slash commands from exposing details sent
+/// by an older payload-v3 peer with `ChatEnabled: false`.
+fn chat_enabled_events(
+    history: &crate::events::EventHistoryResponse,
+) -> std::vec::IntoIter<&crate::events::Event> {
+    let mut visible = Vec::new();
+    for event in &history.response {
+        let scope = crate::events::event_delivery_scope(&event.event);
+        if event.chat_enabled {
+            visible.push(event);
+        } else {
+            // A disabled payload-v3 record is a category tombstone. Remove
+            // older values in the same local privacy scope so commands cannot
+            // walk backwards to data shared before that switch was disabled.
+            visible
+                .retain(|candidate| crate::events::event_delivery_scope(&candidate.event) != scope);
+        }
+    }
+    visible.into_iter()
+}
+
+type TargetEventProjection = (
+    String,
+    Option<crate::events::TargetCoordinates>,
+    Option<String>,
+    Option<f64>,
+);
+
+fn latest_target_event(
+    history: &crate::events::EventHistoryResponse,
+    history_allowed: bool,
+) -> Option<TargetEventProjection> {
+    if !history_allowed {
+        return None;
+    }
+    chat_enabled_events(history).rev().find_map(|event| {
+        if !matches!(
+            event.event.as_str(),
+            crate::events::event_types::TS_TARGETSTART
+                | crate::events::event_types::TS_NEWTARGETSTART
+        ) {
+            return None;
+        }
+        if let Some(crate::events::EventDetails::TargetStart {
+            target_name,
+            coordinates,
+            project_name,
+            rotation,
+            ..
+        }) = &event.details
+            && target_name != "Sequential Instruction Set"
+        {
+            Some((
+                target_name.clone(),
+                coordinates.clone(),
+                project_name.clone(),
+                *rotation,
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
+mod sequence_operation_summary_tests {
+    use super::*;
+
+    fn operation(kind: SequenceOperationKind) -> SequenceOperation {
+        SequenceOperation {
+            key: "0/1".to_string(),
+            name: "Sequencer+ wait".to_string(),
+            status: "RUNNING".to_string(),
+            chat_enabled: true,
+            kind,
+        }
+    }
+
+    #[test]
+    fn sequencer_plus_wait_summaries_are_useful_without_condition_details() {
+        let condition = sequence_operation_summary(
+            &operation(SequenceOperationKind::ConditionWait {
+                wait_interval: Some(chrono::Duration::seconds(13)),
+            }),
+            None,
+        );
+        let manual =
+            sequence_operation_summary(&operation(SequenceOperationKind::ManualWait), None);
+
+        assert_eq!(
+            condition,
+            "⏳ Waiting for a sequence condition (checking every 13s)"
+        );
+        assert_eq!(manual, "⏸️ Waiting for manual sequence resume");
+    }
+
+    #[test]
+    fn astronomical_wait_and_plate_solve_have_slash_command_summaries() {
+        let astronomical = sequence_operation_summary(
+            &operation(SequenceOperationKind::AstronomicalWait {
+                target_altitude_degrees: Some(-12.0),
+                current_altitude_degrees: Some(-8.5),
+                comparator: Some("LESS_THAN_OR_EQUAL".to_string()),
+                expected_time: Some("2026-08-26T21:30:00-07:00".to_string()),
+            }),
+            None,
+        );
+        assert!(astronomical.contains("current -8.50°"));
+        assert!(astronomical.contains("target LESS_THAN_OR_EQUAL -12.00°"));
+
+        let solve = sequence_operation_summary(
+            &operation(SequenceOperationKind::PlateSolve {
+                coordinates: None,
+                rotation: Some(31.5),
+                output: Some(Box::new(crate::sequence::PlateSolveOutput {
+                    solve_time: Some("2026-08-26T21:30:00-07:00".to_string()),
+                    success: Some(true),
+                    coordinates: None,
+                    position_angle: Some(31.5),
+                    pixel_scale: None,
+                    radius_degrees: None,
+                    separation_arcseconds: None,
+                    ra_error: None,
+                    dec_error: None,
+                    ra_pixel_error: None,
+                    dec_pixel_error: None,
+                    flipped: None,
+                    thumbnail: None,
+                    thumbnail_media_type: None,
+                })),
+            }),
+            None,
+        );
+        assert_eq!(solve, "🔎 Plate solving at 31.5°; result succeeded");
+    }
+
+    #[test]
+    fn disabled_operations_are_absent_from_discord_status_and_sequence_views() {
+        let sequence: crate::sequence::SequenceResponse =
+            serde_json::from_value(serde_json::json!({
+                "Response": [{
+                    "Name": "Waits",
+                    "Status": "RUNNING",
+                    "Items": [{
+                        "Name": "Private safety wait",
+                        "Status": "RUNNING",
+                        "OperationKind": "safety_wait",
+                        "IsSafe": false,
+                        "WaitInterval": "00:00:05",
+                        "ChatEnabled": false
+                    }, {
+                        "Name": "Visible condition wait",
+                        "Status": "RUNNING",
+                        "OperationKind": "condition_wait",
+                        "WaitInterval": "00:00:13",
+                        "ChatEnabled": true
+                    }]
+                }],
+                "Error": "",
+                "StatusCode": 200,
+                "Success": true,
+                "Type": "API"
+            }))
+            .unwrap();
+
+        let operations = active_chat_operations(&sequence);
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(
+            operations[0].kind,
+            SequenceOperationKind::ConditionWait { .. }
+        ));
+    }
+
+    #[test]
+    fn disabled_events_revoke_older_values_before_recent_limits_and_target_lookup() {
+        let history: crate::events::EventHistoryResponse =
+            serde_json::from_value(serde_json::json!({
+                "Response": [{
+                    "Time": "2026-08-26T06:00:00Z",
+                    "Event": "TS-TARGETSTART",
+                    "ChatEnabled": true,
+                    "TargetName": "Visible target"
+                }, {
+                    "Time": "2026-08-26T06:00:01Z",
+                    "Event": "TS-TARGETSTART",
+                    "ChatEnabled": false,
+                    "TargetName": "Private target"
+                }],
+                "Error": "",
+                "StatusCode": 200,
+                "Success": true,
+                "Type": "API"
+            }))
+            .unwrap();
+
+        let recent: Vec<_> = chat_enabled_events(&history).rev().take(1).collect();
+        assert!(recent.is_empty());
+    }
+
+    #[test]
+    fn disabled_sequence_target_blocks_older_target_event_fallback() {
+        let sequence: crate::sequence::SequenceResponse =
+            serde_json::from_value(serde_json::json!({
+                "Response": [{
+                    "Name": "_Container",
+                    "Status": "SUPPRESSED",
+                    "IsTargetContainer": true,
+                    "ChatEnabled": false,
+                    "Items": []
+                }],
+                "Error": "",
+                "StatusCode": 200,
+                "Success": true,
+                "Type": "API"
+            }))
+            .unwrap();
+        let history: crate::events::EventHistoryResponse =
+            serde_json::from_value(serde_json::json!({
+                "Response": [{
+                    "Time": "2026-08-26T06:00:00Z",
+                    "Event": "TS-TARGETSTART",
+                    "ChatEnabled": true,
+                    "TargetName": "Previously shared target"
+                }],
+                "Error": "",
+                "StatusCode": 200,
+                "Success": true,
+                "Type": "API"
+            }))
+            .unwrap();
+
+        let sequence_target = crate::sequence::extract_current_target_with_delivery(&sequence);
+        let history_allowed = !matches!(sequence_target, Some((_, false)));
+        assert!(latest_target_event(&history, history_allowed).is_none());
+    }
+
+    #[test]
+    fn target_history_ignores_wrapper_and_accepts_new_target_events() {
+        let history: crate::events::EventHistoryResponse =
+            serde_json::from_value(serde_json::json!({
+                "Response": [
+                    {
+                        "Time": "2026-08-26T06:00:00Z",
+                        "Event": "TS-NEWTARGETSTART",
+                        "ChatEnabled": true,
+                        "TargetName": "M31"
+                    },
+                    {
+                        "Time": "2026-08-26T06:00:01Z",
+                        "Event": "TS-TARGETSTART",
+                        "ChatEnabled": true,
+                        "TargetName": "Sequential Instruction Set"
+                    }
+                ],
+                "Error": "",
+                "StatusCode": 200,
+                "Success": true,
+                "Type": "API"
+            }))
+            .unwrap();
+
+        assert_eq!(
+            latest_target_event(&history, true).map(|target| target.0),
+            Some("M31".to_string())
+        );
+    }
+}
+
 /// Display target coordinates and sequence details for the active target.
 #[poise::command(slash_command)]
 async fn target(
@@ -762,32 +1129,18 @@ async fn target(
     };
     ctx.defer().await?;
     let seq = client.get_sequence().await?;
-    let active_target =
-        crate::sequence::extract_current_target(&seq).unwrap_or_else(|| "(none)".to_string());
+    let sequence_target = crate::sequence::extract_current_target_with_delivery(&seq);
+    let history_allowed = !matches!(sequence_target, Some((_, false)));
+    let active_target = sequence_target
+        .filter(|(_, chat_enabled)| *chat_enabled)
+        .map(|(name, _)| name)
+        .unwrap_or_else(|| "(none)".to_string());
 
     // Look for the latest TS-TARGETSTART event for richer coords.
     let events = client.get_event_history().await.ok();
-    let ts_target = events.as_ref().and_then(|e| {
-        e.response.iter().rev().find_map(|ev| {
-            if let Some(crate::events::EventDetails::TargetStart {
-                target_name,
-                coordinates,
-                project_name,
-                rotation,
-                ..
-            }) = &ev.details
-            {
-                Some((
-                    target_name.clone(),
-                    coordinates.clone(),
-                    project_name.clone(),
-                    *rotation,
-                ))
-            } else {
-                None
-            }
-        })
-    });
+    let ts_target = events
+        .as_ref()
+        .and_then(|events| latest_target_event(events, history_allowed));
 
     let mut embed = serenity::CreateEmbed::new().title(format!("[{name}] Target"));
     if let Some((tname, coords, project, rot)) = ts_target {
@@ -993,7 +1346,8 @@ async fn events(
     ctx.defer().await?;
     let history = client.get_event_history().await?;
     let count = count.unwrap_or(10).min(25) as usize;
-    let events: Vec<&crate::events::Event> = history.response.iter().rev().take(count).collect();
+    let events: Vec<&crate::events::Event> =
+        chat_enabled_events(&history).rev().take(count).collect();
     let lines: Vec<String> = events
         .iter()
         .rev()
@@ -1022,7 +1376,16 @@ async fn last_image(
     };
     ctx.defer().await?;
     let images = client.get_all_image_history().await?;
-    let Some((idx, img)) = images.response.iter().enumerate().next_back() else {
+    // Image delivery is one local privacy category. A trailing disabled
+    // compatibility record revokes the older history rather than allowing
+    // `/last-image` to walk backwards across that boundary.
+    let Some((idx, img)) = images
+        .response
+        .iter()
+        .enumerate()
+        .next_back()
+        .filter(|(_, image)| image.chat_enabled)
+    else {
         ctx.send(
             poise::CreateReply::default()
                 .content("No images in history.")
