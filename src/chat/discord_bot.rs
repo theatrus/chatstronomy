@@ -21,7 +21,11 @@ use async_trait::async_trait;
 use poise::serenity_prelude::{self as serenity, CreateAttachment, CreateMessage};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+const FOCUS_REPORT_READY_MAX_ATTEMPTS: usize = 4;
+const FOCUS_REPORT_READY_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Per-bot state carried by the Poise framework. Each slash command has
 /// `ctx.data()` access to this. Telescope lookup and write authorization go
@@ -1249,7 +1253,12 @@ async fn focus(
         Err(_) => return Ok(()),
     };
     ctx.defer().await?;
-    let af = client.get_last_autofocus().await?;
+    let af = super::retry_resource_not_ready(
+        || client.get_last_autofocus(),
+        FOCUS_REPORT_READY_MAX_ATTEMPTS,
+        FOCUS_REPORT_READY_RETRY_DELAY,
+    )
+    .await?;
     let d = &af.response;
     let position = format!("{:.0}", d.calculated_focus_point.position);
     let position_text = if d.previous_focus_point.position.is_finite() {

@@ -642,6 +642,7 @@ mod tests {
             include_str!("../../contracts/direct/v1/fixtures/query-guider-graph.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-command.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-result-autofocus-hocus.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-resource-not-ready.json"),
             include_str!("../../contracts/direct/v1/fixtures/heartbeat.json"),
             include_str!("../../contracts/direct/v1/fixtures/error.json"),
@@ -651,6 +652,21 @@ mod tests {
             let message: DirectMessage = serde_json::from_str(fixture).unwrap();
             serde_json::to_string(&message).unwrap();
         }
+
+        let hocus: DirectMessage = serde_json::from_str(include_str!(
+            "../../contracts/direct/v1/fixtures/query-result-autofocus-hocus.json"
+        ))
+        .unwrap();
+        let DirectMessage::QueryResult(hocus) = hocus else {
+            panic!("expected Hocus Focus QueryResult fixture");
+        };
+        let autofocus: crate::autofocus::AutofocusResponse =
+            serde_json::from_value(hocus.payload).unwrap();
+        assert_eq!(autofocus.response.auto_focuser_name, "Hocus Focus");
+        assert_eq!(
+            autofocus.response.calculated_focus_point.position,
+            4188.955065493704
+        );
 
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../contracts/direct/v1/schema.json")).unwrap();

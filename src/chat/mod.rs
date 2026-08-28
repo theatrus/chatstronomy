@@ -14,6 +14,7 @@ use crate::error::ChatError;
 use crate::source::{RigSourceError, SharedRigSource};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::time::Duration;
 
 // N.I.N.A. publishes image metadata before its background JPEG encoder has
@@ -22,6 +23,27 @@ use std::time::Duration;
 // timeout and should degrade immediately instead of holding up chat delivery.
 const THUMBNAIL_READY_MAX_ATTEMPTS: usize = 6;
 const THUMBNAIL_READY_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+pub(crate) async fn retry_resource_not_ready<T, Operation, OperationFuture>(
+    mut operation: Operation,
+    max_attempts: usize,
+    retry_delay: Duration,
+) -> Result<T, RigSourceError>
+where
+    Operation: FnMut() -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, RigSourceError>>,
+{
+    let max_attempts = max_attempts.max(1);
+    for attempt in 1..=max_attempts {
+        match operation().await {
+            Err(RigSourceError::NotReady { .. }) if attempt < max_attempts => {
+                tokio::time::sleep(retry_delay).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the bounded retry loop always returns on its final attempt")
+}
 
 fn thumbnail_is_still_preparing(error: &RigSourceError) -> bool {
     match error {
@@ -608,6 +630,53 @@ mod thumbnail_retry_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn resource_not_ready_retries_are_bounded_and_typed() {
+        let attempts = AtomicUsize::new(0);
+        let value = retry_resource_not_ready(
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if attempt < 3 {
+                        Err(RigSourceError::NotReady {
+                            kind: RigSourceKind::NinaDirect,
+                            reason: "autofocus report is still being published".to_string(),
+                        })
+                    } else {
+                        Ok(42)
+                    }
+                }
+            },
+            3,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        let terminal_attempts = AtomicUsize::new(0);
+        let terminal = retry_resource_not_ready(
+            || {
+                terminal_attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<(), _>(RigSourceError::InvalidResponse {
+                        kind: RigSourceKind::NinaDirect,
+                        reason: "malformed autofocus payload".to_string(),
+                    })
+                }
+            },
+            3,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(matches!(
+            terminal,
+            Err(RigSourceError::InvalidResponse { .. })
+        ));
+        assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
+    }
 
     #[derive(Clone, Copy)]
     enum ThumbnailBehavior {
