@@ -34,7 +34,11 @@ safety-monitor, sequence, cooling and warming, wait, slew, center, plate-solve,
 and Target Scheduler state. It reports image-save and sequence-item failures,
 and distinguishes clean, failed, stopped, cancelled, and otherwise ended
 sequence outcomes instead of assuming every finish event means success.
-Autofocus graph input comes from the report matching the completed run.
+Autofocus graph input comes from the report matching the completed run. Native
+N.I.N.A. Star HFR and Contrast Detection modes and every built-in fit mode are
+supported. Hocus Focus reports add available fit quality, accepted-star range,
+region, validation, and algorithm details; missing Hocus fields fall back to the
+standard N.I.N.A. presentation.
 Supported built-in waits include time, altitude, Moon-altitude, Sun-altitude,
 horizon, and safety waits; supported long-running Sequencer+ waits include
 condition and manual waits. Private condition expressions and pause reasons

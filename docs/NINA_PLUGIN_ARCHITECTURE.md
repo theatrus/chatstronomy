@@ -138,6 +138,16 @@ is used for graph input. Both the plugin and updater retry bounded transient
 report-availability failures so a preceding run is not rendered as the new
 autofocus result.
 
+The common report parser covers N.I.N.A.'s Star HFR and Contrast Detection
+methods and all built-in fitting modes. Hocus Focus reports can enrich that
+surface with an allowlisted set of fit-quality, accepted-star, normalized-region,
+validation, and algorithm fields. Every extension is optional, so native
+N.I.N.A. reports retain the same graph and chat path. Raw Hocus settings, local
+paths, device IDs, images, and star lists are not part of the Direct contract.
+Hocus's optimizer feedback variants and complete Aberration Inspector analysis
+are not exported through its normal report/lifecycle; those require a future
+Hocus event or adapter rather than private-folder scraping.
+
 Target Scheduler integration follows its N.I.N.A. message-broker topics and
 projects the active container's `Target.TargetName`, avoiding the generic
 “Sequential Instruction Set” wrapper name.

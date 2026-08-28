@@ -139,10 +139,7 @@ impl DirectPipeRigSource {
             ));
         }
         if !result.ok {
-            return Err(RigSourceError::Rejected {
-                kind: RigSourceKind::NinaDirect,
-                reason: result.error.unwrap_or_else(|| "query failed".to_string()),
-            });
+            return Err(result.into_source_error(RigSourceKind::NinaDirect));
         }
         serde_json::from_value(result.payload).map_err(|error| {
             Self::invalid_response(format!("invalid payload from plugin: {error}"))

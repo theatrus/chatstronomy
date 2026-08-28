@@ -1,0 +1,10 @@
+{
+  "type": "query_result",
+  "payload": {
+    "id": "7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e",
+    "ok": false,
+    "payload": null,
+    "error": "The autofocus report is still being published.",
+    "error_code": "resource_not_ready"
+  }
+}

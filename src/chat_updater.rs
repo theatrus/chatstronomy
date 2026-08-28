@@ -46,6 +46,8 @@ const DEFAULT_AUTOFOCUS_RETRY: AutofocusRetryPolicy = AutofocusRetryPolicy {
     max_attempts: 5,
     initial_delay: Duration::from_secs(1),
     max_delay: Duration::from_secs(8),
+    not_ready_timeout: Duration::from_secs(120),
+    overall_timeout: Duration::from_secs(120),
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +55,15 @@ struct AutofocusRetryPolicy {
     max_attempts: usize,
     initial_delay: Duration,
     max_delay: Duration,
+    /// `resource_not_ready` is a healthy response from N.I.N.A., so it does
+    /// not consume the ordinary malformed/rejected-response budget. Bound
+    /// that special treatment by elapsed time so a report that is never
+    /// published cannot remain queued forever.
+    not_ready_timeout: Duration,
+    /// Absolute lifetime of a queued completion across every failure class.
+    /// Transport outages do not consume `max_attempts`, but they must not keep
+    /// a stale report read (or a repeatedly timing-out endpoint) alive forever.
+    overall_timeout: Duration,
 }
 
 /// Double `current`, capped at `max` — but never below `initial`, so a
@@ -925,6 +936,8 @@ struct PendingAutofocusDelivery {
     position: Option<f64>,
     temperature: Option<f64>,
     attempts: usize,
+    queued_at: TokioInstant,
+    not_ready_since: Option<TokioInstant>,
     next_attempt_at: TokioInstant,
     retry_delay: Duration,
     retry: AutofocusRetryPolicy,
@@ -2723,6 +2736,20 @@ impl ChatUpdater {
             ),
             _ => (None, None, None, None),
         };
+        let queued_at = TokioInstant::now();
+        // Direct exposes only N.I.N.A.'s latest completed report. Once a newer
+        // completion arrives, an older pending delivery can no longer be
+        // fetched reliably and would otherwise retry against the new report
+        // before emitting a false "Report Unavailable" warning. Prefer the
+        // newest truthful result and supersede older undelivered completions
+        // silently.
+        if !self.pending_autofocus_deliveries.is_empty() {
+            println!(
+                "Superseded {} pending autofocus result(s) with the newer completion.",
+                self.pending_autofocus_deliveries.len()
+            );
+            self.pending_autofocus_deliveries.clear();
+        }
         self.pending_autofocus_deliveries
             .push(PendingAutofocusDelivery {
                 event_time: event.time.clone(),
@@ -2731,7 +2758,9 @@ impl ChatUpdater {
                 position,
                 temperature,
                 attempts: 0,
-                next_attempt_at: TokioInstant::now(),
+                queued_at,
+                not_ready_since: None,
+                next_attempt_at: queued_at,
                 retry_delay: self.autofocus_retry.initial_delay,
                 retry: self.autofocus_retry,
             });
@@ -2751,22 +2780,60 @@ impl ChatUpdater {
             return;
         };
         let mut delivery = self.pending_autofocus_deliveries.remove(index);
-        let result = self.source.get_last_autofocus().await;
+        if self
+            .expire_autofocus_delivery_if_timed_out(
+                &delivery,
+                now,
+                "the overall report-retry deadline elapsed before the next read",
+            )
+            .await
+        {
+            return;
+        }
+
+        let remaining = delivery
+            .retry
+            .overall_timeout
+            .saturating_sub(now.saturating_duration_since(delivery.queued_at));
+        let result = match tokio::time::timeout(remaining, self.source.get_last_autofocus()).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.expire_autofocus_delivery(
+                    &delivery,
+                    "the Direct autofocus read did not finish before the overall deadline",
+                )
+                .await;
+                return;
+            }
+        };
         if let Err(RigSourceError::Unavailable { reason, .. }) = &result {
             // A transport outage says nothing about whether N.I.N.A. has
             // finished publishing this report. Preserve the attempt budget
-            // and resume after the updater's source can answer again.
-            let delay = delivery.retry.initial_delay.max(Duration::from_millis(1));
+            // and resume after the updater's source can answer again, but keep
+            // the delivery's absolute lifetime bounded.
+            let now = TokioInstant::now();
+            if self
+                .expire_autofocus_delivery_if_timed_out(&delivery, now, reason)
+                .await
+            {
+                return;
+            }
+            let remaining = delivery
+                .retry
+                .overall_timeout
+                .saturating_sub(now.saturating_duration_since(delivery.queued_at));
+            let initial_delay = delivery.retry.initial_delay.max(Duration::from_millis(1));
+            let delay = delivery.retry_delay.max(initial_delay).min(remaining);
             eprintln!(
                 "[{}] Autofocus report for {} is paused while N.I.N.A. is unavailable: {reason}; retrying in {delay:?}",
                 self.telescope_name, delivery.event_time
             );
-            delivery.next_attempt_at = TokioInstant::now() + delay;
+            delivery.next_attempt_at = now + delay;
+            delivery.retry_delay = backoff_delay(delay, initial_delay, delivery.retry.max_delay);
             self.pending_autofocus_deliveries.push(delivery);
             return;
         }
 
-        delivery.attempts += 1;
         match result {
             Ok(autofocus_data)
                 if autofocus_report_matches(
@@ -2788,6 +2855,7 @@ impl ChatUpdater {
                 .await;
             }
             Ok(autofocus_data) => {
+                delivery.attempts += 1;
                 let expected = delivery
                     .report_timestamp
                     .as_deref()
@@ -2798,11 +2866,83 @@ impl ChatUpdater {
                 );
                 self.retry_autofocus_delivery(delivery, &reason).await;
             }
+            Err(RigSourceError::NotReady { reason, .. }) => {
+                self.retry_autofocus_not_ready(delivery, &reason).await;
+            }
             Err(error) => {
+                delivery.attempts += 1;
                 self.retry_autofocus_delivery(delivery, &error.to_string())
                     .await
             }
         }
+    }
+
+    async fn expire_autofocus_delivery_if_timed_out(
+        &self,
+        delivery: &PendingAutofocusDelivery,
+        now: TokioInstant,
+        reason: &str,
+    ) -> bool {
+        let timeout = delivery.retry.overall_timeout;
+        let elapsed = now.saturating_duration_since(delivery.queued_at);
+        if elapsed < timeout {
+            return false;
+        }
+
+        self.expire_autofocus_delivery(delivery, reason).await;
+        true
+    }
+
+    async fn expire_autofocus_delivery(&self, delivery: &PendingAutofocusDelivery, reason: &str) {
+        let timeout = delivery.retry.overall_timeout;
+        eprintln!(
+            "[{}] Autofocus report for {} exceeded its overall retry window of {timeout:?}: {reason}",
+            self.telescope_name, delivery.event_time
+        );
+        self.send_autofocus_unavailable(delivery).await;
+    }
+
+    async fn retry_autofocus_not_ready(
+        &mut self,
+        mut delivery: PendingAutofocusDelivery,
+        reason: &str,
+    ) {
+        let now = TokioInstant::now();
+        let not_ready_since = *delivery.not_ready_since.get_or_insert(now);
+        let elapsed = now.duration_since(not_ready_since);
+        let timeout = delivery.retry.not_ready_timeout;
+        if elapsed >= timeout {
+            eprintln!(
+                "[{}] Autofocus report for {} remained unavailable for {timeout:?}: {reason}",
+                self.telescope_name, delivery.event_time
+            );
+            self.send_autofocus_unavailable(&delivery).await;
+            return;
+        }
+        if self
+            .expire_autofocus_delivery_if_timed_out(&delivery, now, reason)
+            .await
+        {
+            return;
+        }
+
+        let remaining = timeout.saturating_sub(elapsed);
+        let overall_remaining = delivery
+            .retry
+            .overall_timeout
+            .saturating_sub(now.saturating_duration_since(delivery.queued_at));
+        let delay = delivery.retry_delay.min(remaining).min(overall_remaining);
+        eprintln!(
+            "[{}] Autofocus report for {} is not ready after {elapsed:?}: {reason}; retrying in {delay:?}",
+            self.telescope_name, delivery.event_time
+        );
+        delivery.next_attempt_at = now + delay;
+        delivery.retry_delay = backoff_delay(
+            delivery.retry_delay,
+            delivery.retry.initial_delay,
+            delivery.retry.max_delay,
+        );
+        self.pending_autofocus_deliveries.push(delivery);
     }
 
     async fn retry_autofocus_delivery(
@@ -2816,10 +2956,41 @@ impl ChatUpdater {
                 "[{}] Failed to fetch autofocus report for {} after {attempts} attempts: {reason}",
                 self.telescope_name, delivery.event_time
             );
-            if self.chat_manager.service_count() > 0 {
-                let mut message = ChatMessage::new(
-                    &self.titled("⚠️ Autofocus Completed · Report Unavailable"),
-                )
+            self.send_autofocus_unavailable(&delivery).await;
+            return;
+        }
+
+        let now = TokioInstant::now();
+        if self
+            .expire_autofocus_delivery_if_timed_out(&delivery, now, reason)
+            .await
+        {
+            return;
+        }
+        let overall_remaining = delivery
+            .retry
+            .overall_timeout
+            .saturating_sub(now.saturating_duration_since(delivery.queued_at));
+        let delay = delivery.retry_delay.min(overall_remaining);
+        eprintln!(
+            "[{}] Autofocus report for {} was not available on attempt {}/{attempts}: {reason}; retrying in {delay:?}",
+            self.telescope_name, delivery.event_time, delivery.attempts
+        );
+        delivery.next_attempt_at = now + delay;
+        delivery.retry_delay = backoff_delay(
+            delay,
+            delivery.retry.initial_delay,
+            delivery.retry.max_delay,
+        );
+        self.pending_autofocus_deliveries.push(delivery);
+    }
+
+    async fn send_autofocus_unavailable(&self, delivery: &PendingAutofocusDelivery) {
+        if self.chat_manager.service_count() == 0 {
+            return;
+        }
+        let mut message =
+            ChatMessage::new(&self.titled("⚠️ Autofocus Completed · Report Unavailable"))
                 .color(colors::ORANGE)
                 .field("Time", &delivery.event_time, false)
                 .field(
@@ -2827,34 +2998,27 @@ impl ChatUpdater {
                     "N.I.N.A. completed autofocus, but the saved report could not be retrieved.",
                     false,
                 );
-                if let Some(filter) = delivery.filter.as_deref() {
-                    message = message.field("Filter", filter, true);
-                }
-                if let Some(position) = delivery.position {
-                    message = message.field("Position", &format!("{position:.0}"), true);
-                }
-                if let Some(temperature) = delivery.temperature {
-                    message = message.field("Temperature", &format!("{temperature:.1} °C"), true);
-                }
-                self.chat_manager
-                    .send_message(&message, &self.chat_target)
-                    .await;
-            }
-            return;
+        if let Some(filter) = delivery.filter.as_deref() {
+            let filter = filter.trim();
+            message = message.field(
+                "Filter",
+                if filter.is_empty() {
+                    "No filter"
+                } else {
+                    filter
+                },
+                true,
+            );
         }
-
-        let delay = delivery.retry_delay;
-        eprintln!(
-            "[{}] Autofocus report for {} was not available on attempt {}/{attempts}: {reason}; retrying in {delay:?}",
-            self.telescope_name, delivery.event_time, delivery.attempts
-        );
-        delivery.next_attempt_at = TokioInstant::now() + delay;
-        delivery.retry_delay = backoff_delay(
-            delay,
-            delivery.retry.initial_delay,
-            delivery.retry.max_delay,
-        );
-        self.pending_autofocus_deliveries.push(delivery);
+        if let Some(position) = delivery.position {
+            message = message.field("Position", &format!("{position:.0}"), true);
+        }
+        if let Some(temperature) = delivery.temperature {
+            message = message.field("Temperature", &format!("{temperature:.1} °C"), true);
+        }
+        self.chat_manager
+            .send_message(&message, &self.chat_target)
+            .await;
     }
 
     async fn handle_mount_event(&self, event: &Event) {
@@ -3124,15 +3288,38 @@ impl ChatUpdater {
         let success_indicator = if af.is_successful() { "✅" } else { "⚠️" };
 
         println!("{success_indicator} Autofocus Summary");
-        println!("  Filter: {}", af_data.filter);
-        println!("  Method: {}", af_data.method);
-        println!("  Temperature: {:.1}°C", af_data.temperature);
+        println!("  Filter: {}", af_data.filter_name());
+        println!("  Mode: {}", af_data.method_summary());
+        if af_data.temperature.is_finite() {
+            println!("  Temperature: {:.1}°C", af_data.temperature);
+        } else {
+            println!("  Temperature: n/a");
+        }
         println!("  Duration: {}", af_data.duration);
         println!(
-            "  Position Change: {}",
+            "  Position Change: {:.0}",
             af_data.calculated_focus_point.position - af_data.initial_focus_point.position
         );
-        println!("  Best R-squared: {:.4}", af.get_best_r_squared());
+        if let Some(r_squared) = af_data.fit_quality_summary() {
+            println!("  Fit R-squared: {r_squared}");
+        } else {
+            println!("  Fit R-squared: n/a");
+        }
+        if let Some(stars) = af_data.accepted_star_count_summary() {
+            println!("  Accepted stars per point: {stars}");
+        }
+        if let Some(uncertainty) = af_data.hyperbolic_minimum_std_error {
+            println!("  Focus precision: ±{uncertainty:.2} steps");
+        }
+        if let Some(stability) = af_data.hyperbolic_leave_one_out_std_error {
+            println!("  Leave-one-out stability: {stability:.2} steps");
+        }
+        if let Some(chi_squared) = af_data.hyperbolic_reduced_chi_squared {
+            println!("  Reduced chi-squared: {chi_squared:.4}");
+        }
+        if let Some(region) = af_data.region_summary() {
+            println!("  Detection region: {region}");
+        }
     }
 
     // Chat notification methods
@@ -3704,32 +3891,37 @@ impl ChatUpdater {
 
         let position_change =
             af_data.calculated_focus_point.position - af_data.initial_focus_point.position;
-        let position_change_text = if position_change > 0 {
-            format!("+{position_change}")
+        let position_change_text = if position_change > 0.0 {
+            format!("+{position_change:.0}")
         } else {
-            position_change.to_string()
+            format!("{position_change:.0}")
         };
+        let temperature_text = if af_data.temperature.is_finite() {
+            format!("{:.1}°C", af_data.temperature)
+        } else {
+            "n/a".to_string()
+        };
+        let fit_quality_text = af_data
+            .fit_quality_summary()
+            .unwrap_or_else(|| "n/a".to_string());
 
-        let message = ChatMessage::new(&format!(
+        let measurement_name = af_data.measurement_name();
+        let mut message = ChatMessage::new(&format!(
             "[{telescope_name}] {success_indicator} Autofocus Completed"
         ))
         .color(color)
-        .field("Filter", &af_data.filter, true)
-        .field("Method", &af_data.method, true)
+        .field("Filter", af_data.filter_name(), true)
+        .field("Mode", &af_data.method_summary(), true)
         .field("Duration", &af_data.duration, true)
-        .field(
-            "Temperature",
-            &format!("{:.1}°C", af_data.temperature),
-            true,
-        )
+        .field("Temperature", &temperature_text, true)
         .field(
             "Focus Position",
-            &af_data.calculated_focus_point.position.to_string(),
+            &format!("{:.0}", af_data.calculated_focus_point.position),
             true,
         )
         .field("Position Change", &position_change_text, true)
         .field(
-            "HFR Before",
+            &format!("{measurement_name} Before"),
             &af_data
                 .initial_hfr()
                 .map(|v| format!("{v:.3}"))
@@ -3737,24 +3929,42 @@ impl ChatUpdater {
             true,
         )
         .field(
-            "HFR After",
+            &af_data.final_measurement_label(),
             &af_data
                 .final_hfr()
                 .map(|v| format!("{v:.3}"))
                 .unwrap_or_else(|| "n/a".to_string()),
             true,
         )
-        .field(
-            "R-squared",
-            &format!("{:.4}", af.get_best_r_squared()),
-            true,
-        )
+        .field("Fit R²", &fit_quality_text, true)
         .field(
             "Measurements",
             &af_data.measure_points.len().to_string(),
             true,
         )
         .footer(&format!("Focuser: {}", af_data.auto_focuser_name));
+
+        if let Some(stars) = af_data.accepted_star_count_summary() {
+            message = message.field("Accepted stars / point", &stars, true);
+        }
+        if let Some(uncertainty) = af_data.hyperbolic_minimum_std_error {
+            message = message.field("Focus precision", &format!("±{uncertainty:.2} steps"), true);
+        }
+        if let Some(stability) = af_data.hyperbolic_leave_one_out_std_error {
+            message = message.field("LOO stability", &format!("{stability:.2} steps"), true);
+        }
+        if let Some(chi_squared) = af_data.hyperbolic_reduced_chi_squared {
+            message = message.field("Reduced χ²", &format!("{chi_squared:.4}"), true);
+        }
+        if let Some(region) = af_data.region_summary() {
+            message = message.field("Detection region", &region, true);
+        }
+        if let Some(acceptance) = af_data.fit_acceptance_summary() {
+            message = message.field("Acceptance", &acceptance, true);
+        }
+        if let Some(detection) = af_data.detection_summary() {
+            message = message.field("Star detection", &detection, false);
+        }
 
         // Attach the rendered autofocus graph; failures are non-fatal and
         // the notification just goes out without it.
@@ -4581,10 +4791,10 @@ fn autofocus_report_matches(expected: Option<&str>, actual: &str) -> bool {
         return true;
     };
     match (parse_nina_timestamp(expected), parse_nina_timestamp(actual)) {
-        // The N.I.N.A. callback and the report writer can timestamp the same
-        // completed run a few seconds apart. Match the plugin's five-second
-        // correlation window while still rejecting an adjacent autofocus run.
-        (Some(expected), Some(actual)) => (expected - actual).abs() <= chrono::Duration::seconds(5),
+        // N.I.N.A. and Hocus Focus copy the report timestamp into the
+        // completion callback. Filename timestamps have a bounded skew, but
+        // v3 payload identity must name the exact completed report.
+        (Some(expected), Some(actual)) => expected == actual,
         _ => expected.trim() == actual.trim(),
     }
 }
@@ -4683,9 +4893,12 @@ mod tests {
         event_queries: AtomicUsize,
         image_queries: AtomicUsize,
         autofocus_queries: AtomicUsize,
+        autofocus_delay: Duration,
         unavailable_queries: usize,
+        not_ready_queries: usize,
         invalid_response: bool,
         baseline_retry: bool,
+        hocus_response: bool,
     }
 
     impl FlakyAutofocusSource {
@@ -4699,9 +4912,12 @@ mod tests {
                 event_queries: AtomicUsize::new(0),
                 image_queries: AtomicUsize::new(0),
                 autofocus_queries: AtomicUsize::new(0),
+                autofocus_delay: Duration::ZERO,
                 unavailable_queries,
+                not_ready_queries: 0,
                 invalid_response: false,
                 baseline_retry: false,
+                hocus_response: false,
             }
         }
 
@@ -4711,9 +4927,12 @@ mod tests {
                 event_queries: AtomicUsize::new(0),
                 image_queries: AtomicUsize::new(0),
                 autofocus_queries: AtomicUsize::new(0),
+                autofocus_delay: Duration::ZERO,
                 unavailable_queries: 0,
+                not_ready_queries: 0,
                 invalid_response: true,
                 baseline_retry: false,
+                hocus_response: false,
             }
         }
 
@@ -4723,10 +4942,49 @@ mod tests {
                 event_queries: AtomicUsize::new(0),
                 image_queries: AtomicUsize::new(0),
                 autofocus_queries: AtomicUsize::new(0),
+                autofocus_delay: Duration::ZERO,
                 unavailable_queries: 0,
+                not_ready_queries: 0,
                 invalid_response: false,
                 baseline_retry: true,
+                hocus_response: false,
             }
+        }
+
+        fn not_ready_for(event: Event, not_ready_queries: usize) -> Self {
+            Self {
+                event,
+                event_queries: AtomicUsize::new(0),
+                image_queries: AtomicUsize::new(0),
+                autofocus_queries: AtomicUsize::new(0),
+                autofocus_delay: Duration::ZERO,
+                unavailable_queries: 0,
+                not_ready_queries,
+                invalid_response: false,
+                baseline_retry: false,
+                hocus_response: false,
+            }
+        }
+
+        fn delayed(event: Event, autofocus_delay: Duration) -> Self {
+            Self {
+                event,
+                event_queries: AtomicUsize::new(0),
+                image_queries: AtomicUsize::new(0),
+                autofocus_queries: AtomicUsize::new(0),
+                autofocus_delay,
+                unavailable_queries: 0,
+                not_ready_queries: 0,
+                invalid_response: false,
+                baseline_retry: false,
+                hocus_response: false,
+            }
+        }
+
+        fn hocus(event: Event) -> Self {
+            let mut source = Self::unavailable_for(event, 0);
+            source.hocus_response = true;
+            source
         }
 
         fn unexpected<T>() -> RigSourceResult<T> {
@@ -4806,8 +5064,21 @@ mod tests {
 
         async fn get_last_autofocus(&self) -> RigSourceResult<AutofocusResponse> {
             let query = self.autofocus_queries.fetch_add(1, Ordering::SeqCst);
+            if !self.autofocus_delay.is_zero() {
+                tokio::time::sleep(self.autofocus_delay).await;
+            }
             if query < self.unavailable_queries {
                 return Err(RigSourceError::Unavailable {
+                    kind: RigSourceKind::NinaDirect,
+                    reason: "report is still being published".to_string(),
+                });
+            }
+            if query
+                < self
+                    .unavailable_queries
+                    .saturating_add(self.not_ready_queries)
+            {
+                return Err(RigSourceError::NotReady {
                     kind: RigSourceKind::NinaDirect,
                     reason: "report is still being published".to_string(),
                 });
@@ -4818,10 +5089,12 @@ mod tests {
                     reason: "malformed autofocus payload".to_string(),
                 });
             }
-            Ok(
-                serde_json::from_str(include_str!("../example_last_af.json"))
-                    .expect("valid autofocus fixture"),
-            )
+            let fixture = if self.hocus_response {
+                include_str!("../example_last_af_hocus_modern.json")
+            } else {
+                include_str!("../example_last_af.json")
+            };
+            Ok(serde_json::from_str(fixture).expect("valid autofocus fixture"))
         }
 
         async fn get_mount_info(&self) -> RigSourceResult<MountInfoResponse> {
@@ -5005,7 +5278,7 @@ mod tests {
             details: Some(EventDetails::AutofocusFinished {
                 // N.I.N.A.'s callback can precede the matching report timestamp
                 // slightly; the plugin accepts this exact run with a 5s window.
-                report_timestamp: "2025-08-11T23:28:29.5478817-07:00".to_string(),
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
                 filter: Some("OIII".to_string()),
                 position: Some(4068.0),
                 temperature: Some(21.3),
@@ -5028,6 +5301,8 @@ mod tests {
             max_attempts: 3,
             initial_delay: Duration::from_millis(10),
             max_delay: Duration::from_millis(20),
+            not_ready_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_secs(1),
         };
 
         // Event polling only queues the potentially slow report fetch. Seeing
@@ -5067,6 +5342,23 @@ mod tests {
                 attachments[0].data.get(..8),
                 Some(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a][..])
             );
+            assert!(message.fields.iter().any(|field| {
+                field.name == "Mode" && field.value == "Star HFR · Trend + hyperbolic"
+            }));
+            for hocus_only in [
+                "Accepted stars / point",
+                "Focus precision",
+                "LOO stability",
+                "Reduced χ²",
+                "Detection region",
+                "Acceptance",
+                "Star detection",
+            ] {
+                assert!(
+                    message.fields.iter().all(|field| field.name != hocus_only),
+                    "native fallback unexpectedly contained {hocus_only}"
+                );
+            }
         }
 
         // Advancing beyond the entire retry window cannot produce a duplicate.
@@ -5078,6 +5370,129 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn hocus_autofocus_completion_delivers_enriched_feedback_and_graph() {
+        let event = Event {
+            time: "2026-08-28T05:15:42.250Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2026-08-27T22:15:42.2500000-07:00".to_string(),
+                filter: Some("L".to_string()),
+                position: Some(4188.955065493704),
+                temperature: Some(12.4),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::hocus(event));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Hocus Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        )
+        .with_lifecycle_announcements(false);
+
+        updater.poll_events().await;
+        updater.poll_autofocus_delivery().await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let (message, attachments) = &deliveries[0];
+        assert!(message.title.contains("Autofocus Completed"));
+        assert!(!message.title.contains("Report Unavailable"));
+        for (name, expected) in [
+            ("Mode", "Star HFR · Trend + hyperbolic · Tilted Hyperbola"),
+            ("HFR After (measured)", "2.220"),
+            ("Accepted stars / point", "83–119"),
+            ("Focus precision", "±0.70 steps"),
+            ("LOO stability", "0.57 steps"),
+            ("Reduced χ²", "0.0017"),
+            ("Detection region", "Region 3 · 50% × 50%"),
+            ("Acceptance", "Reduced χ² ≤ 5.000"),
+            (
+                "Star detection",
+                "Optimized · Mean + outlier detection · 2× binning",
+            ),
+        ] {
+            assert!(
+                message
+                    .fields
+                    .iter()
+                    .any(|field| field.name == name && field.value == expected),
+                "missing {name}={expected}"
+            );
+        }
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "autofocus.png");
+        assert_eq!(
+            attachments[0].data.get(..8),
+            Some(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a][..])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn newer_autofocus_completion_silently_supersedes_an_unfetchable_older_report() {
+        let older = Event {
+            time: "2025-08-11T22:28:30Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T15:28:30-07:00".to_string(),
+                filter: Some("L".to_string()),
+                position: Some(4000.0),
+                temperature: Some(21.0),
+            }),
+        };
+        let newer = Event {
+            time: "2025-08-12T06:28:30.5478817Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::unavailable_for(newer.clone(), 0));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source,
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        )
+        .with_lifecycle_announcements(false);
+
+        updater.handle_autofocus_finished(&older).await;
+        updater.handle_autofocus_finished(&newer).await;
+        assert_eq!(updater.pending_autofocus_deliveries.len(), 1);
+        assert_eq!(
+            updater.pending_autofocus_deliveries[0]
+                .report_timestamp
+                .as_deref(),
+            Some("2025-08-11T23:28:30.5478817-07:00")
+        );
+
+        updater.poll_autofocus_delivery().await;
+        tokio::time::advance(Duration::from_secs(300)).await;
+        updater.poll_autofocus_delivery().await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].0.title.contains("Autofocus Completed"));
+        assert!(!deliveries[0].0.title.contains("Report Unavailable"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn autofocus_completion_never_delivers_a_different_reports_graph() {
         let event = Event {
             time: "2026-08-25T22:30:00Z".to_string(),
@@ -5085,7 +5500,7 @@ mod tests {
             chat_enabled: true,
             details: Some(EventDetails::AutofocusFinished {
                 report_timestamp: "2026-08-25T22:29:59Z".to_string(),
-                filter: Some("L".to_string()),
+                filter: Some("  ".to_string()),
                 position: Some(5000.0),
                 temperature: Some(-5.0),
             }),
@@ -5106,6 +5521,8 @@ mod tests {
             max_attempts: 2,
             initial_delay: Duration::from_millis(10),
             max_delay: Duration::from_millis(10),
+            not_ready_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_secs(1),
         };
 
         updater.poll_events().await;
@@ -5125,7 +5542,7 @@ mod tests {
             message
                 .fields
                 .iter()
-                .any(|field| { field.name == "Filter" && field.value == "L" })
+                .any(|field| { field.name == "Filter" && field.value == "No filter" })
         );
     }
 
@@ -5136,7 +5553,7 @@ mod tests {
             event: event_types::AUTOFOCUS_FINISHED.to_string(),
             chat_enabled: true,
             details: Some(EventDetails::AutofocusFinished {
-                report_timestamp: "2025-08-11T23:28:29.5478817-07:00".to_string(),
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
                 filter: Some("OIII".to_string()),
                 position: Some(4068.0),
                 temperature: Some(21.3),
@@ -5180,7 +5597,7 @@ mod tests {
             event: event_types::AUTOFOCUS_FINISHED.to_string(),
             chat_enabled: true,
             details: Some(EventDetails::AutofocusFinished {
-                report_timestamp: "2025-08-11T23:28:29.5478817-07:00".to_string(),
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
                 filter: Some("OIII".to_string()),
                 position: Some(4068.0),
                 temperature: Some(21.3),
@@ -5202,6 +5619,8 @@ mod tests {
             max_attempts: 1,
             initial_delay: Duration::from_millis(10),
             max_delay: Duration::from_millis(10),
+            not_ready_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_millis(100),
         };
 
         updater.poll_events().await;
@@ -5226,13 +5645,259 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn permanently_unavailable_autofocus_stops_at_overall_deadline() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::unavailable_for(event, usize::MAX));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source.clone(),
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        updater.autofocus_retry = AutofocusRetryPolicy {
+            // Transport failures retain this ordinary attempt budget, while
+            // the independent overall deadline still bounds the queue entry.
+            max_attempts: 1,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(20),
+            not_ready_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_millis(50),
+        };
+
+        updater.poll_events().await;
+        for (expected_queries, expected_wait) in [
+            (1, Duration::from_millis(10)),
+            (2, Duration::from_millis(20)),
+            (3, Duration::from_millis(20)),
+        ] {
+            updater.poll_autofocus_delivery().await;
+            assert_eq!(
+                source.autofocus_queries.load(Ordering::SeqCst),
+                expected_queries
+            );
+            assert_eq!(updater.pending_autofocus_deliveries.len(), 1);
+            assert_eq!(updater.pending_autofocus_deliveries[0].attempts, 0);
+            let wait = updater.pending_autofocus_deliveries[0]
+                .next_attempt_at
+                .saturating_duration_since(TokioInstant::now());
+            assert_eq!(wait, expected_wait);
+            tokio::time::advance(wait).await;
+        }
+
+        // At the absolute deadline, expire without issuing a fourth query.
+        updater.poll_autofocus_delivery().await;
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 3);
+        assert!(updater.pending_autofocus_deliveries.is_empty());
+        {
+            let deliveries = chat_state.deliveries.lock().unwrap();
+            assert_eq!(deliveries.len(), 1);
+            assert!(deliveries[0].0.title.contains("Report Unavailable"));
+        }
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        updater.poll_autofocus_delivery().await;
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_autofocus_read_cannot_outlive_overall_deadline() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::delayed(
+            event,
+            Duration::from_millis(50),
+        ));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source.clone(),
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        updater.autofocus_retry = AutofocusRetryPolicy {
+            max_attempts: 1,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(20),
+            not_ready_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_millis(25),
+        };
+
+        updater.poll_events().await;
+        let started = TokioInstant::now();
+        updater.poll_autofocus_delivery().await;
+
+        assert_eq!(
+            TokioInstant::now().duration_since(started),
+            Duration::from_millis(25)
+        );
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 1);
+        assert!(updater.pending_autofocus_deliveries.is_empty());
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].0.title.contains("Report Unavailable"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autofocus_not_ready_preserves_attempt_budget_until_report_arrives() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::not_ready_for(event, 3));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source.clone(),
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        updater.autofocus_retry = AutofocusRetryPolicy {
+            // A single ordinary failure would exhaust this budget. The three
+            // readiness responses must leave it untouched.
+            max_attempts: 1,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(20),
+            not_ready_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_secs(1),
+        };
+
+        updater.poll_events().await;
+        for expected_queries in 1..=3 {
+            updater.poll_autofocus_delivery().await;
+            assert_eq!(
+                source.autofocus_queries.load(Ordering::SeqCst),
+                expected_queries
+            );
+            assert_eq!(updater.pending_autofocus_deliveries.len(), 1);
+            assert_eq!(updater.pending_autofocus_deliveries[0].attempts, 0);
+            assert!(chat_state.deliveries.lock().unwrap().is_empty());
+            let wait = updater.pending_autofocus_deliveries[0]
+                .next_attempt_at
+                .saturating_duration_since(TokioInstant::now());
+            tokio::time::advance(wait).await;
+        }
+
+        updater.poll_autofocus_delivery().await;
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 4);
+        assert!(updater.pending_autofocus_deliveries.is_empty());
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].0.title.contains("Autofocus Completed"));
+        assert_eq!(deliveries[0].1.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autofocus_not_ready_stops_at_elapsed_deadline() {
+        let event = Event {
+            time: "2026-08-25T22:30:00Z".to_string(),
+            event: event_types::AUTOFOCUS_FINISHED.to_string(),
+            chat_enabled: true,
+            details: Some(EventDetails::AutofocusFinished {
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
+                filter: Some("OIII".to_string()),
+                position: Some(4068.0),
+                temperature: Some(21.3),
+            }),
+        };
+        let source = Arc::new(FlakyAutofocusSource::not_ready_for(event, usize::MAX));
+        let chat_state = Arc::new(RecordingChatState::default());
+        let mut chat_manager = ChatServiceManager::new();
+        chat_manager.add_service(Box::new(RecordingChatService {
+            state: chat_state.clone(),
+        }));
+        let mut updater = ChatUpdater::new(
+            source.clone(),
+            "Backyard Rig".to_string(),
+            ChatTarget::default(),
+            Arc::new(chat_manager),
+        );
+        updater.autofocus_retry = AutofocusRetryPolicy {
+            max_attempts: 1,
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(10),
+            not_ready_timeout: Duration::from_millis(25),
+            overall_timeout: Duration::from_secs(1),
+        };
+
+        updater.poll_events().await;
+        for expected_queries in 1..=3 {
+            updater.poll_autofocus_delivery().await;
+            assert_eq!(
+                source.autofocus_queries.load(Ordering::SeqCst),
+                expected_queries
+            );
+            assert_eq!(updater.pending_autofocus_deliveries.len(), 1);
+            assert_eq!(updater.pending_autofocus_deliveries[0].attempts, 0);
+            let wait = updater.pending_autofocus_deliveries[0]
+                .next_attempt_at
+                .saturating_duration_since(TokioInstant::now());
+            tokio::time::advance(wait).await;
+        }
+
+        // The fourth readiness response lands exactly on the 25 ms elapsed
+        // deadline. It terminates the pending delivery without consuming the
+        // ordinary one-attempt failure budget.
+        updater.poll_autofocus_delivery().await;
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 4);
+        assert!(updater.pending_autofocus_deliveries.is_empty());
+        {
+            let deliveries = chat_state.deliveries.lock().unwrap();
+            assert_eq!(deliveries.len(), 1);
+            assert!(deliveries[0].0.title.contains("Report Unavailable"));
+        }
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        updater.poll_autofocus_delivery().await;
+        assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn malformed_autofocus_report_exhausts_attempt_budget() {
         let event = Event {
             time: "2026-08-25T22:30:00Z".to_string(),
             event: event_types::AUTOFOCUS_FINISHED.to_string(),
             chat_enabled: true,
             details: Some(EventDetails::AutofocusFinished {
-                report_timestamp: "2025-08-11T23:28:29.5478817-07:00".to_string(),
+                report_timestamp: "2025-08-11T23:28:30.5478817-07:00".to_string(),
                 filter: Some("OIII".to_string()),
                 position: Some(4068.0),
                 temperature: Some(21.3),
@@ -5249,6 +5914,8 @@ mod tests {
             max_attempts: 2,
             initial_delay: Duration::from_millis(10),
             max_delay: Duration::from_millis(10),
+            not_ready_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_secs(1),
         };
 
         updater.poll_events().await;
@@ -5289,6 +5956,8 @@ mod tests {
             max_attempts: 2,
             initial_delay: Duration::from_millis(10),
             max_delay: Duration::from_millis(10),
+            not_ready_timeout: Duration::from_millis(100),
+            overall_timeout: Duration::from_secs(1),
         };
 
         updater.poll_events().await;
@@ -5780,6 +6449,24 @@ mod tests {
         assert!(parse_nina_timestamp("2026-08-17T04:00:00").is_some());
         assert!(parse_nina_timestamp("2026-08-17T04:00:00.1234567").is_some());
         assert!(parse_nina_timestamp("not a timestamp").is_none());
+    }
+
+    #[test]
+    fn autofocus_v3_identity_requires_the_exact_report_timestamp() {
+        let expected = "2026-08-26T22:15:30.1250000-07:00";
+        assert!(autofocus_report_matches(Some(expected), expected));
+        assert!(autofocus_report_matches(
+            Some(expected),
+            "2026-08-27T05:15:30.1250000Z"
+        ));
+        assert!(!autofocus_report_matches(
+            Some(expected),
+            "2026-08-26T22:15:31.1250000-07:00"
+        ));
+        assert!(autofocus_report_matches(
+            None,
+            "2026-08-26T22:15:31.1250000-07:00"
+        ));
     }
 
     #[test]
