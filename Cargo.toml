@@ -50,7 +50,7 @@ libsqlite3-sys = { version = "0", features = ["bundled"] }
 axum = { version = "0.8", features = ["ws"], optional = true }
 rusqlite = { version = "0.37", optional = true }
 hmac = { version = "0.12", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 subtle = { version = "2", optional = true }
 # WebSocket client used by Direct Hub integration tests. Serenity 0.12 still
 # pins its own older tokio-tungstenite copy
