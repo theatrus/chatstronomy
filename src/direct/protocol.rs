@@ -1,6 +1,6 @@
 //! Versioned messages exchanged between N.I.N.A. plugins and a Chatstronomy hub.
 
-use crate::source::{RigCapabilities, RigCommand};
+use crate::source::{RigCapabilities, RigCommand, RigSourceError, RigSourceKind};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -240,6 +240,19 @@ pub enum QueryKind {
 
 /// Answer to a [`QueryRequest`]. On success `payload` holds the JSON of the
 /// response type matching the query kind; on failure `error` explains why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryErrorCode {
+    /// A report, thumbnail, or other asynchronous resource is still being
+    /// produced and the same read may succeed later.
+    ResourceNotReady,
+    /// Preserve compatibility with peers that introduce a newer additive
+    /// error code before this side is upgraded. Unknown failures remain
+    /// ordinary rejections rather than breaking the whole Direct frame.
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryResult {
     pub id: Uuid,
@@ -248,6 +261,20 @@ pub struct QueryResult {
     pub payload: serde_json::Value,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<QueryErrorCode>,
+}
+
+impl QueryResult {
+    /// Convert a failed Direct result into the source-neutral error surface.
+    /// Missing/unknown codes retain the legacy rejection behavior.
+    pub(crate) fn into_source_error(self, kind: RigSourceKind) -> RigSourceError {
+        let reason = self.error.unwrap_or_else(|| "query failed".to_string());
+        match self.error_code {
+            Some(QueryErrorCode::ResourceNotReady) => RigSourceError::NotReady { kind, reason },
+            _ => RigSourceError::Rejected { kind, reason },
+        }
+    }
 }
 
 /// Direct protocol messages. The identity handshake (pair/auth → hello) is
@@ -418,6 +445,40 @@ mod tests {
         assert!(result.ok);
         assert!(result.payload.is_null());
         assert!(result.error.is_none());
+        assert!(result.error_code.is_none());
+    }
+
+    #[test]
+    fn resource_not_ready_query_result_maps_to_a_retryable_source_state() {
+        let json =
+            include_str!("../../contracts/direct/v1/fixtures/query-result-resource-not-ready.json");
+        let message: DirectMessage = serde_json::from_str(json).unwrap();
+        let DirectMessage::QueryResult(result) = message else {
+            panic!("expected QueryResult");
+        };
+        assert_eq!(result.error_code, Some(QueryErrorCode::ResourceNotReady));
+        assert!(matches!(
+            result.into_source_error(RigSourceKind::NinaDirect),
+            RigSourceError::NotReady { reason, .. }
+                if reason == "The autofocus report is still being published."
+        ));
+    }
+
+    #[test]
+    fn legacy_and_unknown_query_error_codes_remain_rejections() {
+        for json in [
+            r#"{"type":"query_result","payload":{"id":"7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e","ok":false,"error":"legacy failure"}}"#,
+            r#"{"type":"query_result","payload":{"id":"7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e","ok":false,"error":"future failure","error_code":"future_code"}}"#,
+        ] {
+            let message: DirectMessage = serde_json::from_str(json).unwrap();
+            let DirectMessage::QueryResult(result) = message else {
+                panic!("expected QueryResult");
+            };
+            assert!(matches!(
+                result.into_source_error(RigSourceKind::NinaDirect),
+                RigSourceError::Rejected { .. }
+            ));
+        }
     }
 
     #[test]
@@ -581,6 +642,8 @@ mod tests {
             include_str!("../../contracts/direct/v1/fixtures/query-guider-graph.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-command.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-result-autofocus-hocus.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-result-resource-not-ready.json"),
             include_str!("../../contracts/direct/v1/fixtures/heartbeat.json"),
             include_str!("../../contracts/direct/v1/fixtures/error.json"),
         ];
@@ -589,6 +652,21 @@ mod tests {
             let message: DirectMessage = serde_json::from_str(fixture).unwrap();
             serde_json::to_string(&message).unwrap();
         }
+
+        let hocus: DirectMessage = serde_json::from_str(include_str!(
+            "../../contracts/direct/v1/fixtures/query-result-autofocus-hocus.json"
+        ))
+        .unwrap();
+        let DirectMessage::QueryResult(hocus) = hocus else {
+            panic!("expected Hocus Focus QueryResult fixture");
+        };
+        let autofocus: crate::autofocus::AutofocusResponse =
+            serde_json::from_value(hocus.payload).unwrap();
+        assert_eq!(autofocus.response.auto_focuser_name, "Hocus Focus");
+        assert_eq!(
+            autofocus.response.calculated_focus_point.position,
+            4188.955065493704
+        );
 
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../contracts/direct/v1/schema.json")).unwrap();

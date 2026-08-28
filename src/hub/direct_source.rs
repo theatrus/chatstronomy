@@ -144,10 +144,7 @@ impl DirectRigSource {
         // an old rig's rejection text through the new logical source.
         self.ensure_connection_still_current(&connection)?;
         if !result.ok {
-            return Err(RigSourceError::Rejected {
-                kind: RigSourceKind::NinaDirect,
-                reason: result.error.unwrap_or_else(|| "query failed".to_string()),
-            });
+            return Err(result.into_source_error(RigSourceKind::NinaDirect));
         }
         Ok(result.payload)
     }
@@ -249,7 +246,7 @@ impl RigSource for DirectRigSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::direct::protocol::{DirectMessage, QueryResult};
+    use crate::direct::protocol::{DirectMessage, QueryErrorCode, QueryResult};
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
 
@@ -358,11 +355,43 @@ mod tests {
             ok: false,
             payload: serde_json::Value::Null,
             error: Some("PRIVATE_OLD_PROFILE_ERROR".to_string()),
+            error_code: None,
         });
 
         let error = query.await.unwrap().expect_err("stale result must fail");
         assert!(matches!(error, RigSourceError::Unavailable { .. }));
         assert!(!error.to_string().contains("PRIVATE_OLD_PROFILE_ERROR"));
         drop(replacement_outgoing);
+    }
+
+    #[tokio::test]
+    async fn resource_not_ready_result_maps_through_hub_source() {
+        let (connection, mut outgoing) = RigConnection::stub(7, Uuid::new_v4());
+        let source = DirectRigSource::new(connection.clone());
+
+        let query = tokio::spawn(async move { source.get_last_autofocus().await });
+        let request = match outgoing.recv().await.expect("query request") {
+            DirectMessage::Query(request) => request,
+            other => panic!("expected query, got {other:?}"),
+        };
+        connection.resolve(QueryResult {
+            id: request.id,
+            ok: false,
+            payload: serde_json::Value::Null,
+            error: Some("autofocus report is still being published".to_string()),
+            error_code: Some(QueryErrorCode::ResourceNotReady),
+        });
+
+        let error = query
+            .await
+            .unwrap()
+            .expect_err("report should not be ready");
+        assert!(matches!(
+            error,
+            RigSourceError::NotReady {
+                kind: RigSourceKind::NinaDirect,
+                reason,
+            } if reason == "autofocus report is still being published"
+        ));
     }
 }

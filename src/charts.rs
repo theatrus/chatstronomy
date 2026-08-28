@@ -29,6 +29,7 @@ const DEC_COLOR: RGBColor = RGBColor(232, 77, 77);
 const DITHER_COLOR: RGBColor = RGBColor(160, 160, 90);
 const HFR_COLOR: RGBColor = RGBColor(96, 189, 232);
 const FOCUS_COLOR: RGBColor = RGBColor(96, 209, 122);
+const FIT_COLOR: RGBColor = RGBColor(213, 143, 255);
 
 #[derive(Debug, Error)]
 pub enum ChartError {
@@ -254,42 +255,70 @@ pub fn render_autofocus_graph_png(af: &AutofocusData) -> Result<Vec<u8>, ChartEr
         .measure_points
         .iter()
         .filter(|p| p.value.is_finite())
-        .map(|p| (p.position as f64, p.value, p.error.max(0.0)))
+        .map(|p| {
+            let error = if p.error.is_finite() {
+                p.error.max(0.0)
+            } else {
+                0.0
+            };
+            (p.position, p.value, error)
+        })
         .collect();
     if points.len() < 2 {
         return Err(ChartError::NotEnoughData(points.len()));
     }
     ensure_font();
 
-    let initial_pos = af.initial_focus_point.position as f64;
-    let final_pos = af.calculated_focus_point.position as f64;
+    let initial_pos = af.initial_focus_point.position;
+    let final_pos = af.calculated_focus_point.position;
+    let fit_points: Vec<_> = af
+        .selected_fit_points()
+        .into_iter()
+        .filter(|(_, point)| point.value.is_finite())
+        .collect();
 
     let x_lo = points
         .iter()
         .map(|p| p.0)
+        .chain(fit_points.iter().map(|(_, point)| point.position))
         .fold(initial_pos.min(final_pos), f64::min);
     let x_hi = points
         .iter()
         .map(|p| p.0)
+        .chain(fit_points.iter().map(|(_, point)| point.position))
         .fold(initial_pos.max(final_pos), f64::max);
     let x_pad = ((x_hi - x_lo) * 0.05).max(1.0);
 
     let y_lo = points
         .iter()
         .map(|(_, v, e)| v - e)
+        .chain(fit_points.iter().map(|(_, point)| point.value))
         .fold(f64::INFINITY, f64::min);
     let y_hi = points
         .iter()
         .map(|(_, v, e)| v + e)
+        .chain(fit_points.iter().map(|(_, point)| point.value))
         .fold(f64::NEG_INFINITY, f64::max);
     let y_pad = ((y_hi - y_lo) * 0.1).max(0.1);
 
-    let hfr_change = match (af.initial_hfr(), af.final_hfr()) {
-        (Some(before), Some(after)) => format!("HFR {:.2} → {:.2}", before, after),
-        (None, Some(after)) => format!("HFR → {:.2}", after),
-        _ => "HFR".to_string(),
+    let measurement_name = af.measurement_name();
+    let measurement_change = match (af.initial_hfr(), af.final_hfr()) {
+        (Some(before), Some(after)) => {
+            format!("{measurement_name} {before:.2} → {after:.2}")
+        }
+        (None, Some(after)) => format!("{measurement_name} → {after:.2}"),
+        _ => measurement_name.to_string(),
     };
-    let title = format!("Autofocus  —  {}  ({})", hfr_change, af.filter);
+    let engine = if af.is_hocus_focus() {
+        "Hocus Focus"
+    } else {
+        "Autofocus"
+    };
+    let title = format!(
+        "{engine}  —  {measurement_change}  —  {}  ({})",
+        af.method_summary(),
+        af.filter_name()
+    );
 
     let mut buffer = vec![0u8; (WIDTH * HEIGHT * 3) as usize];
     {
@@ -298,7 +327,7 @@ pub fn render_autofocus_graph_png(af: &AutofocusData) -> Result<Vec<u8>, ChartEr
             .map_err(|e| ChartError::Render(e.to_string()))?;
 
         let mut chart = ChartBuilder::on(&root)
-            .caption(&title, ("sans-serif", 20).into_font().color(&TEXT))
+            .caption(&title, ("sans-serif", 18).into_font().color(&TEXT))
             .margin(12)
             .x_label_area_size(36)
             .y_label_area_size(52)
@@ -315,7 +344,7 @@ pub fn render_autofocus_graph_png(af: &AutofocusData) -> Result<Vec<u8>, ChartEr
             .axis_style(GRID)
             .label_style(("sans-serif", 14).into_font().color(&TEXT))
             .x_desc("Focuser position")
-            .y_desc("HFR")
+            .y_desc(measurement_name)
             .draw()
             .map_err(|e| ChartError::Render(e.to_string()))?;
 
@@ -363,7 +392,7 @@ pub fn render_autofocus_graph_png(af: &AutofocusData) -> Result<Vec<u8>, ChartEr
                 HFR_COLOR.stroke_width(2),
             ))
             .map_err(|e| ChartError::Render(e.to_string()))?
-            .label("Measured HFR")
+            .label(format!("Measured {measurement_name}"))
             .legend(|(x, y)| {
                 PathElement::new(vec![(x, y), (x + 16, y)], HFR_COLOR.stroke_width(2))
             });
@@ -374,6 +403,18 @@ pub fn render_autofocus_graph_png(af: &AutofocusData) -> Result<Vec<u8>, ChartEr
                     .map(|&(x, v, _)| Circle::new((x, v), 4, HFR_COLOR.filled())),
             )
             .map_err(|e| ChartError::Render(e.to_string()))?;
+
+        for (label, point) in fit_points {
+            chart
+                .draw_series(std::iter::once(TriangleMarker::new(
+                    (point.position, point.value),
+                    7,
+                    FIT_COLOR.filled(),
+                )))
+                .map_err(|e| ChartError::Render(e.to_string()))?
+                .label(label)
+                .legend(|(x, y)| TriangleMarker::new((x + 8, y), 5, FIT_COLOR.filled()));
+        }
 
         chart
             .configure_series_labels()
@@ -523,6 +564,63 @@ mod tests {
         let af = sample_autofocus();
         let png = render_autofocus_graph_png(&af).unwrap();
         assert_eq!(&png[..4], &[0x89, b'P', b'N', b'G']);
+        assert!(png.len() > 1000);
+    }
+
+    #[test]
+    fn test_render_modern_hocus_focus_fractional_positions() {
+        let json = std::fs::read_to_string("example_last_af_hocus_modern.json").unwrap();
+        let parsed: crate::autofocus::AutofocusResponse = serde_json::from_str(&json).unwrap();
+        assert!(
+            (parsed.response.calculated_focus_point.position - 4188.955065493704).abs() < 1e-12
+        );
+
+        let png = render_autofocus_graph_png(&parsed.response).unwrap();
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        assert!(png.len() > 1000);
+    }
+
+    #[test]
+    fn test_render_every_nina_autofocus_feedback_mode() {
+        let mut af = sample_autofocus();
+        let marker = af
+            .intersections
+            .hyperbolic_minimum
+            .clone()
+            .expect("fixture has a fitted minimum");
+        af.intersections.quadratic_minimum = Some(marker.clone());
+        af.intersections.gaussian_maximum = Some(marker);
+
+        for (method, fitting) in [
+            ("STARHFR", "TRENDLINES"),
+            ("STARHFR", "PARABOLIC"),
+            ("STARHFR", "TRENDPARABOLIC"),
+            ("STARHFR", "HYPERBOLIC"),
+            ("STARHFR", "TRENDHYPERBOLIC"),
+            ("CONTRASTDETECTION", "GAUSSIAN"),
+        ] {
+            af.method = method.to_string();
+            af.fitting = fitting.to_string();
+            let png = render_autofocus_graph_png(&af)
+                .unwrap_or_else(|error| panic!("{method}/{fitting}: {error}"));
+            assert_eq!(
+                &png[..8],
+                &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+                "{method}/{fitting}"
+            );
+            assert!(png.len() > 1000, "{method}/{fitting}");
+        }
+    }
+
+    #[test]
+    fn test_render_autofocus_ignores_nonfinite_measurement_error() {
+        let json = std::fs::read_to_string("example_last_af_hocus_modern.json").unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["Response"]["MeasurePoints"][0]["Error"] = serde_json::json!("Infinity");
+        let parsed: crate::autofocus::AutofocusResponse = serde_json::from_value(value).unwrap();
+
+        let png = render_autofocus_graph_png(&parsed.response).unwrap();
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
         assert!(png.len() > 1000);
     }
 

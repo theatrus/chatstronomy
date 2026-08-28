@@ -135,9 +135,14 @@ Switch values and LiveStack data are not captured. Enabled popup notifications
 and opt-in raw N.I.N.A. logs remain unstructured text and may contain
 operational details.
 Autofocus graphs use the report matched to the completed run, and graph delivery
-tolerates bounded transient query failures. Guider
-graph failures remain non-fatal and the image notification is sent without the
-graph.
+tolerates bounded transient query failures. Native N.I.N.A. focus and fitting
+modes share one presentation; available Hocus Focus fit-quality, star-count,
+region, validation, and algorithm fields enrich it without being required.
+Only allowlisted result and algorithm fields cross Direct; raw Hocus settings,
+paths, device IDs, images, star lists, optimizer feedback, and complete
+Aberration Inspector analysis remain local.
+Guider graph failures remain non-fatal and the image notification is sent
+without the graph.
 Disabled events or images can make state incomplete. Only approved
 notifications are routed to attached Discord channels. Disconnects remove the
 live source; reconnecting with the stored credential replaces the stale session

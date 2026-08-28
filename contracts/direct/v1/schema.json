@@ -327,7 +327,8 @@
             "id": { "$ref": "#/$defs/uuid" },
             "ok": { "type": "boolean" },
             "payload": true,
-            "error": { "type": ["string", "null"] }
+            "error": { "type": ["string", "null"] },
+            "error_code": { "type": ["string", "null"] }
           }
         }
       }

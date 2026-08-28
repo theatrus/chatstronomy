@@ -84,6 +84,12 @@ pub enum RigSourceError {
     #[error("{kind:?} request was rejected: {reason}")]
     Rejected { kind: RigSourceKind, reason: String },
 
+    /// The source answered successfully at the transport layer, but the
+    /// requested resource is still being produced. Callers may retry this
+    /// separately from terminal policy/validation rejections.
+    #[error("{kind:?} resource is not ready: {reason}")]
+    NotReady { kind: RigSourceKind, reason: String },
+
     #[error("{kind:?} source is unavailable: {reason}")]
     Unavailable { kind: RigSourceKind, reason: String },
 
@@ -183,5 +189,17 @@ mod tests {
         assert!(message.contains("request was rejected"));
         assert!(message.contains("Parking is disabled"));
         assert!(!message.contains("unavailable"));
+    }
+
+    #[test]
+    fn resource_readiness_is_distinct_from_rejection_and_transport_outage() {
+        let error = RigSourceError::NotReady {
+            kind: RigSourceKind::NinaDirect,
+            reason: "autofocus report is still being published".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("resource is not ready"));
+        assert!(!message.contains("request was rejected"));
+        assert!(!message.contains("source is unavailable"));
     }
 }

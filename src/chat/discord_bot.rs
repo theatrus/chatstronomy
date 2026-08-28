@@ -21,7 +21,11 @@ use async_trait::async_trait;
 use poise::serenity_prelude::{self as serenity, CreateAttachment, CreateMessage};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+const FOCUS_REPORT_READY_MAX_ATTEMPTS: usize = 4;
+const FOCUS_REPORT_READY_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Per-bot state carried by the Poise framework. Each slash command has
 /// `ctx.data()` access to this. Telescope lookup and write authorization go
@@ -1249,30 +1253,61 @@ async fn focus(
         Err(_) => return Ok(()),
     };
     ctx.defer().await?;
-    let af = client.get_last_autofocus().await?;
+    let af = super::retry_resource_not_ready(
+        || client.get_last_autofocus(),
+        FOCUS_REPORT_READY_MAX_ATTEMPTS,
+        FOCUS_REPORT_READY_RETRY_DELAY,
+    )
+    .await?;
     let d = &af.response;
-    let position_change = d.calculated_focus_point.position - d.previous_focus_point.position;
+    let position = format!("{:.0}", d.calculated_focus_point.position);
+    let position_text = if d.previous_focus_point.position.is_finite() {
+        let position_change = d.calculated_focus_point.position - d.previous_focus_point.position;
+        format!("{position} (Δ {position_change:+.0})")
+    } else {
+        position
+    };
+    let temperature = if d.temperature.is_finite() {
+        format!("{:.1}°C", d.temperature)
+    } else {
+        "n/a".to_string()
+    };
+    let final_measurement = d
+        .final_hfr()
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let fit_quality = d.fit_quality_summary().unwrap_or_else(|| "n/a".to_string());
     let mut embed = serenity::CreateEmbed::new()
         .title(format!("[{name}] Last autofocus"))
-        .field("Filter", &d.filter, true)
-        .field("Method", &d.method, true)
+        .field("Filter", d.filter_name(), true)
+        .field("Mode", d.method_summary(), true)
         .field("Duration", &d.duration, true)
-        .field("Temperature", format!("{:.1}°C", d.temperature), true)
-        .field(
-            "Position",
-            format!(
-                "{} (Δ {:+})",
-                d.calculated_focus_point.position, position_change
-            ),
-            true,
-        )
-        .field(
-            "HFR",
-            format!("{:.3}", d.calculated_focus_point.value),
-            true,
-        )
-        .field("Best R²", format!("{:.4}", af.get_best_r_squared()), true)
+        .field("Temperature", temperature, true)
+        .field("Position", position_text, true)
+        .field(d.final_measurement_label(), final_measurement, true)
+        .field("Fit R²", fit_quality, true)
         .field("Timestamp", &d.timestamp, true);
+    if let Some(stars) = d.accepted_star_count_summary() {
+        embed = embed.field("Accepted stars / point", stars, true);
+    }
+    if let Some(uncertainty) = d.hyperbolic_minimum_std_error {
+        embed = embed.field("Focus precision", format!("±{uncertainty:.2} steps"), true);
+    }
+    if let Some(stability) = d.hyperbolic_leave_one_out_std_error {
+        embed = embed.field("LOO stability", format!("{stability:.2} steps"), true);
+    }
+    if let Some(chi_squared) = d.hyperbolic_reduced_chi_squared {
+        embed = embed.field("Reduced χ²", format!("{chi_squared:.4}"), true);
+    }
+    if let Some(region) = d.region_summary() {
+        embed = embed.field("Detection region", region, true);
+    }
+    if let Some(acceptance) = d.fit_acceptance_summary() {
+        embed = embed.field("Acceptance", acceptance, true);
+    }
+    if let Some(detection) = d.detection_summary() {
+        embed = embed.field("Star detection", detection, false);
+    }
     let mut reply = poise::CreateReply::default();
     if let Ok(png) = crate::charts::render_autofocus_graph_png(d) {
         let filename = "autofocus.png";

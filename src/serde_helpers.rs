@@ -40,6 +40,33 @@ where
     }
 }
 
+/// Finite `f64` field for focus positions. Newer autofocus engines may return
+/// a fractional fitted position; the legacy empty-array sentinel retains its
+/// historical `-1` value. Null and non-finite sentinels are rejected because
+/// they cannot be used safely as chart coordinates.
+pub fn de_finite_f64<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(d)?;
+    let value = match raw {
+        serde_json::Value::Number(number) => {
+            number.as_f64().ok_or_else(|| D::Error::custom("not f64"))?
+        }
+        serde_json::Value::String(value) => value.parse::<f64>().map_err(D::Error::custom)?,
+        serde_json::Value::Array(values) if values.is_empty() => return Ok(-1.0),
+        other => {
+            return Err(D::Error::custom(format!(
+                "expected a finite number or []; got {other}"
+            )));
+        }
+    };
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or_else(|| D::Error::custom("expected a finite number"))
+}
+
 /// Optional `f64` field using the same N.I.N.A. sentinel handling as
 /// [`de_f64_tolerant`]. Missing fields are handled by `#[serde(default)]` at
 /// the call site; explicit `null`, `[]`, `"NaN"`, and infinities become
@@ -50,6 +77,33 @@ where
 {
     let value = de_f64_tolerant(d)?;
     Ok(value.is_finite().then_some(value))
+}
+
+/// Optional non-negative count. Hocus Focus uses `-1` when a star-count
+/// statistic was not calculated; null and an empty array are also treated as
+/// unavailable for compatibility with N.I.N.A.'s common sentinel shapes.
+pub fn de_optional_nonnegative_i32<'de, D>(d: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(d)?;
+    let value = match raw {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::Array(values) if values.is_empty() => return Ok(None),
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .ok_or_else(|| D::Error::custom("not an integral i32"))?,
+        serde_json::Value::String(value) => value.parse::<i64>().map_err(D::Error::custom)?,
+        other => {
+            return Err(D::Error::custom(format!(
+                "expected a non-negative integer, [], or null; got {other}"
+            )));
+        }
+    };
+    if value < 0 {
+        return Ok(None);
+    }
+    Ok(Some(i32::try_from(value).map_err(D::Error::custom)?))
 }
 
 /// `String` field that may also arrive as an empty array `[]` — empty
@@ -106,11 +160,15 @@ mod tests {
     #[derive(Deserialize)]
     struct F(#[serde(deserialize_with = "de_f64_tolerant")] f64);
     #[derive(Deserialize)]
+    struct Finite(#[serde(deserialize_with = "de_finite_f64")] f64);
+    #[derive(Deserialize)]
     struct S(#[serde(deserialize_with = "de_string_tolerant")] String);
     #[derive(Deserialize)]
     struct I(#[serde(deserialize_with = "de_i32_tolerant")] i32);
     #[derive(Deserialize)]
     struct O(#[serde(deserialize_with = "de_optional_finite_f64")] Option<f64>);
+    #[derive(Deserialize)]
+    struct C(#[serde(deserialize_with = "de_optional_nonnegative_i32")] Option<i32>);
 
     #[test]
     fn f64_number() {
@@ -145,11 +203,39 @@ mod tests {
     }
 
     #[test]
+    fn finite_f64_accepts_fractional_positions_and_rejects_sentinels() {
+        let Finite(value) = serde_json::from_str("4188.955065493704").unwrap();
+        assert!((value - 4188.955065493704).abs() < 1e-12);
+        let Finite(value) = serde_json::from_str("\"4068.25\"").unwrap();
+        assert_eq!(value, 4068.25);
+        let Finite(value) = serde_json::from_str("[]").unwrap();
+        assert_eq!(value, -1.0);
+        for json in ["null", "\"NaN\"", "\"Infinity\"", "\"-Infinity\""] {
+            assert!(
+                serde_json::from_str::<Finite>(json).is_err(),
+                "sentinel {json}"
+            );
+        }
+    }
+
+    #[test]
     fn optional_finite_f64_discards_nina_unknown_sentinels() {
         let O(value) = serde_json::from_str("12.5").unwrap();
         assert_eq!(value, Some(12.5));
         for json in ["null", "[]", "\"NaN\"", "\"Infinity\"", "\"-Infinity\""] {
             let O(value) = serde_json::from_str(json).unwrap();
+            assert_eq!(value, None, "sentinel {json}");
+        }
+    }
+
+    #[test]
+    fn optional_nonnegative_i32_discards_hocus_unknown_sentinels() {
+        let C(value) = serde_json::from_str("83").unwrap();
+        assert_eq!(value, Some(83));
+        let C(value) = serde_json::from_str("\"119\"").unwrap();
+        assert_eq!(value, Some(119));
+        for json in ["-1", "null", "[]"] {
+            let C(value) = serde_json::from_str(json).unwrap();
             assert_eq!(value, None, "sentinel {json}");
         }
     }

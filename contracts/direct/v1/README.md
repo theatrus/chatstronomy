@@ -9,6 +9,12 @@ fixtures are durable cross-repository compatibility inputs. Additive optional
 fields may be introduced within v1; incompatible wire changes require a new
 protocol directory and protocol version.
 
+Failed `query_result` frames may optionally carry
+`error_code: "resource_not_ready"` when an asynchronous resource exists but is
+still being produced. A peer that understands the code can retry it separately
+from policy or validation failures. The field is additive: older frames omit
+it, and unknown future codes retain the legacy terminal-rejection behavior.
+
 `payload_version` marks the additive data contract independently of the Direct
 envelope. Current clients advertise payload version 3. Version 2 added
 sequence-operation reporting and Hub image attachments; version 3 adds event
@@ -22,6 +28,14 @@ Payload version 3 permits additive autofocus-completion and safety-monitor
 event details plus the `safety_wait`, `condition_wait`, and `manual_wait`
 sequence operation kinds. Peers that do not send these optional details retain
 their existing behavior.
+
+`last_autofocus` keeps N.I.N.A.'s common autofocus report as its required
+surface. Hocus Focus can add optional final-measurement provenance, fit-quality
+statistics, accepted-star counts, normalized region geometry, selected fit
+model, and the allowlisted `HocusFocusAlgorithm` object. These fields are
+additive within payload v3: pure N.I.N.A. reports omit them and use the same
+query, chat, and graph paths. Raw Hocus settings objects are never part of this
+contract.
 
 When local event consent is revoked for an operation that previously appeared
 in the sequence tree, its stable tree slot can contain an opaque privacy

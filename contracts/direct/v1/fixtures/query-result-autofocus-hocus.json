@@ -1,0 +1,120 @@
+{
+  "type": "query_result",
+  "payload": {
+    "id": "a4f2f481-9ff7-4c18-b57c-21d620924116",
+    "ok": true,
+    "payload": {
+      "Response": {
+        "Version": 2,
+        "Filter": "L",
+        "AutoFocuserName": "Hocus Focus",
+        "StarDetectorName": "Hocus Focus",
+        "Timestamp": "2026-08-27T22:15:42.2500000-07:00",
+        "Temperature": 12.4,
+        "Method": "STARHFR",
+        "Fitting": "TRENDHYPERBOLIC",
+        "InitialFocusPoint": {
+          "Position": 4076.5,
+          "Value": 4.12,
+          "Error": 0.12
+        },
+        "CalculatedFocusPoint": {
+          "Position": 4188.955065493704,
+          "Value": 2.31,
+          "Error": 0.0
+        },
+        "PreviousFocusPoint": {
+          "Position": 4076.5,
+          "Value": 4.12,
+          "Error": 0.12
+        },
+        "MeasurePoints": [
+          {
+            "Position": 4056.25,
+            "Value": 4.8,
+            "Error": 0.18
+          },
+          {
+            "Position": 4196.75,
+            "Value": 2.4,
+            "Error": 0.1
+          }
+        ],
+        "Intersections": {
+          "TrendLineIntersection": {
+            "Position": 4187.75,
+            "Value": 2.28,
+            "Error": 0.0
+          },
+          "HyperbolicMinimum": {
+            "Position": 4188.955065493704,
+            "Value": 2.31,
+            "Error": 0.0
+          },
+          "QuadraticMinimum": null,
+          "GaussianMaximum": null
+        },
+        "Fittings": {
+          "Quadratic": "",
+          "Hyperbolic": "hocus-focus fit",
+          "Gaussian": "",
+          "LeftTrend": "left fit",
+          "RightTrend": "right fit"
+        },
+        "RSquares": {
+          "Quadratic": "NaN",
+          "Hyperbolic": 0.992,
+          "LeftTrend": 0.97,
+          "RightTrend": 0.98
+        },
+        "BacklashCompensation": {
+          "BacklashCompensationModel": "OVERSHOOT",
+          "BacklashIN": 0,
+          "BacklashOUT": 20
+        },
+        "Duration": "00:02:18.5000000",
+        "FinalHFR": 2.22,
+        "FinalHFRSource": "measured_validation",
+        "InitialHFRMeasured": true,
+        "HyperbolicMinimumStdError": 0.7,
+        "HyperbolicReducedChiSquared": 0.0017,
+        "HyperbolicLeaveOneOutStdError": 0.57,
+        "AcceptedStarCountMin": 83,
+        "AcceptedStarCountMax": 119,
+        "HyperbolicFitModelChosen": "Tilted Hyperbola",
+        "Region": {
+          "Index": 3,
+          "OuterBoundary": {
+            "StartX": 0.5,
+            "StartY": 0.0,
+            "Width": 0.5,
+            "Height": 0.5
+          },
+          "InnerCropBoundary": null
+        },
+        "HocusFocusAlgorithm": {
+          "ValidateHfrImprovement": true,
+          "HFRImprovementThreshold": 0.15,
+          "WeightedHyperbolicFitEnabled": true,
+          "ConfiguredHyperbolicModel": "Hybrid (Best Fit)",
+          "FitRejectionCriterion": "Reduced χ²",
+          "ReducedChiSquaredRejectionThreshold": 5.0,
+          "MaxOutlierRejections": 1,
+          "OutlierRejectionConfidence": 0.99,
+          "RSquaredThreshold": 0.9,
+          "ModelPSF": true,
+          "UseOptimizedSettings": true,
+          "HasOptimizedSettings": true,
+          "DetectionBinning": 2,
+          "MeasurementAverage": "Mean + outlier detection",
+          "StarDetectionMode": "Optimized"
+        }
+      },
+      "Error": "",
+      "StatusCode": 200,
+      "Success": true,
+      "Type": "API"
+    },
+    "error": null
+  }
+}
