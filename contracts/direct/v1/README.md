@@ -29,6 +29,18 @@ event details plus the `safety_wait`, `condition_wait`, and `manual_wait`
 sequence operation kinds. Peers that do not send these optional details retain
 their existing behavior.
 
+Payload version 3 also permits additive motion diagnostics. A plugin may emit
+`MOUNT-SLEW-STARTED` before the existing `MOUNT-SLEWED` event and
+`ROTATOR-MOVE-STARTED` before the existing `ROTATOR-MOVED` or
+`ROTATOR-MOVED-MECHANICAL` event. Motion IDs, requested targets, observed
+logical/mechanical positions, elapsed observation time, and end-detection provenance are
+optional so older completion payloads remain valid. State-observed mount starts
+and ends can carry altitude and azimuth only when the N.I.N.A. profile permits
+location sharing. A callback-only recovery sets `ObservedInProgress`, carries no
+inferred duration, and lets the receiver label the reconstructed pair
+accordingly. Because N.I.N.A.'s completion callback has no start timestamp, its
+recovered `From` position contains RA/Dec but no historical altitude or azimuth.
+
 `last_autofocus` keeps N.I.N.A.'s common autofocus report as its required
 surface. Hocus Focus can add optional final-measurement provenance, fit-quality
 statistics, accepted-star counts, normalized region geometry, selected fit

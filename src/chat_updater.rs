@@ -2030,6 +2030,11 @@ impl ChatUpdater {
                     )
                 });
             }
+            // Start-event scopes are new and transient. Existing completion
+            // names deliberately retain their legacy broad scopes so a
+            // payload-v3 privacy tombstone still revokes all older state that
+            // was captured under those switches.
+            EventDeliveryScope::SlewMotion | EventDeliveryScope::RotatorMotion => {}
             EventDeliveryScope::Guiding => {
                 self.state.last_guider_event = None;
             }
@@ -2112,9 +2117,11 @@ impl ChatUpdater {
                 self.state.last_mount_event = Some(event.event.clone());
                 self.state.center_event_seen_at = Some(Utc::now());
             }
-            // Flip and dither events describe brief activity, not a stable
+            // Motion starts and flips describe brief activity, not a stable
             // state. They are announced but must not replace the status state.
-            event_types::MOUNT_BEFORE_FLIP | event_types::MOUNT_AFTER_FLIP => {}
+            event_types::MOUNT_SLEW_STARTED
+            | event_types::MOUNT_BEFORE_FLIP
+            | event_types::MOUNT_AFTER_FLIP => {}
             event_types::GUIDER_START | event_types::GUIDER_STOP => {
                 self.state.last_guider_event = Some(event.event.clone());
             }
@@ -2565,6 +2572,7 @@ impl ChatUpdater {
             | event_types::MOUNT_UNPARKED
             | event_types::MOUNT_HOMED
             | event_types::MOUNT_CENTER
+            | event_types::MOUNT_SLEW_STARTED
             | event_types::MOUNT_SLEWED => self.handle_mount_event(event).await,
             event_types::GUIDER_START | event_types::GUIDER_DITHER => {
                 self.handle_guider_event(event).await
@@ -3782,6 +3790,7 @@ impl ChatUpdater {
                 event_types::MOUNT_BEFORE_FLIP => "🔄 Mount pre-flip",
                 event_types::MOUNT_AFTER_FLIP => "✅ Mount post-flip",
                 event_types::MOUNT_CENTER => "🎯 Centering started",
+                event_types::MOUNT_SLEWED => "🔭 Mount slew ended",
                 _ => "🔭 Mount active",
             };
             parts.push(label.to_string());
@@ -3993,7 +4002,19 @@ impl ChatUpdater {
             event_types::MOUNT_UNPARKED => ("🔭 Mount Unparked", colors::YELLOW),
             event_types::MOUNT_HOMED => ("🏠 Mount Homed", colors::CYAN),
             event_types::MOUNT_CENTER => ("🎯 Centering Started", colors::CYAN),
-            event_types::MOUNT_SLEWED => ("🔭 Mount Slew Completed", colors::CYAN),
+            event_types::MOUNT_SLEW_STARTED
+                if matches!(
+                    &event.details,
+                    Some(EventDetails::MountSlewStarted {
+                        observed_in_progress: Some(true),
+                        ..
+                    })
+                ) =>
+            {
+                ("🔭 Mount Slew Recovered", colors::BLUE)
+            }
+            event_types::MOUNT_SLEW_STARTED => ("🔭 Mount Slew Started", colors::BLUE),
+            event_types::MOUNT_SLEWED => ("🔭 Mount Slew Ended", colors::CYAN),
             _ => ("🔭 Mount Event", colors::GRAY),
         };
 
@@ -4005,14 +4026,56 @@ impl ChatUpdater {
         if let Some(target) = &self.state.current_target {
             message = message.field("Current Target", &target.name, true);
         }
-        if let Some(EventDetails::MountSlewed { from, to }) = &event.details {
-            message =
-                message
-                    .field("From", &from.display(), false)
-                    .field("To", &to.display(), false);
+        match &event.details {
+            Some(EventDetails::MountSlewStarted {
+                from,
+                target,
+                motion_id,
+                observed_in_progress,
+            }) => {
+                message = add_coordinate_field(message, "From position", from);
+                if let Some(target) = target {
+                    message = add_coordinate_field(message, "Requested destination", target);
+                }
+                message =
+                    add_motion_metadata(message, *motion_id, None, None, *observed_in_progress);
+            }
+            Some(EventDetails::MountSlewed {
+                from,
+                to,
+                target,
+                motion_id,
+                duration_seconds,
+                end_detection,
+                observed_in_progress,
+            }) => {
+                message = add_coordinate_field(message, "From position", from);
+                if let Some(target) = target {
+                    message = add_coordinate_field(message, "Requested destination", target);
+                }
+                message = add_coordinate_field(message, "To position", to);
+                message = add_motion_metadata(
+                    message,
+                    *motion_id,
+                    *duration_seconds,
+                    end_detection.as_deref(),
+                    *observed_in_progress,
+                );
+            }
+            _ => {}
         }
 
-        self.add_mount_info(&mut message).await;
+        // Motion diagnostics carry snapshots associated with their state edges
+        // (or callback coordinates when capture recovered late). A live
+        // query here could replace that useful evidence with a later position
+        // and could stall delivery while the driver is unhealthy, so enrich
+        // only the other mount events.
+        if !matches!(
+            event.event.as_str(),
+            event_types::MOUNT_SLEW_STARTED | event_types::MOUNT_SLEWED
+        ) {
+            self.add_mount_info(&mut message).await;
+        }
         self.chat_manager
             .send_message(&message, &self.chat_target)
             .await;
@@ -4226,6 +4289,13 @@ impl ChatUpdater {
 
     async fn send_generic_event_notification(&self, event: &Event) {
         let (color, title) = match &event.details {
+            Some(EventDetails::RotatorMoveStarted {
+                observed_in_progress: Some(true),
+                ..
+            }) => (
+                get_event_color(&event.event),
+                "🧭 Rotator move recovered".to_string(),
+            ),
             Some(EventDetails::CommandFailed { command, .. }) => (
                 colors::RED,
                 format!("❌ Command failed · {}", truncate_chat_title(command)),
@@ -4364,17 +4434,85 @@ impl ChatUpdater {
                         );
                     }
                 }
-                EventDetails::RotatorMoved { from, to } => {
-                    message = message
-                        .field("From", &format!("{from:.2}°"), true)
-                        .field("To", &format!("{to:.2}°"), true)
-                        .field("Δ", &format!("{:+.2}°", to - from), true);
+                EventDetails::RotatorMoveStarted {
+                    position,
+                    mechanical_position,
+                    motion_id,
+                    observed_in_progress,
+                } => {
+                    if let Some(position) = position {
+                        message = message.field("From position", &format!("{position:.2}°"), true);
+                    }
+                    if let Some(position) = mechanical_position {
+                        message =
+                            message.field("Mechanical from", &format!("{position:.2}°"), true);
+                    }
+                    message =
+                        add_motion_metadata(message, *motion_id, None, None, *observed_in_progress);
                 }
-                EventDetails::MountSlewed { from, to } => {
-                    message = message.field("From", &from.display(), false).field(
-                        "To",
-                        &to.display(),
-                        false,
+                EventDetails::RotatorMoved {
+                    from,
+                    to,
+                    position,
+                    mechanical_from,
+                    mechanical_to,
+                    mechanical_position,
+                    motion_id,
+                    duration_seconds,
+                    end_detection,
+                    observed_in_progress,
+                } => {
+                    message = add_rotator_end_fields(
+                        message,
+                        &event.event,
+                        *from,
+                        *to,
+                        *position,
+                        *mechanical_from,
+                        *mechanical_to,
+                        *mechanical_position,
+                    );
+                    message = add_motion_metadata(
+                        message,
+                        *motion_id,
+                        *duration_seconds,
+                        end_detection.as_deref(),
+                        *observed_in_progress,
+                    );
+                }
+                EventDetails::MountSlewStarted {
+                    from,
+                    target,
+                    motion_id,
+                    observed_in_progress,
+                } => {
+                    message = add_coordinate_field(message, "From position", from);
+                    if let Some(target) = target {
+                        message = add_coordinate_field(message, "Requested destination", target);
+                    }
+                    message =
+                        add_motion_metadata(message, *motion_id, None, None, *observed_in_progress);
+                }
+                EventDetails::MountSlewed {
+                    from,
+                    to,
+                    target,
+                    motion_id,
+                    duration_seconds,
+                    end_detection,
+                    observed_in_progress,
+                } => {
+                    message = add_coordinate_field(message, "From position", from);
+                    if let Some(target) = target {
+                        message = add_coordinate_field(message, "Requested destination", target);
+                    }
+                    message = add_coordinate_field(message, "To position", to);
+                    message = add_motion_metadata(
+                        message,
+                        *motion_id,
+                        *duration_seconds,
+                        end_detection.as_deref(),
+                        *observed_in_progress,
                     );
                 }
                 EventDetails::DomeSlewed { from, to } => {
@@ -4641,6 +4779,99 @@ impl ChatUpdater {
     }
 }
 
+fn add_coordinate_field(
+    message: ChatMessage,
+    name: &str,
+    coordinates: &crate::events::EventCoordinates,
+) -> ChatMessage {
+    let display = coordinates.display();
+    let display = if display.is_empty() {
+        "Position unavailable".to_string()
+    } else {
+        truncate_chat_value(&display)
+    };
+    message.field(name, &display, false)
+}
+
+fn motion_end_detection_display(value: &str) -> String {
+    match value {
+        "motion_state" => "Equipment first reported idle".to_string(),
+        "nina_slewed" => "N.I.N.A. slew event".to_string(),
+        "nina_moved" => "N.I.N.A. move event".to_string(),
+        _ => truncate_chat_value(value),
+    }
+}
+
+fn add_motion_metadata(
+    mut message: ChatMessage,
+    motion_id: Option<i64>,
+    duration_seconds: Option<f64>,
+    end_detection: Option<&str>,
+    observed_in_progress: Option<bool>,
+) -> ChatMessage {
+    if let Some(motion_id) = motion_id {
+        message = message.field("Motion", &format!("#{motion_id}"), true);
+    }
+    if let Some(duration_seconds) = duration_seconds {
+        message = message.field(
+            "Observed interval",
+            &format!("{duration_seconds:.2} s"),
+            true,
+        );
+    }
+    if let Some(end_detection) = end_detection.filter(|value| !value.trim().is_empty()) {
+        message = message.field(
+            "End detected by",
+            &motion_end_detection_display(end_detection),
+            true,
+        );
+    }
+    if observed_in_progress == Some(true) {
+        message = message.field("Capture", "Recovered after motion began", false);
+    }
+    message
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_rotator_end_fields(
+    mut message: ChatMessage,
+    event_name: &str,
+    from: Option<f64>,
+    to: Option<f64>,
+    position: Option<f64>,
+    mechanical_from: Option<f64>,
+    mechanical_to: Option<f64>,
+    mechanical_position: Option<f64>,
+) -> ChatMessage {
+    let mechanical_event = event_name == event_types::ROTATOR_MOVED_MECHANICAL;
+    let logical_from = (!mechanical_event).then_some(from).flatten();
+    let logical_to = position.or((!mechanical_event).then_some(to).flatten());
+    let mechanical_from = mechanical_from.or(mechanical_event.then_some(from).flatten());
+    let mechanical_to = mechanical_to
+        .or(mechanical_position)
+        .or(mechanical_event.then_some(to).flatten());
+
+    if let Some(value) = logical_from {
+        message = message.field("From position", &format!("{value:.2}°"), true);
+    }
+    if let Some(value) = logical_to {
+        message = message.field("To position", &format!("{value:.2}°"), true);
+    }
+    if let (Some(from), Some(to)) = (logical_from, logical_to) {
+        message = message.field("Position change", &format!("{:+.2}°", to - from), true);
+    }
+    if let Some(value) = mechanical_from {
+        message = message.field("Mechanical from", &format!("{value:.2}°"), true);
+    }
+    if let Some(value) = mechanical_to {
+        message = message.field("Mechanical to", &format!("{value:.2}°"), true);
+    }
+    if let (Some(from), Some(to)) = (mechanical_from, mechanical_to) {
+        message = message.field("Mechanical change", &format!("{:+.2}°", to - from), true);
+    }
+    message
+}
+
 fn get_event_color(event: &str) -> u32 {
     match event {
         // Camera events
@@ -4660,6 +4891,7 @@ fn get_event_color(event: &str) -> u32 {
         event_types::MOUNT_UNPARKED => colors::YELLOW,
         event_types::MOUNT_HOMED => colors::CYAN,
         event_types::MOUNT_CENTER => colors::CYAN,
+        event_types::MOUNT_SLEW_STARTED => colors::BLUE,
         event_types::MOUNT_SLEWED => colors::CYAN,
 
         // Focuser events
@@ -4674,6 +4906,7 @@ fn get_event_color(event: &str) -> u32 {
         // Rotator events
         event_types::ROTATOR_CONNECTED => colors::GREEN,
         event_types::ROTATOR_DISCONNECTED => colors::RED,
+        event_types::ROTATOR_MOVE_STARTED => colors::BLUE,
         event_types::ROTATOR_MOVED => colors::CYAN,
         event_types::ROTATOR_MOVED_MECHANICAL => colors::CYAN,
         event_types::ROTATOR_SYNCED => colors::CYAN,
@@ -4828,9 +5061,11 @@ fn get_event_title(event: &str) -> String {
         event_types::TS_TARGETSTART => "🎯 Target Started".to_string(),
         event_types::TS_WAITSTART => "⏳ Sequence Waiting".to_string(),
         event_types::AUTOFOCUS_POINT_ADDED => "📈 Autofocus Point".to_string(),
-        event_types::ROTATOR_MOVED => "🧭 Rotator Moved".to_string(),
-        event_types::ROTATOR_MOVED_MECHANICAL => "🧭 Rotator Moved (Mech.)".to_string(),
-        event_types::MOUNT_SLEWED => "🔭 Mount slew completed".to_string(),
+        event_types::ROTATOR_MOVE_STARTED => "🧭 Rotator move started".to_string(),
+        event_types::ROTATOR_MOVED => "🧭 Rotator move ended".to_string(),
+        event_types::ROTATOR_MOVED_MECHANICAL => "🧭 Rotator mechanical move ended".to_string(),
+        event_types::MOUNT_SLEW_STARTED => "🔭 Mount slew started".to_string(),
+        event_types::MOUNT_SLEWED => "🔭 Mount slew ended".to_string(),
         event_types::SEQUENCE_STARTING => "▶️ Sequence starting".to_string(),
         event_types::SEQUENCE_FINISHED => "🏁 Sequence ended".to_string(),
         event_types::SEQUENCE_ENTITY_FAILED => "❌ Sequence item failed".to_string(),
@@ -6718,6 +6953,233 @@ mod tests {
         )
     }
 
+    fn message_field<'a>(message: &'a ChatMessage, name: &str) -> Option<&'a str> {
+        message
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.value.as_str())
+    }
+
+    #[tokio::test]
+    async fn motion_edge_messages_use_event_time_positions_and_starts_are_not_durable_state() {
+        let (mut updater, chat_state) = recording_test_updater();
+        updater.state.last_mount_event = Some(event_types::MOUNT_PARKED.to_string());
+
+        let mount_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:00:00Z",
+            "Event": "MOUNT-SLEW-STARTED",
+            "MotionId": 42,
+            "From": {
+                "RAString": "01:15:00",
+                "DecString": "-12:30:00",
+                "Epoch": "J2000",
+                "Altitude": 31.25,
+                "Azimuth": 127.5
+            },
+            "Target": {
+                "RAString": "03:30:00",
+                "DecString": "+22:00:00",
+                "Epoch": "J2000"
+            }
+        }))
+        .unwrap();
+        updater.handle_event(&mount_start).await;
+        assert_eq!(
+            updater.state.last_mount_event.as_deref(),
+            Some(event_types::MOUNT_PARKED),
+            "a transient slew start must not replace durable mount state"
+        );
+
+        let mount_end: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:00:12Z",
+            "Event": "MOUNT-SLEWED",
+            "MotionId": 42,
+            "From": {
+                "RAString": "01:15:00",
+                "DecString": "-12:30:00",
+                "Epoch": "J2000",
+                "Altitude": 31.25,
+                "Azimuth": 127.5
+            },
+            "Target": {
+                "RAString": "03:30:00",
+                "DecString": "+22:00:00",
+                "Epoch": "J2000"
+            },
+            "To": {
+                "RAString": "03:29:59",
+                "DecString": "+21:59:58",
+                "Epoch": "J2000",
+                "Altitude": 52.0,
+                "Azimuth": 201.75
+            },
+            "DurationSeconds": 12.25,
+            "EndDetection": "motion_state"
+        }))
+        .unwrap();
+        updater.handle_event(&mount_end).await;
+
+        let rotator_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:01:00Z",
+            "Event": "ROTATOR-MOVE-STARTED",
+            "MotionId": 43,
+            "Position": 12.5,
+            "MechanicalPosition": 87.5
+        }))
+        .unwrap();
+        updater.handle_event(&rotator_start).await;
+
+        let rotator_end: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:01:02Z",
+            "Event": "ROTATOR-MOVED-MECHANICAL",
+            "MotionId": 43,
+            "From": 87.5,
+            "To": 90.0,
+            "Position": 15.0,
+            "MechanicalFrom": 87.5,
+            "MechanicalTo": 90.0,
+            "DurationSeconds": 2.0,
+            "EndDetection": "nina_moved"
+        }))
+        .unwrap();
+        updater.handle_event(&rotator_end).await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 4);
+
+        let mount_start_message = &deliveries[0].0;
+        assert!(mount_start_message.title.contains("Mount Slew Started"));
+        let start_position = message_field(mount_start_message, "From position").unwrap();
+        assert!(start_position.contains("RA 01:15:00 · Dec -12:30:00 (J2000)"));
+        assert!(start_position.contains("Alt 31.25° · Az 127.50°"));
+        assert!(message_field(mount_start_message, "Start position").is_none());
+        assert!(
+            message_field(mount_start_message, "Requested destination")
+                .unwrap()
+                .contains("RA 03:30:00 · Dec +22:00:00 (J2000)")
+        );
+
+        let mount_end_message = &deliveries[1].0;
+        assert!(mount_end_message.title.contains("Mount Slew Ended"));
+        assert!(!mount_end_message.title.contains("Completed"));
+        assert!(message_field(mount_end_message, "From position").is_some());
+        let end_position = message_field(mount_end_message, "To position").unwrap();
+        assert!(end_position.contains("RA 03:29:59 · Dec +21:59:58 (J2000)"));
+        assert!(end_position.contains("Alt 52.00° · Az 201.75°"));
+        assert!(message_field(mount_end_message, "End position").is_none());
+        assert_eq!(
+            message_field(mount_end_message, "Observed interval"),
+            Some("12.25 s")
+        );
+        assert_eq!(
+            message_field(mount_end_message, "End detected by"),
+            Some("Equipment first reported idle")
+        );
+
+        let rotator_start_message = &deliveries[2].0;
+        assert!(rotator_start_message.title.contains("Rotator move started"));
+        assert_eq!(
+            message_field(rotator_start_message, "From position"),
+            Some("12.50°")
+        );
+        assert_eq!(
+            message_field(rotator_start_message, "Mechanical from"),
+            Some("87.50°")
+        );
+        assert!(message_field(rotator_start_message, "Start position").is_none());
+        assert!(message_field(rotator_start_message, "Start mechanical position").is_none());
+
+        let rotator_end_message = &deliveries[3].0;
+        assert!(
+            rotator_end_message
+                .title
+                .contains("Rotator mechanical move ended")
+        );
+        assert_eq!(
+            message_field(rotator_end_message, "To position"),
+            Some("15.00°")
+        );
+        assert_eq!(
+            message_field(rotator_end_message, "Mechanical from"),
+            Some("87.50°")
+        );
+        assert_eq!(
+            message_field(rotator_end_message, "Mechanical to"),
+            Some("90.00°")
+        );
+        assert!(message_field(rotator_end_message, "End position").is_none());
+        assert!(message_field(rotator_end_message, "Mechanical start").is_none());
+        assert!(message_field(rotator_end_message, "Mechanical end").is_none());
+        assert_eq!(
+            message_field(rotator_end_message, "End detected by"),
+            Some("N.I.N.A. move event")
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_recovered_motion_starts_have_recovered_titles_without_an_interval() {
+        let (mut updater, chat_state) = recording_test_updater();
+
+        let mount_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T02:00:00Z",
+            "Event": "MOUNT-SLEW-STARTED",
+            "MotionId": 51,
+            "From": {
+                "RAString": "05:00:00",
+                "DecString": "+10:00:00",
+                "Epoch": "J2000"
+            },
+            "ObservedInProgress": true
+        }))
+        .unwrap();
+        updater.handle_event(&mount_start).await;
+
+        let rotator_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T02:00:01Z",
+            "Event": "ROTATOR-MOVE-STARTED",
+            "MotionId": 52,
+            "Position": 21.5,
+            "MechanicalPosition": 81.5,
+            "ObservedInProgress": true
+        }))
+        .unwrap();
+        updater.handle_event(&rotator_start).await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 2);
+
+        let mount_message = &deliveries[0].0;
+        assert!(mount_message.title.contains("Mount Slew Recovered"));
+        assert!(!mount_message.title.contains("Mount Slew Started"));
+        assert_eq!(
+            message_field(mount_message, "Capture"),
+            Some("Recovered after motion began")
+        );
+        assert!(message_field(mount_message, "Observed interval").is_none());
+        assert!(message_field(mount_message, "From position").is_some());
+        assert!(message_field(mount_message, "Start position").is_none());
+
+        let rotator_message = &deliveries[1].0;
+        assert!(rotator_message.title.contains("Rotator move recovered"));
+        assert!(!rotator_message.title.contains("Rotator move started"));
+        assert_eq!(
+            message_field(rotator_message, "Capture"),
+            Some("Recovered after motion began")
+        );
+        assert!(message_field(rotator_message, "Observed interval").is_none());
+        assert_eq!(
+            message_field(rotator_message, "From position"),
+            Some("21.50°")
+        );
+        assert_eq!(
+            message_field(rotator_message, "Mechanical from"),
+            Some("81.50°")
+        );
+        assert!(message_field(rotator_message, "Start position").is_none());
+        assert!(message_field(rotator_message, "Start mechanical position").is_none());
+    }
+
     #[tokio::test]
     async fn astronomical_wait_and_plate_solve_have_lifecycle_and_dedup_delivery() {
         let (mut updater, chat_state) = recording_test_updater();
@@ -7266,6 +7728,79 @@ mod tests {
         updater.revoke_state_for_disabled_event(event_types::DOME_DISCONNECTED);
         assert_eq!(updater.state.dome_connected, None);
         assert_eq!(updater.state.dome_shutter_open, Some(false));
+    }
+
+    #[tokio::test]
+    async fn motion_start_tombstones_are_transient_and_legacy_end_tombstones_keep_old_scopes() {
+        let mut updater = state_test_updater();
+        updater.state.last_mount_event = Some(event_types::MOUNT_PARKED.to_string());
+        updater.state.last_filter = Some(FilterInfo {
+            name: "L".to_string(),
+            id: 2,
+        });
+
+        let mount_start_tombstone = Event {
+            time: "2026-08-31T02:00:00Z".to_string(),
+            event: event_types::MOUNT_SLEW_STARTED.to_string(),
+            chat_enabled: false,
+            details: None,
+        };
+        updater.process_baseline_events(std::slice::from_ref(&mount_start_tombstone));
+        assert_eq!(
+            updater.state.last_mount_event.as_deref(),
+            Some(event_types::MOUNT_PARKED)
+        );
+        assert_eq!(
+            updater
+                .state
+                .last_filter
+                .as_ref()
+                .map(|filter| filter.name.as_str()),
+            Some("L")
+        );
+
+        let rotator_start_tombstone = Event {
+            time: "2026-08-31T02:00:01Z".to_string(),
+            event: event_types::ROTATOR_MOVE_STARTED.to_string(),
+            chat_enabled: false,
+            details: None,
+        };
+        updater
+            .process_live_events(vec![rotator_start_tombstone])
+            .await;
+        assert_eq!(
+            updater.state.last_mount_event.as_deref(),
+            Some(event_types::MOUNT_PARKED)
+        );
+        assert_eq!(
+            updater
+                .state
+                .last_filter
+                .as_ref()
+                .map(|filter| filter.name.as_str()),
+            Some("L")
+        );
+
+        updater.state.last_mount_event = Some(event_types::MOUNT_SLEWED.to_string());
+        updater
+            .process_live_events(vec![Event {
+                time: "2026-08-31T02:00:02Z".to_string(),
+                event: event_types::MOUNT_SLEWED.to_string(),
+                chat_enabled: false,
+                details: None,
+            }])
+            .await;
+        assert!(updater.state.last_mount_event.is_none());
+
+        updater
+            .process_live_events(vec![Event {
+                time: "2026-08-31T02:00:03Z".to_string(),
+                event: event_types::ROTATOR_MOVED.to_string(),
+                chat_enabled: false,
+                details: None,
+            }])
+            .await;
+        assert!(updater.state.last_filter.is_none());
     }
 
     #[test]

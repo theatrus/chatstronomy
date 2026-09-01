@@ -44,6 +44,28 @@ horizon, and safety waits; supported long-running Sequencer+ waits include
 condition and manual waits. Private condition expressions and pause reasons
 remain inside N.I.N.A.
 
+Slew and rotator movement diagnostics have independent per-profile event
+switches and start off. N.I.N.A. exposes completion callbacks but no public
+movement-start callbacks, so the plugin watches equipment motion state. When
+both edges are observed, it reports the moving and idle positions, a motion
+correlation ID, and the interval between those observations. An ordinary end
+means N.I.N.A. first reported the device idle; it does not claim that a
+configured settling interval or the operation that requested the move later
+succeeded. Mount diagnostics include a requested target when N.I.N.A. provides
+one and observed RA/Dec. State-observed starts and ends also include altitude
+and azimuth only when **Share observatory location** is enabled; otherwise they
+are removed before either local or Hub transmission. N.I.N.A. does not expose a
+requested rotator target
+at its public start-state boundary. State-observed rotator starts report
+available sky and mechanical angles; a recovered start carries the callback's
+available logical or mechanical `From` angle. If a short move completes between live state observations,
+the plugin recovers a paired start and end from N.I.N.A.'s completion callback,
+labels it **Recovered after motion began**, and omits an interval it could not
+observe. The callback has no start timestamp, so a recovered mount start
+contains callback RA/Dec but no historical altitude or azimuth; its end uses
+the available live idle snapshot and is timestamped by the completion callback.
+Neither recovery record implies success.
+
 Dome/shutter actions and flat-panel cover, light, and brightness changes use a
 dedicated local **Observatory and flat panel** event switch. Connect/disconnect
 state for dome, flat-panel, weather, and switch devices uses **Equipment
