@@ -41,7 +41,11 @@ impl DiscordChatService {
             embed = embed.timestamp(timestamp);
         }
         for field in &message.fields {
-            embed = embed.field(&field.name, &field.value, field.inline);
+            embed = embed.field(
+                &field.name,
+                field.discord_value.as_deref().unwrap_or(&field.value),
+                field.inline,
+            );
         }
         if let Some(footer_text) = &message.footer {
             embed = embed.footer(footer_text, None);
@@ -181,5 +185,34 @@ mod tests {
         );
 
         assert!(embed.image.is_none());
+    }
+
+    #[test]
+    fn embed_prefers_discord_field_value_and_falls_back_to_portable_value() {
+        let occurred_at = chrono::DateTime::parse_from_rfc3339("2026-08-17T04:00:00-07:00")
+            .expect("valid occurrence timestamp")
+            .with_timezone(&chrono::Utc);
+        let message = ChatMessage::new("Timed wait")
+            .field_with_discord_value(
+                "Until",
+                "2026-08-17 11:00:00 UTC",
+                "<t:1786964400:F>",
+                false,
+            )
+            .field("Status", "Waiting", true)
+            .occurred_at("Started", occurred_at);
+
+        let embed = DiscordChatService::build_embed(&message);
+        let fields = embed.fields.expect("embed fields");
+
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "Until");
+        assert_eq!(fields[0].value, "<t:1786964400:F>");
+        assert_eq!(fields[1].name, "Status");
+        assert_eq!(fields[1].value, "Waiting");
+        assert_eq!(
+            embed.timestamp.as_deref(),
+            Some("2026-08-17T11:00:00+00:00")
+        );
     }
 }

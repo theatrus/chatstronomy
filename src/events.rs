@@ -30,6 +30,13 @@ fn default_true() -> bool {
     true
 }
 
+fn de_required_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer)
+}
+
 /// Unit-explicit weather readings copied from N.I.N.A.'s `WeatherDataInfo`.
 /// Every sensor is optional because observing-conditions drivers advertise
 /// different subsets; the plugin omits N.I.N.A.'s `double.NaN` sentinel and
@@ -188,7 +195,7 @@ impl WeatherConditions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 #[non_exhaustive]
 pub enum EventDetails {
     FilterWheelChange {
@@ -268,21 +275,114 @@ pub enum EventDetails {
         #[serde(flatten)]
         conditions: WeatherConditions,
     },
-    /// Rotator moved. Emitted for both ROTATOR-MOVED and
-    /// ROTATOR-MOVED-MECHANICAL — both share `{From, To}` in degrees.
+    /// Rotator movement ended. Emitted for both ROTATOR-MOVED and
+    /// ROTATOR-MOVED-MECHANICAL. Legacy plugins provide only `{From, To}`;
+    /// newer plugins add observed logical/mechanical positions and motion
+    /// correlation metadata.
     RotatorMoved {
-        #[serde(rename = "From")]
-        from: f64,
-        #[serde(rename = "To")]
-        to: f64,
+        #[serde(rename = "From", deserialize_with = "de_optional_finite_f64")]
+        from: Option<f64>,
+        #[serde(rename = "To", deserialize_with = "de_optional_finite_f64")]
+        to: Option<f64>,
+        #[serde(
+            rename = "Position",
+            default,
+            deserialize_with = "de_optional_finite_f64",
+            skip_serializing_if = "Option::is_none"
+        )]
+        position: Option<f64>,
+        #[serde(
+            rename = "MechanicalFrom",
+            default,
+            deserialize_with = "de_optional_finite_f64",
+            skip_serializing_if = "Option::is_none"
+        )]
+        mechanical_from: Option<f64>,
+        #[serde(
+            rename = "MechanicalTo",
+            default,
+            deserialize_with = "de_optional_finite_f64",
+            skip_serializing_if = "Option::is_none"
+        )]
+        mechanical_to: Option<f64>,
+        #[serde(
+            rename = "MechanicalPosition",
+            default,
+            deserialize_with = "de_optional_finite_f64",
+            skip_serializing_if = "Option::is_none"
+        )]
+        mechanical_position: Option<f64>,
+        #[serde(rename = "MotionId", default, skip_serializing_if = "Option::is_none")]
+        motion_id: Option<i64>,
+        #[serde(
+            rename = "DurationSeconds",
+            default,
+            deserialize_with = "de_optional_finite_f64",
+            skip_serializing_if = "Option::is_none"
+        )]
+        duration_seconds: Option<f64>,
+        #[serde(
+            rename = "EndDetection",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        end_detection: Option<String>,
+        #[serde(
+            rename = "ObservedInProgress",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        observed_in_progress: Option<bool>,
     },
-    /// A completed telescope slew. Coordinates are deliberately kept in a
-    /// compact wire type instead of serializing N.I.N.A. objects.
+    /// A telescope slew start inferred from `TelescopeInfo.Slewing` changing
+    /// to true. `From` is the first observed moving position. A callback-only
+    /// recovery instead carries N.I.N.A.'s pre-command coordinate and sets
+    /// `ObservedInProgress`. `Target`, when exposed, is the requested destination.
+    MountSlewStarted {
+        #[serde(rename = "From")]
+        from: EventCoordinates,
+        #[serde(rename = "Target", default, skip_serializing_if = "Option::is_none")]
+        target: Option<EventCoordinates>,
+        #[serde(rename = "MotionId", default, skip_serializing_if = "Option::is_none")]
+        motion_id: Option<i64>,
+        #[serde(
+            rename = "ObservedInProgress",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        observed_in_progress: Option<bool>,
+    },
+    /// A telescope slew was first observed idle. This does not promise that
+    /// N.I.N.A.'s configured settling interval or a later operation succeeded.
+    /// Legacy payloads contain only `From` and `To`.
     MountSlewed {
         #[serde(rename = "From")]
         from: EventCoordinates,
         #[serde(rename = "To")]
         to: EventCoordinates,
+        #[serde(rename = "Target", default, skip_serializing_if = "Option::is_none")]
+        target: Option<EventCoordinates>,
+        #[serde(rename = "MotionId", default, skip_serializing_if = "Option::is_none")]
+        motion_id: Option<i64>,
+        #[serde(
+            rename = "DurationSeconds",
+            default,
+            deserialize_with = "de_optional_finite_f64",
+            skip_serializing_if = "Option::is_none"
+        )]
+        duration_seconds: Option<f64>,
+        #[serde(
+            rename = "EndDetection",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        end_detection: Option<String>,
+        #[serde(
+            rename = "ObservedInProgress",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        observed_in_progress: Option<bool>,
     },
     /// A completed dome azimuth slew, in degrees.
     DomeSlewed {
@@ -354,6 +454,37 @@ pub enum EventDetails {
         #[serde(rename = "Message")]
         message: String,
     },
+    /// A rotator motion edge inferred from N.I.N.A.'s mutable equipment
+    /// state. N.I.N.A. does not expose a public "move started" callback, so
+    /// neither logical nor mechanical intent can be classified at this edge.
+    /// `MotionId` is required only by this standalone untagged deserializer to
+    /// keep the arm from greedily accepting unrelated event-detail objects;
+    /// the name-aware `Event` decoder remains tolerant of older payloads that
+    /// omit it.
+    RotatorMoveStarted {
+        #[serde(
+            rename = "Position",
+            default,
+            deserialize_with = "de_optional_finite_f64",
+            skip_serializing_if = "Option::is_none"
+        )]
+        position: Option<f64>,
+        #[serde(
+            rename = "MechanicalPosition",
+            default,
+            deserialize_with = "de_optional_finite_f64",
+            skip_serializing_if = "Option::is_none"
+        )]
+        mechanical_position: Option<f64>,
+        #[serde(rename = "MotionId", deserialize_with = "de_required_optional_i64")]
+        motion_id: Option<i64>,
+        #[serde(
+            rename = "ObservedInProgress",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        observed_in_progress: Option<bool>,
+    },
     /// Fields from an event name this version does not understand. Keeping
     /// them round-trippable makes mixed-version Hub connections tolerant
     /// without guessing a typed shape from coincidentally matching keys.
@@ -382,34 +513,61 @@ pub struct EventCoordinates {
 }
 
 impl EventCoordinates {
-    pub fn display(&self) -> String {
-        if self.altitude.is_some() || self.azimuth.is_some() {
-            return format!(
-                "Alt {} · Az {}",
-                self.altitude
-                    .map(|value| format!("{value:.2}°"))
-                    .unwrap_or_else(|| "--".to_string()),
-                self.azimuth
-                    .map(|value| format!("{value:.2}°"))
-                    .unwrap_or_else(|| "--".to_string())
-            );
+    pub fn equatorial_display(&self) -> Option<String> {
+        let has_equatorial = self.ra_string.is_some()
+            || self.ra.is_some()
+            || self.ra_degrees.is_some()
+            || self.dec_string.is_some()
+            || self.dec.is_some()
+            || self.epoch.is_some();
+        if !has_equatorial {
+            return None;
         }
 
         let ra = self
             .ra_string
-            .clone()
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
             .or_else(|| self.ra.map(|value| format!("{value:.5} h")))
             .or_else(|| self.ra_degrees.map(|value| format!("{value:.5}°")))
             .unwrap_or_else(|| "--".to_string());
         let dec = self
             .dec_string
-            .clone()
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
             .or_else(|| self.dec.map(|value| format!("{value:.5}°")))
             .unwrap_or_else(|| "--".to_string());
-        match self.epoch.as_deref() {
+        Some(match self.epoch.as_deref().map(str::trim) {
             Some(epoch) if !epoch.is_empty() => format!("RA {ra} · Dec {dec} ({epoch})"),
             _ => format!("RA {ra} · Dec {dec}"),
+        })
+    }
+
+    pub fn horizontal_display(&self) -> Option<String> {
+        if self.altitude.is_none() && self.azimuth.is_none() {
+            return None;
         }
+        Some(format!(
+            "Alt {} · Az {}",
+            self.altitude
+                .map(|value| format!("{value:.2}°"))
+                .unwrap_or_else(|| "--".to_string()),
+            self.azimuth
+                .map(|value| format!("{value:.2}°"))
+                .unwrap_or_else(|| "--".to_string())
+        ))
+    }
+
+    pub fn display(&self) -> String {
+        [self.equatorial_display(), self.horizontal_display()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -503,11 +661,69 @@ struct WeatherHighWindWire {
     #[serde(default, deserialize_with = "de_optional_finite_f64")]
     wind_gust_meters_per_second: Option<f64>,
 }
-wire_details!(NumericMoveWire { from: f64, to: f64 });
-wire_details!(MountSlewedWire {
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RotatorMoveStartedWire {
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    position: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    mechanical_position: Option<f64>,
+    #[serde(default)]
+    motion_id: Option<i64>,
+    #[serde(default)]
+    observed_in_progress: Option<bool>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RotatorMovedWire {
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    from: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    to: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    position: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    mechanical_from: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    mechanical_to: Option<f64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    mechanical_position: Option<f64>,
+    #[serde(default)]
+    motion_id: Option<i64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    duration_seconds: Option<f64>,
+    #[serde(default)]
+    end_detection: Option<String>,
+    #[serde(default)]
+    observed_in_progress: Option<bool>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MountSlewStartedWire {
     from: EventCoordinates,
-    to: EventCoordinates
-});
+    #[serde(default)]
+    target: Option<EventCoordinates>,
+    #[serde(default)]
+    motion_id: Option<i64>,
+    #[serde(default)]
+    observed_in_progress: Option<bool>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MountSlewedWire {
+    from: EventCoordinates,
+    to: EventCoordinates,
+    #[serde(default)]
+    target: Option<EventCoordinates>,
+    #[serde(default)]
+    motion_id: Option<i64>,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    duration_seconds: Option<f64>,
+    #[serde(default)]
+    end_detection: Option<String>,
+    #[serde(default)]
+    observed_in_progress: Option<bool>,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct DomeSlewedWire {
@@ -566,7 +782,67 @@ fn unknown_details(fields: Map<String, Value>) -> Option<EventDetails> {
     (!fields.is_empty()).then_some(EventDetails::Unknown(fields))
 }
 
+fn decode_motion_event_details(event: &str, fields: &Map<String, Value>) -> Option<EventDetails> {
+    match event {
+        event_types::ROTATOR_MOVE_STARTED => {
+            decode_wire::<RotatorMoveStartedWire>(fields).map(|wire| {
+                EventDetails::RotatorMoveStarted {
+                    position: wire.position,
+                    mechanical_position: wire.mechanical_position,
+                    motion_id: wire.motion_id,
+                    observed_in_progress: wire.observed_in_progress,
+                }
+            })
+        }
+        event_types::ROTATOR_MOVED | event_types::ROTATOR_MOVED_MECHANICAL => {
+            decode_wire::<RotatorMovedWire>(fields).map(|wire| EventDetails::RotatorMoved {
+                from: wire.from,
+                to: wire.to,
+                position: wire.position,
+                mechanical_from: wire.mechanical_from,
+                mechanical_to: wire.mechanical_to,
+                mechanical_position: wire.mechanical_position,
+                motion_id: wire.motion_id,
+                duration_seconds: wire.duration_seconds.filter(|value| *value >= 0.0),
+                end_detection: wire.end_detection,
+                observed_in_progress: wire.observed_in_progress,
+            })
+        }
+        event_types::MOUNT_SLEW_STARTED => {
+            decode_wire::<MountSlewStartedWire>(fields).map(|wire| EventDetails::MountSlewStarted {
+                from: wire.from,
+                target: wire.target,
+                motion_id: wire.motion_id,
+                observed_in_progress: wire.observed_in_progress,
+            })
+        }
+        event_types::MOUNT_SLEWED => {
+            decode_wire::<MountSlewedWire>(fields).map(|wire| EventDetails::MountSlewed {
+                from: wire.from,
+                to: wire.to,
+                target: wire.target,
+                motion_id: wire.motion_id,
+                duration_seconds: wire.duration_seconds.filter(|value| *value >= 0.0),
+                end_detection: wire.end_detection,
+                observed_in_progress: wire.observed_in_progress,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn decode_event_details(event: &str, fields: Map<String, Value>) -> Option<EventDetails> {
+    if matches!(
+        event,
+        event_types::ROTATOR_MOVE_STARTED
+            | event_types::ROTATOR_MOVED
+            | event_types::ROTATOR_MOVED_MECHANICAL
+            | event_types::MOUNT_SLEW_STARTED
+            | event_types::MOUNT_SLEWED
+    ) {
+        return decode_motion_event_details(event, &fields).or_else(|| unknown_details(fields));
+    }
+
     let details = match event {
         event_types::FILTERWHEEL_CHANGED => {
             decode_wire::<FilterWheelChangeWire>(&fields).map(|wire| {
@@ -640,18 +916,6 @@ fn decode_event_details(event: &str, fields: Map<String, Value>) -> Option<Event
                             .filter(|value| (0.0..=1_000.0).contains(value)),
                         conditions,
                     })
-            })
-        }
-        event_types::ROTATOR_MOVED | event_types::ROTATOR_MOVED_MECHANICAL => {
-            decode_wire::<NumericMoveWire>(&fields).map(|wire| EventDetails::RotatorMoved {
-                from: wire.from,
-                to: wire.to,
-            })
-        }
-        event_types::MOUNT_SLEWED => {
-            decode_wire::<MountSlewedWire>(&fields).map(|wire| EventDetails::MountSlewed {
-                from: wire.from,
-                to: wire.to,
             })
         }
         event_types::DOME_SLEWED => {
@@ -816,12 +1080,14 @@ pub mod event_types {
     pub const MOUNT_AFTER_FLIP: &str = "MOUNT-AFTER-FLIP";
     pub const MOUNT_HOMED: &str = "MOUNT-HOMED";
     pub const MOUNT_CENTER: &str = "MOUNT-CENTER";
+    pub const MOUNT_SLEW_STARTED: &str = "MOUNT-SLEW-STARTED";
     pub const MOUNT_SLEWED: &str = "MOUNT-SLEWED";
     pub const FOCUSER_DISCONNECTED: &str = "FOCUSER-DISCONNECTED";
     pub const FOCUSER_CONNECTED: &str = "FOCUSER-CONNECTED";
     pub const FOCUSER_USER_FOCUSED: &str = "FOCUSER-USER-FOCUSED";
     pub const ROTATOR_DISCONNECTED: &str = "ROTATOR-DISCONNECTED";
     pub const ROTATOR_CONNECTED: &str = "ROTATOR-CONNECTED";
+    pub const ROTATOR_MOVE_STARTED: &str = "ROTATOR-MOVE-STARTED";
     pub const ROTATOR_MOVED: &str = "ROTATOR-MOVED";
     pub const ROTATOR_MOVED_MECHANICAL: &str = "ROTATOR-MOVED-MECHANICAL";
     pub const ROTATOR_SYNCED: &str = "ROTATOR-SYNCED";
@@ -883,12 +1149,14 @@ pub(crate) enum EventDeliveryScope {
     Autofocus,
     Guiding,
     Mount,
+    SlewMotion,
     Sequence,
     Safety,
     WeatherChanges,
     HighWindAlerts,
     TargetScheduler,
     FilterFocuserRotator,
+    RotatorMotion,
     EquipmentConnections,
     Observatory,
     CommandFailures,
@@ -936,6 +1204,12 @@ pub(crate) fn event_delivery_scope(event: &str) -> EventDeliveryScope {
     }
     if event.starts_with("GUIDER-") {
         return EventDeliveryScope::Guiding;
+    }
+    if event == event_types::MOUNT_SLEW_STARTED {
+        return EventDeliveryScope::SlewMotion;
+    }
+    if event == event_types::ROTATOR_MOVE_STARTED {
+        return EventDeliveryScope::RotatorMotion;
     }
     if event.starts_with("MOUNT-") || event == event_types::ERROR_PLATESOLVE {
         return EventDeliveryScope::Mount;
@@ -1522,9 +1796,9 @@ mod tests {
         let event: Event = serde_json::from_str(event_json).unwrap();
         assert_eq!(event.event, event_types::ROTATOR_MOVED);
         match event.details {
-            Some(EventDetails::RotatorMoved { from, to }) => {
-                assert_eq!(from, 0.0);
-                assert!((to - 104.04).abs() < 1e-6);
+            Some(EventDetails::RotatorMoved { from, to, .. }) => {
+                assert_eq!(from, Some(0.0));
+                assert!((to.unwrap() - 104.04).abs() < 1e-6);
             }
             other => panic!("expected RotatorMoved, got {other:?}"),
         }
@@ -1578,8 +1852,9 @@ mod tests {
         assert!(matches!(
             rotator.details,
             Some(EventDetails::RotatorMoved {
-                from: 12.0,
-                to: 15.5
+                from: Some(12.0),
+                to: Some(15.5),
+                ..
             })
         ));
 
@@ -1606,12 +1881,253 @@ mod tests {
         }))
         .unwrap();
         match mount.details {
-            Some(EventDetails::MountSlewed { from, to }) => {
+            Some(EventDetails::MountSlewed { from, to, .. }) => {
                 assert_eq!(from.ra, Some(1.0));
                 assert_eq!(to.dec, Some(4.0));
             }
             details => panic!("mount slew was not typed correctly: {details:?}"),
         }
+    }
+
+    #[test]
+    fn motion_edges_decode_additive_diagnostics_and_nullable_rotator_positions() {
+        let mount_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:00:00Z",
+            "Event": "MOUNT-SLEW-STARTED",
+            "MotionId": 42,
+            "From": {
+                "RA": 1.25,
+                "RAString": "01:15:00",
+                "Dec": -12.5,
+                "DecString": "-12:30:00",
+                "Epoch": "J2000",
+                "Altitude": 31.25,
+                "Azimuth": 127.5
+            },
+            "Target": {
+                "RA": 3.5,
+                "Dec": 22.0,
+                "Epoch": "J2000"
+            }
+        }))
+        .unwrap();
+        match mount_start.details {
+            Some(EventDetails::MountSlewStarted {
+                from,
+                target,
+                motion_id,
+                observed_in_progress,
+            }) => {
+                assert_eq!(motion_id, Some(42));
+                assert_eq!(observed_in_progress, None);
+                assert_eq!(from.altitude, Some(31.25));
+                let rendered = from.display();
+                assert!(rendered.contains("RA 01:15:00 · Dec -12:30:00 (J2000)"));
+                assert!(rendered.contains("Alt 31.25° · Az 127.50°"));
+                assert_eq!(target.and_then(|coordinates| coordinates.ra), Some(3.5));
+            }
+            details => panic!("mount start was not typed correctly: {details:?}"),
+        }
+
+        let mount_end: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:00:12Z",
+            "Event": "MOUNT-SLEWED",
+            "MotionId": 42,
+            "From": { "RA": 1.25, "Dec": -12.5, "Altitude": 31.25, "Azimuth": 127.5 },
+            "Target": { "RA": 3.5, "Dec": 22.0, "Epoch": "J2000" },
+            "To": { "RA": 3.49, "Dec": 21.98, "Altitude": 52.0, "Azimuth": 201.75 },
+            "DurationSeconds": 12.25,
+            "EndDetection": "motion_state",
+            "FutureDiagnostic": { "mode": "future" }
+        }))
+        .unwrap();
+        match mount_end.details {
+            Some(EventDetails::MountSlewed {
+                target,
+                to,
+                motion_id,
+                duration_seconds,
+                end_detection,
+                ..
+            }) => {
+                assert_eq!(motion_id, Some(42));
+                assert_eq!(duration_seconds, Some(12.25));
+                assert_eq!(end_detection.as_deref(), Some("motion_state"));
+                assert_eq!(target.and_then(|coordinates| coordinates.dec), Some(22.0));
+                assert_eq!(to.azimuth, Some(201.75));
+            }
+            details => panic!("mount end was not typed correctly: {details:?}"),
+        }
+
+        let rotator_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:01:00Z",
+            "Event": "ROTATOR-MOVE-STARTED",
+            "MotionId": 43,
+            "Position": null,
+            "MechanicalPosition": 87.5
+        }))
+        .unwrap();
+        assert!(matches!(
+            rotator_start.details,
+            Some(EventDetails::RotatorMoveStarted {
+                position: None,
+                mechanical_position: Some(87.5),
+                motion_id: Some(43),
+                ..
+            })
+        ));
+
+        let rotator_end: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:01:02Z",
+            "Event": "ROTATOR-MOVED-MECHANICAL",
+            "MotionId": 43,
+            "From": null,
+            "To": 90.0,
+            "Position": 12.5,
+            "MechanicalFrom": 87.5,
+            "MechanicalTo": 90.0,
+            "DurationSeconds": 2.0,
+            "EndDetection": "nina_moved"
+        }))
+        .unwrap();
+        assert!(matches!(
+            rotator_end.details,
+            Some(EventDetails::RotatorMoved {
+                from: None,
+                to: Some(90.0),
+                position: Some(12.5),
+                mechanical_from: Some(87.5),
+                mechanical_to: Some(90.0),
+                duration_seconds: Some(2.0),
+                ..
+            })
+        ));
+
+        let blank_strings = EventCoordinates {
+            ra: Some(1.5),
+            ra_degrees: None,
+            ra_string: Some("   ".to_string()),
+            dec: Some(-2.25),
+            dec_string: Some(String::new()),
+            epoch: Some("  ".to_string()),
+            altitude: None,
+            azimuth: None,
+        };
+        assert_eq!(blank_strings.display(), "RA 1.50000 h · Dec -2.25000°");
+    }
+
+    #[test]
+    fn event_details_roundtrips_do_not_hit_the_optional_motion_start_arm() {
+        fn roundtrip(details: EventDetails) -> EventDetails {
+            serde_json::from_value(serde_json::to_value(details).unwrap()).unwrap()
+        }
+
+        let mount_details = EventDetails::MountSlewed {
+            from: EventCoordinates {
+                ra: Some(1.0),
+                ra_degrees: None,
+                ra_string: None,
+                dec: Some(2.0),
+                dec_string: None,
+                epoch: None,
+                altitude: None,
+                azimuth: None,
+            },
+            to: EventCoordinates {
+                ra: Some(3.0),
+                ra_degrees: None,
+                ra_string: None,
+                dec: Some(4.0),
+                dec_string: None,
+                epoch: None,
+                altitude: None,
+                azimuth: None,
+            },
+            target: None,
+            motion_id: Some(44),
+            duration_seconds: Some(1.0),
+            end_detection: Some("motion_state".to_string()),
+            observed_in_progress: None,
+        };
+        let decoded = roundtrip(mount_details);
+        assert!(matches!(decoded, EventDetails::MountSlewed { .. }));
+
+        let legacy_rotator_details = EventDetails::RotatorMoved {
+            from: Some(12.0),
+            to: Some(15.5),
+            position: None,
+            mechanical_from: None,
+            mechanical_to: None,
+            mechanical_position: None,
+            motion_id: None,
+            duration_seconds: None,
+            end_detection: None,
+            observed_in_progress: None,
+        };
+        let decoded = roundtrip(legacy_rotator_details);
+        assert!(matches!(
+            decoded,
+            EventDetails::RotatorMoved {
+                from: Some(12.0),
+                to: Some(15.5),
+                ..
+            }
+        ));
+
+        let nullable_rotator_details = EventDetails::RotatorMoved {
+            from: None,
+            to: Some(90.0),
+            position: Some(12.5),
+            mechanical_from: Some(87.5),
+            mechanical_to: Some(90.0),
+            mechanical_position: None,
+            motion_id: Some(45),
+            duration_seconds: Some(2.0),
+            end_detection: Some("nina_moved".to_string()),
+            observed_in_progress: None,
+        };
+        let decoded = roundtrip(nullable_rotator_details);
+        assert!(matches!(
+            decoded,
+            EventDetails::RotatorMoved {
+                from: None,
+                to: Some(90.0),
+                position: Some(12.5),
+                ..
+            }
+        ));
+
+        let rotator_start_details = EventDetails::RotatorMoveStarted {
+            position: Some(12.0),
+            mechanical_position: Some(87.0),
+            motion_id: Some(45),
+            observed_in_progress: None,
+        };
+        let decoded = roundtrip(rotator_start_details);
+        assert!(matches!(decoded, EventDetails::RotatorMoveStarted { .. }));
+
+        let start_without_id = EventDetails::RotatorMoveStarted {
+            position: None,
+            mechanical_position: Some(87.0),
+            motion_id: None,
+            observed_in_progress: Some(true),
+        };
+        let decoded = roundtrip(start_without_id);
+        assert!(matches!(
+            decoded,
+            EventDetails::RotatorMoveStarted {
+                motion_id: None,
+                observed_in_progress: Some(true),
+                ..
+            }
+        ));
+
+        let command_failure = EventDetails::CommandFailed {
+            command: "Start sequence".to_string(),
+            error: "Rejected".to_string(),
+        };
+        let decoded = roundtrip(command_failure);
+        assert!(matches!(decoded, EventDetails::CommandFailed { .. }));
     }
 
     #[test]
@@ -1720,6 +2236,24 @@ mod tests {
 
     #[test]
     fn scopes_separate_observatory_connections_and_failures() {
+        assert_eq!(
+            event_delivery_scope(event_types::MOUNT_SLEW_STARTED),
+            EventDeliveryScope::SlewMotion
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::ROTATOR_MOVE_STARTED),
+            EventDeliveryScope::RotatorMotion
+        );
+        // Existing completion names retain their payload-v3 scopes so an old
+        // category tombstone still revokes legacy buffered state.
+        assert_eq!(
+            event_delivery_scope(event_types::MOUNT_SLEWED),
+            EventDeliveryScope::Mount
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::ROTATOR_MOVED),
+            EventDeliveryScope::FilterFocuserRotator
+        );
         assert_eq!(
             event_delivery_scope(event_types::DOME_SLEWED),
             EventDeliveryScope::Observatory

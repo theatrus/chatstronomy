@@ -94,6 +94,106 @@ fn format_duration(duration: chrono::Duration) -> String {
     }
 }
 
+fn format_utc_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+fn add_wait_endpoint_field(message: ChatMessage, label: &str, end: DateTime<Utc>) -> ChatMessage {
+    let until = format_utc_timestamp(end);
+    let discord_until = format!("<t:{}:F>", end.timestamp());
+    message.field_with_discord_value(label, &until, &discord_until, false)
+}
+
+/// Add one scheduled endpoint in a form each chat adapter can render well.
+/// Discord receives native timestamp markup, so its relative value counts down
+/// in the client without polling or editing a message. Matrix receives only
+/// canonical UTC text and a remaining-duration snapshot.
+fn add_wait_timing_fields(
+    message: ChatMessage,
+    end: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> ChatMessage {
+    let (countdown, discord_countdown) = if end > now {
+        (
+            format!(
+                "{} remaining",
+                format_duration(end.signed_duration_since(now))
+            ),
+            format!("<t:{}:R>", end.timestamp()),
+        )
+    } else {
+        (
+            "Scheduled time reached".to_string(),
+            "Scheduled time reached".to_string(),
+        )
+    };
+    add_wait_endpoint_field(message, "Until", end).field_with_discord_value(
+        "Countdown",
+        &countdown,
+        &discord_countdown,
+        true,
+    )
+}
+
+#[cfg(test)]
+mod wait_timing_tests {
+    use super::*;
+
+    #[test]
+    fn wait_fields_normalize_offsets_and_include_a_discord_live_countdown() {
+        let started = DateTime::parse_from_rfc3339("2026-09-02T01:55:00.6436653+00:00")
+            .expect("valid start")
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2026-09-01T21:25:51.5404816-05:00")
+            .expect("valid end")
+            .with_timezone(&Utc);
+
+        let message = add_wait_timing_fields(ChatMessage::new("Wait"), end, started);
+        let until = message
+            .fields
+            .iter()
+            .find(|field| field.name == "Until")
+            .expect("Until field");
+        let countdown = message
+            .fields
+            .iter()
+            .find(|field| field.name == "Countdown")
+            .expect("Countdown field");
+
+        assert_eq!(until.value, "2026-09-02 02:25:51 UTC");
+        assert_eq!(
+            until.discord_value.as_deref(),
+            Some(format!("<t:{}:F>", end.timestamp()).as_str())
+        );
+        assert_eq!(countdown.value, "30m 50s remaining");
+        assert_eq!(
+            countdown.discord_value.as_deref(),
+            Some(format!("<t:{}:R>", end.timestamp()).as_str())
+        );
+    }
+
+    #[test]
+    fn elapsed_wait_is_described_truthfully() {
+        let end = DateTime::parse_from_rfc3339("2026-09-02T02:25:51Z")
+            .expect("valid end")
+            .with_timezone(&Utc);
+        let now = end + chrono::Duration::seconds(1);
+        let message = add_wait_timing_fields(ChatMessage::new("Wait"), end, now);
+        let countdown = message
+            .fields
+            .iter()
+            .find(|field| field.name == "Countdown")
+            .expect("Countdown field");
+
+        assert_eq!(countdown.value, "Scheduled time reached");
+        assert_eq!(
+            countdown.discord_value.as_deref(),
+            Some("Scheduled time reached")
+        );
+        assert!(!countdown.value.to_ascii_lowercase().contains("success"));
+    }
+}
+
 /// Information about the current observation target
 #[derive(Debug, Clone)]
 struct TargetInfo {
@@ -271,10 +371,6 @@ struct TrackedSequenceOperation {
     operation: SequenceOperation,
     started_at: DateTime<Utc>,
     estimated_end: Option<DateTime<Utc>>,
-    /// True only when `estimated_end` came from TS-WAITSTART rather than the
-    /// sequence item itself. A Target Scheduler privacy tombstone can then
-    /// revoke that projection without erasing intrinsic wait configuration.
-    estimated_end_from_target_scheduler: bool,
     initial_temperature: Option<f64>,
     camera: Option<CameraInfo>,
     last_milestone: u8,
@@ -305,7 +401,6 @@ impl TrackedSequenceOperation {
             operation,
             started_at: now,
             estimated_end,
-            estimated_end_from_target_scheduler: false,
             initial_temperature,
             camera,
             last_milestone: 0,
@@ -325,7 +420,6 @@ impl TrackedSequenceOperation {
             } => Some(self.started_at + *duration),
             _ => None,
         };
-        self.estimated_end_from_target_scheduler = false;
     }
 
     fn progress_percent(&self, now: DateTime<Utc>) -> Option<u8> {
@@ -593,6 +687,11 @@ fn claim_plate_solve_output(
 /// it is still visible in the source history.
 const SEEN_SET_CAPACITY: usize = 20_000;
 
+#[derive(Debug, Clone, Copy)]
+struct SchedulerWaitState {
+    end_at: DateTime<Utc>,
+}
+
 /// State management for the chat updater
 struct UpdaterState {
     /// Per-updater keyed hasher for dedup identities. History keys must never
@@ -622,8 +721,13 @@ struct UpdaterState {
     /// subsequent sequence start so a normal finish is never called success.
     sequence_failure: Option<SequenceFailureInfo>,
     sequence_outcome: Option<String>,
-    /// Active TS-WAITSTART wait-end time, if NINA is currently waiting.
-    wait_until: Option<DateTime<FixedOffset>>,
+    /// Latest Target Scheduler wait plan, normalized to UTC. Its endpoint is
+    /// an estimate, not a completion signal, and is independent from N.I.N.A.
+    /// sequence `WaitForTime` operations.
+    scheduler_wait: Option<SchedulerWaitState>,
+    /// Newest wait or terminal transition applied to scheduler state. This
+    /// prevents delayed history from resurrecting or replacing newer state.
+    scheduler_wait_latest_at: Option<DateTime<Utc>>,
     safety_state: SafetyState,
     dome_connected: Option<bool>,
     dome_shutter_open: Option<bool>,
@@ -685,7 +789,8 @@ impl UpdaterState {
             sequence_running: false,
             sequence_failure: None,
             sequence_outcome: None,
-            wait_until: None,
+            scheduler_wait: None,
+            scheduler_wait_latest_at: None,
             safety_state: SafetyState::Unknown,
             dome_connected: None,
             dome_shutter_open: None,
@@ -713,6 +818,80 @@ impl UpdaterState {
         }
     }
 
+    fn scheduler_wait_end(&self) -> Option<DateTime<Utc>> {
+        self.scheduler_wait.map(|wait| wait.end_at)
+    }
+
+    fn record_scheduler_wait(&mut self, event: &Event) -> bool {
+        let occurred_at =
+            parse_nina_timestamp(&event.time).map(|timestamp| timestamp.with_timezone(&Utc));
+        if !self.accept_scheduler_transition(occurred_at) {
+            return false;
+        }
+
+        // A new wait announcement supersedes the prior plan even when this
+        // legacy payload cannot provide a usable endpoint.
+        self.scheduler_wait = None;
+        let Some(EventDetails::WaitStart { wait_end_time }) = event.details.as_ref() else {
+            return true;
+        };
+        let Some(end_at) = parse_nina_timestamp_with_context(wait_end_time, Some(&event.time))
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+        else {
+            return true;
+        };
+        self.scheduler_wait = Some(SchedulerWaitState { end_at });
+        true
+    }
+
+    fn clear_scheduler_waits(&mut self) {
+        self.scheduler_wait = None;
+    }
+
+    fn clear_scheduler_waits_for_privacy(&mut self, event_time: &str) {
+        // A local privacy revocation is authoritative even if a legacy peer's
+        // timestamp is malformed. Keep or advance the ordering watermark so
+        // delayed enabled history cannot reconstruct the redacted wait.
+        self.scheduler_wait = None;
+        if let Some(candidate) =
+            parse_nina_timestamp(event_time).map(|timestamp| timestamp.with_timezone(&Utc))
+            && self
+                .scheduler_wait_latest_at
+                .is_none_or(|current| candidate > current)
+        {
+            self.scheduler_wait_latest_at = Some(candidate);
+        }
+    }
+
+    fn clear_scheduler_waits_at(&mut self, event_time: &str) {
+        let occurred_at =
+            parse_nina_timestamp(event_time).map(|timestamp| timestamp.with_timezone(&Utc));
+        if occurred_at.is_none() {
+            // The terminal event type is still authoritative. Preserve the
+            // known watermark, but do not leave a possibly completed wait
+            // visible merely because a legacy timestamp was malformed.
+            self.scheduler_wait = None;
+            return;
+        }
+        if self.accept_scheduler_transition(occurred_at) {
+            self.scheduler_wait = None;
+        }
+    }
+
+    fn accept_scheduler_transition(&mut self, occurred_at: Option<DateTime<Utc>>) -> bool {
+        match (self.scheduler_wait_latest_at, occurred_at) {
+            (Some(current), Some(candidate)) if candidate < current => false,
+            // An unparseable occurrence must not displace state whose ordering
+            // is known. Legacy-to-legacy evidence remains arrival ordered.
+            (Some(_), None) => false,
+            (_, Some(candidate)) => {
+                self.scheduler_wait_latest_at = Some(candidate);
+                true
+            }
+            (None, None) => true,
+        }
+    }
+
     /// Fingerprint of the state that should drive a live-status edit.
     /// Deliberately excludes the live mount RA/Dec — those drift every
     /// cycle during tracking and would force constant edits. We only
@@ -731,14 +910,18 @@ impl UpdaterState {
             .unwrap_or("");
         let mount = self.last_mount_event.as_deref().unwrap_or("");
         let guider = self.last_guider_event.as_deref().unwrap_or("");
-        let wait_minutes = self
-            .wait_until
-            .map(|end| {
-                end.with_timezone(&Utc)
-                    .signed_duration_since(Utc::now())
-                    .num_minutes()
-            })
-            .unwrap_or(-1);
+        let now = Utc::now();
+        let scheduler_wait = self.scheduler_wait_end().map_or_else(
+            || "none".to_string(),
+            |end| {
+                let remaining = end.signed_duration_since(now);
+                if remaining > chrono::Duration::zero() {
+                    format!("pending:{}", remaining.num_minutes())
+                } else {
+                    "scheduled-time-reached".to_string()
+                }
+            },
+        );
         let mut operations = self
             .sequence_operations
             .iter()
@@ -835,7 +1018,7 @@ impl UpdaterState {
             .as_ref()
             .map_or("", |failure| failure.error.as_str());
         format!(
-            "t={target}|te={target_end}|f={filter}|m={mount}|g={guider}|w={wait_minutes}|sr={}|sf={failure}|so={:?}|safe={:?}|dc={:?}|dso={:?}|daz={:?}|dp={:?}|dh={:?}|fc={:?}|fcs={:?}|fl={:?}|fb={:?}|wc={:?}|wx={:?}|wh={:?}|whx={:?}|wht={:?}|sw={:?}|flip={flip_minutes}|ops={}",
+            "t={target}|te={target_end}|f={filter}|m={mount}|g={guider}|w={scheduler_wait}|sr={}|sf={failure}|so={:?}|safe={:?}|dc={:?}|dso={:?}|daz={:?}|dp={:?}|dh={:?}|fc={:?}|fcs={:?}|fl={:?}|fb={:?}|wc={:?}|wx={:?}|wh={:?}|whx={:?}|wht={:?}|sw={:?}|flip={flip_minutes}|ops={}",
             self.sequence_running,
             self.sequence_outcome,
             self.safety_state,
@@ -1315,9 +1498,7 @@ impl ChatUpdater {
                 break;
             }
         }
-        let event_wait_end = self.state.wait_until.map(|end| end.with_timezone(&Utc));
         let mut notifications = Vec::new();
-        let mut sequence_wait_ended = false;
 
         let existing_keys = self
             .state
@@ -1327,12 +1508,7 @@ impl ChatUpdater {
             .collect::<Vec<_>>();
         for key in existing_keys {
             if suppressed_operation_keys.contains(&key) {
-                if let Some(previous) = self.state.sequence_operations.remove(&key) {
-                    sequence_wait_ended |= matches!(
-                        previous.operation.kind,
-                        SequenceOperationKind::TimeWait { .. }
-                    );
-                }
+                self.state.sequence_operations.remove(&key);
                 continue;
             }
             let Some(next) = incoming.get(&key) else {
@@ -1344,10 +1520,6 @@ impl ChatUpdater {
                     ) {
                         previous.camera = camera.clone();
                     }
-                    sequence_wait_ended |= matches!(
-                        previous.operation.kind,
-                        SequenceOperationKind::TimeWait { .. }
-                    );
                     notifications.push((
                         previous,
                         OperationUpdate::Ended {
@@ -1375,10 +1547,6 @@ impl ChatUpdater {
                     ) {
                         previous.camera = camera.clone();
                     }
-                    sequence_wait_ended |= matches!(
-                        previous.operation.kind,
-                        SequenceOperationKind::TimeWait { .. }
-                    );
                     notifications.push((
                         previous,
                         OperationUpdate::Ended {
@@ -1400,10 +1568,6 @@ impl ChatUpdater {
                     ) {
                         previous.camera = camera.clone();
                     }
-                    sequence_wait_ended |= matches!(
-                        previous.operation.kind,
-                        SequenceOperationKind::TimeWait { .. }
-                    );
                     let output_key = plate_solve_output_key(&self.state.dedup_hasher, next);
                     let attach_output = claim_plate_solve_output(
                         &mut self.state.plate_solve_outputs_seen,
@@ -1446,16 +1610,11 @@ impl ChatUpdater {
                 } = &tracked.operation.kind
                 {
                     tracked.estimated_end = Some(target.with_timezone(&Utc));
-                    tracked.estimated_end_from_target_scheduler = false;
                 } else if matches!(
                     tracked.operation.kind,
                     SequenceOperationKind::TimeWait { .. }
                 ) {
                     tracked.restore_intrinsic_wait_estimate();
-                    if event_wait_end.is_some() {
-                        tracked.estimated_end = event_wait_end;
-                        tracked.estimated_end_from_target_scheduler = true;
-                    }
                 }
 
                 if let Some(milestone) = tracked.next_milestone(now) {
@@ -1490,17 +1649,6 @@ impl ChatUpdater {
             .then(|| camera.clone())
             .flatten();
             let mut tracked = TrackedSequenceOperation::new(operation, now, operation_camera);
-            if matches!(
-                &tracked.operation.kind,
-                SequenceOperationKind::TimeWait {
-                    target_time: None,
-                    ..
-                }
-            ) && event_wait_end.is_some()
-            {
-                tracked.estimated_end = event_wait_end;
-                tracked.estimated_end_from_target_scheduler = true;
-            }
             if !announce {
                 tracked.last_milestone = tracked
                     .progress_percent(now)
@@ -1513,29 +1661,14 @@ impl ChatUpdater {
                 tracked.operation.chat_enabled,
                 output_key.as_ref(),
             );
-            let suppress_duplicate_wait = matches!(
-                tracked.operation.kind,
-                SequenceOperationKind::TimeWait { .. }
-            ) && self.state.wait_until.is_some();
-            if announce && !suppress_duplicate_wait && !suppress_duplicate_center {
+            tracked.last_output_key = output_key;
+            if announce && !suppress_duplicate_center {
                 notifications.push((tracked.clone(), OperationUpdate::Started));
             }
             if announce && output_is_new {
                 notifications.push((tracked.clone(), OperationUpdate::Output));
             }
-            tracked.last_output_key = output_key;
             self.state.sequence_operations.insert(key, tracked);
-        }
-
-        if sequence_wait_ended
-            && !self.state.sequence_operations.values().any(|tracked| {
-                matches!(
-                    tracked.operation.kind,
-                    SequenceOperationKind::TimeWait { .. }
-                )
-            })
-        {
-            self.state.wait_until = None;
         }
 
         if announce && self.chat_manager.service_count() > 0 {
@@ -1774,16 +1907,17 @@ impl ChatUpdater {
             }
             SequenceOperationKind::TimeWait { .. } => {
                 if let Some(end) = tracked.estimated_end {
-                    let remaining = end
-                        .signed_duration_since(Utc::now())
-                        .max(chrono::Duration::zero());
-                    message = message
-                        .field(
-                            "Until",
-                            &end.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-                            false,
-                        )
-                        .field("Remaining", &format_duration(remaining), true);
+                    message = match update {
+                        OperationUpdate::Started | OperationUpdate::Progress(_) => {
+                            add_wait_timing_fields(message, end, Utc::now())
+                        }
+                        OperationUpdate::Finished { .. }
+                        | OperationUpdate::Ended { .. }
+                        | OperationUpdate::Failed { .. }
+                        | OperationUpdate::Output => {
+                            add_wait_endpoint_field(message, "Planned until", end)
+                        }
+                    };
                 }
             }
             SequenceOperationKind::AstronomicalWait {
@@ -2003,15 +2137,14 @@ impl ChatUpdater {
     /// older peer can retain an enabled value followed by a disabled marker;
     /// the marker must revoke that category's reconstructed state rather than
     /// allowing the older value to remain visible.
-    fn revoke_state_for_disabled_event(&mut self, event_type: &str) {
+    fn revoke_state_for_disabled_event(&mut self, event_type: &str, event_time: Option<&str>) {
         match event_delivery_scope(event_type) {
             EventDeliveryScope::TargetScheduler => {
                 self.state.current_target = None;
-                self.state.wait_until = None;
-                for tracked in self.state.sequence_operations.values_mut() {
-                    if tracked.estimated_end_from_target_scheduler {
-                        tracked.restore_intrinsic_wait_estimate();
-                    }
+                if let Some(event_time) = event_time {
+                    self.state.clear_scheduler_waits_for_privacy(event_time);
+                } else {
+                    self.state.clear_scheduler_waits();
                 }
             }
             EventDeliveryScope::FilterFocuserRotator => {
@@ -2030,6 +2163,11 @@ impl ChatUpdater {
                     )
                 });
             }
+            // Start-event scopes are new and transient. Existing completion
+            // names deliberately retain their legacy broad scopes so a
+            // payload-v3 privacy tombstone still revokes all older state that
+            // was captured under those switches.
+            EventDeliveryScope::SlewMotion | EventDeliveryScope::RotatorMotion => {}
             EventDeliveryScope::Guiding => {
                 self.state.last_guider_event = None;
             }
@@ -2037,7 +2175,6 @@ impl ChatUpdater {
                 self.state.sequence_running = false;
                 self.state.sequence_failure = None;
                 self.state.sequence_outcome = None;
-                self.state.wait_until = None;
                 self.state.sequence_container_counts = None;
                 self.state.sequence_operations.retain(|_, tracked| {
                     matches!(
@@ -2097,9 +2234,12 @@ impl ChatUpdater {
         self.state.last_status_fingerprint = None;
     }
 
-    fn apply_event_state(&mut self, event: &Event) {
+    fn apply_event_state(&mut self, event: &Event) -> bool {
         if !has_usable_weather_details(event) {
-            return;
+            return false;
+        }
+        if event.event == event_types::TS_WAITSTART && !self.state.record_scheduler_wait(event) {
+            return false;
         }
         match event.event.as_str() {
             event_types::MOUNT_PARKED
@@ -2112,9 +2252,11 @@ impl ChatUpdater {
                 self.state.last_mount_event = Some(event.event.clone());
                 self.state.center_event_seen_at = Some(Utc::now());
             }
-            // Flip and dither events describe brief activity, not a stable
+            // Motion starts and flips describe brief activity, not a stable
             // state. They are announced but must not replace the status state.
-            event_types::MOUNT_BEFORE_FLIP | event_types::MOUNT_AFTER_FLIP => {}
+            event_types::MOUNT_SLEW_STARTED
+            | event_types::MOUNT_BEFORE_FLIP
+            | event_types::MOUNT_AFTER_FLIP => {}
             event_types::GUIDER_START | event_types::GUIDER_STOP => {
                 self.state.last_guider_event = Some(event.event.clone());
             }
@@ -2123,11 +2265,11 @@ impl ChatUpdater {
                 self.state.sequence_running = true;
                 self.state.sequence_failure = None;
                 self.state.sequence_outcome = None;
-                self.state.wait_until = None;
+                self.state.clear_scheduler_waits_at(&event.time);
             }
             event_types::SEQUENCE_FINISHED => {
                 self.state.sequence_running = false;
-                self.state.wait_until = None;
+                self.state.clear_scheduler_waits_at(&event.time);
                 if let Some(EventDetails::SequenceFinished {
                     outcome,
                     status,
@@ -2168,16 +2310,9 @@ impl ChatUpdater {
                 });
             }
             event_types::TS_TARGETSTART | event_types::TS_NEWTARGETSTART => {
-                self.state.wait_until = None;
+                self.state.clear_scheduler_waits_at(&event.time);
             }
-            event_types::TS_WAITSTART => {
-                if let Some(EventDetails::WaitStart { wait_end_time }) = &event.details
-                    && let Some(parsed) =
-                        parse_nina_timestamp_with_context(wait_end_time, Some(&event.time))
-                {
-                    self.state.wait_until = Some(parsed);
-                }
-            }
+            event_types::TS_WAITSTART => {}
             event_types::SAFETY_CONNECTED => {
                 self.state.safety_state = SafetyState::ConnectedUnknown;
             }
@@ -2309,6 +2444,7 @@ impl ChatUpdater {
             _ => {}
         }
         self.state.last_status_fingerprint = None;
+        true
     }
 
     fn clear_weather_connection_epoch(&mut self) {
@@ -2356,7 +2492,7 @@ impl ChatUpdater {
                 // Baseline initialization can be retried after a later query
                 // fails. Reapply every tombstone on every attempt so enabled
                 // history earlier in this same pass cannot resurrect state.
-                self.revoke_state_for_disabled_event(&event.event);
+                self.revoke_state_for_disabled_event(&event.event, Some(&event.time));
                 continue;
             }
 
@@ -2425,13 +2561,6 @@ impl ChatUpdater {
             self.state.events_seen.insert(key);
         }
 
-        // If the recorded wait has already elapsed, clear it.
-        if let Some(end) = self.state.wait_until
-            && Utc::now() >= end
-        {
-            self.state.wait_until = None;
-        }
-
         // Set the latest TS target if found
         if let Some((_, _, target)) = latest_ts_target {
             self.state.current_target = Some(target);
@@ -2479,7 +2608,7 @@ impl ChatUpdater {
 
             if !event.chat_enabled {
                 if !self.state.has_seen_disabled_event(&event) {
-                    self.revoke_state_for_disabled_event(&event.event);
+                    self.revoke_state_for_disabled_event(&event.event, Some(&event.time));
                 }
                 continue;
             }
@@ -2488,9 +2617,6 @@ impl ChatUpdater {
                 self.print_new_event(&event);
                 self.handle_event(&event).await;
             }
-        }
-        if self.state.wait_until.is_some_and(|end| Utc::now() >= end) {
-            self.state.wait_until = None;
         }
     }
 
@@ -2523,7 +2649,7 @@ impl ChatUpdater {
         }
         if !event.chat_enabled {
             if !self.state.has_seen_disabled_event(event) {
-                self.revoke_state_for_disabled_event(&event.event);
+                self.revoke_state_for_disabled_event(&event.event, Some(&event.time));
             }
             return;
         }
@@ -2540,7 +2666,9 @@ impl ChatUpdater {
             }) if self.state.weather_high_wind == Some(true)
         );
 
-        self.apply_event_state(event);
+        if !self.apply_event_state(event) {
+            return;
+        }
         if suppress_high_wind_refresh {
             return;
         }
@@ -2565,6 +2693,7 @@ impl ChatUpdater {
             | event_types::MOUNT_UNPARKED
             | event_types::MOUNT_HOMED
             | event_types::MOUNT_CENTER
+            | event_types::MOUNT_SLEW_STARTED
             | event_types::MOUNT_SLEWED => self.handle_mount_event(event).await,
             event_types::GUIDER_START | event_types::GUIDER_DITHER => {
                 self.handle_guider_event(event).await
@@ -2680,7 +2809,6 @@ impl ChatUpdater {
             target_end_time,
         }) = &event.details
         {
-            self.state.wait_until = None;
             if target_name == "Sequential Instruction Set" {
                 return;
             }
@@ -3200,7 +3328,7 @@ impl ChatUpdater {
                     }
                     if !image.chat_enabled {
                         if !self.state.has_seen_image(image) {
-                            self.revoke_state_for_disabled_event(event_types::IMAGE_SAVE);
+                            self.revoke_state_for_disabled_event(event_types::IMAGE_SAVE, None);
                         }
                         continue;
                     }
@@ -3405,6 +3533,10 @@ impl ChatUpdater {
     /// Build a one-paragraph summary of NINA's state, inferred from recent events.
     /// Includes wait timer, sequence running, mount state, guider state.
     fn format_startup_status(&self) -> String {
+        self.format_startup_status_at(Utc::now())
+    }
+
+    fn format_startup_status_at(&self, now: DateTime<Utc>) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         if let Some(end) = self
@@ -3426,12 +3558,6 @@ impl ChatUpdater {
             .filter(|tracked| tracked.operation.chat_enabled)
             .collect::<Vec<_>>();
         operations.sort_by(|left, right| left.operation.key.cmp(&right.operation.key));
-        let has_sequence_wait = operations.iter().any(|tracked| {
-            matches!(
-                tracked.operation.kind,
-                SequenceOperationKind::TimeWait { .. }
-            )
-        });
         for tracked in operations {
             match &tracked.operation.kind {
                 SequenceOperationKind::CameraCooling {
@@ -3471,14 +3597,16 @@ impl ChatUpdater {
                 }
                 SequenceOperationKind::TimeWait { .. } => {
                     if let Some(end) = tracked.estimated_end {
-                        let remaining = end
-                            .signed_duration_since(Utc::now())
-                            .max(chrono::Duration::zero());
-                        parts.push(format!(
-                            "⏳ Waiting until {} ({} remaining)",
-                            end.format("%H:%M UTC"),
-                            format_duration(remaining)
-                        ));
+                        let remaining = end.signed_duration_since(now);
+                        if remaining > chrono::Duration::zero() {
+                            parts.push(format!(
+                                "⏳ Sequence wait until {} ({} remaining)",
+                                end.format("%H:%M UTC"),
+                                format_duration(remaining)
+                            ));
+                        } else {
+                            parts.push("⏳ Sequence wait reached its scheduled time".to_string());
+                        }
                     } else {
                         parts.push("⏳ Timed wait in progress".to_string());
                     }
@@ -3592,18 +3720,19 @@ impl ChatUpdater {
             }
         }
 
-        if !has_sequence_wait && let Some(end) = self.state.wait_until {
-            let now = Utc::now();
-            let minutes = end
-                .with_timezone(&Utc)
-                .signed_duration_since(now)
-                .num_minutes();
-            if minutes > 0 {
+        if let Some(end) = self.state.scheduler_wait_end() {
+            let remaining = end.signed_duration_since(now);
+            if remaining > chrono::Duration::zero() {
                 parts.push(format!(
-                    "⏳ Waiting until {} ({} min remaining)",
-                    end.format("%H:%M %Z"),
-                    minutes
+                    "⏳ Target Scheduler wait until {} ({} remaining)",
+                    end.format("%H:%M UTC"),
+                    format_duration(remaining)
                 ));
+            } else {
+                parts.push(
+                    "⏳ Target Scheduler reached its scheduled time; awaiting its next transition"
+                        .to_string(),
+                );
             }
         }
 
@@ -3782,6 +3911,7 @@ impl ChatUpdater {
                 event_types::MOUNT_BEFORE_FLIP => "🔄 Mount pre-flip",
                 event_types::MOUNT_AFTER_FLIP => "✅ Mount post-flip",
                 event_types::MOUNT_CENTER => "🎯 Centering started",
+                event_types::MOUNT_SLEWED => "🔭 Mount slew ended",
                 _ => "🔭 Mount active",
             };
             parts.push(label.to_string());
@@ -3993,7 +4123,19 @@ impl ChatUpdater {
             event_types::MOUNT_UNPARKED => ("🔭 Mount Unparked", colors::YELLOW),
             event_types::MOUNT_HOMED => ("🏠 Mount Homed", colors::CYAN),
             event_types::MOUNT_CENTER => ("🎯 Centering Started", colors::CYAN),
-            event_types::MOUNT_SLEWED => ("🔭 Mount Slew Completed", colors::CYAN),
+            event_types::MOUNT_SLEW_STARTED
+                if matches!(
+                    &event.details,
+                    Some(EventDetails::MountSlewStarted {
+                        observed_in_progress: Some(true),
+                        ..
+                    })
+                ) =>
+            {
+                ("🔭 Mount Slew Recovered", colors::BLUE)
+            }
+            event_types::MOUNT_SLEW_STARTED => ("🔭 Mount Slew Started", colors::BLUE),
+            event_types::MOUNT_SLEWED => ("🔭 Mount Slew Ended", colors::CYAN),
             _ => ("🔭 Mount Event", colors::GRAY),
         };
 
@@ -4005,14 +4147,56 @@ impl ChatUpdater {
         if let Some(target) = &self.state.current_target {
             message = message.field("Current Target", &target.name, true);
         }
-        if let Some(EventDetails::MountSlewed { from, to }) = &event.details {
-            message =
-                message
-                    .field("From", &from.display(), false)
-                    .field("To", &to.display(), false);
+        match &event.details {
+            Some(EventDetails::MountSlewStarted {
+                from,
+                target,
+                motion_id,
+                observed_in_progress,
+            }) => {
+                message = add_coordinate_field(message, "From position", from);
+                if let Some(target) = target {
+                    message = add_coordinate_field(message, "Requested destination", target);
+                }
+                message =
+                    add_motion_metadata(message, *motion_id, None, None, *observed_in_progress);
+            }
+            Some(EventDetails::MountSlewed {
+                from,
+                to,
+                target,
+                motion_id,
+                duration_seconds,
+                end_detection,
+                observed_in_progress,
+            }) => {
+                message = add_coordinate_field(message, "From position", from);
+                if let Some(target) = target {
+                    message = add_coordinate_field(message, "Requested destination", target);
+                }
+                message = add_coordinate_field(message, "To position", to);
+                message = add_motion_metadata(
+                    message,
+                    *motion_id,
+                    *duration_seconds,
+                    end_detection.as_deref(),
+                    *observed_in_progress,
+                );
+            }
+            _ => {}
         }
 
-        self.add_mount_info(&mut message).await;
+        // Motion diagnostics carry snapshots associated with their state edges
+        // (or callback coordinates when capture recovered late). A live
+        // query here could replace that useful evidence with a later position
+        // and could stall delivery while the driver is unhealthy, so enrich
+        // only the other mount events.
+        if !matches!(
+            event.event.as_str(),
+            event_types::MOUNT_SLEW_STARTED | event_types::MOUNT_SLEWED
+        ) {
+            self.add_mount_info(&mut message).await;
+        }
         self.chat_manager
             .send_message(&message, &self.chat_target)
             .await;
@@ -4225,7 +4409,19 @@ impl ChatUpdater {
     }
 
     async fn send_generic_event_notification(&self, event: &Event) {
+        self.send_generic_event_notification_at(event, Utc::now())
+            .await;
+    }
+
+    async fn send_generic_event_notification_at(&self, event: &Event, now: DateTime<Utc>) {
         let (color, title) = match &event.details {
+            Some(EventDetails::RotatorMoveStarted {
+                observed_in_progress: Some(true),
+                ..
+            }) => (
+                get_event_color(&event.event),
+                "🧭 Rotator move recovered".to_string(),
+            ),
             Some(EventDetails::CommandFailed { command, .. }) => (
                 colors::RED,
                 format!("❌ Command failed · {}", truncate_chat_title(command)),
@@ -4265,10 +4461,19 @@ impl ChatUpdater {
             _ => (get_event_color(&event.event), get_event_title(&event.event)),
         };
 
-        let mut message =
-            ChatMessage::new(&self.titled(title))
-                .color(color)
-                .field("Time", &event.time, false);
+        let is_scheduler_wait = event.event == event_types::TS_WAITSTART;
+        let mut message = ChatMessage::new(&self.titled(title)).color(color);
+        if is_scheduler_wait {
+            if let Some(event_time) = parse_nina_timestamp(&event.time) {
+                message = message.occurred_at("Started", event_time.with_timezone(&Utc));
+            } else {
+                // Compatibility fallback for malformed legacy payloads: keep
+                // the source value visible rather than silently replacing it.
+                message = message.field("Started", &event.time, false);
+            }
+        } else {
+            message = message.field("Time", &event.time, false);
+        }
 
         // Add event-specific details
         if let Some(details) = &event.details {
@@ -4292,7 +4497,13 @@ impl ChatUpdater {
                     return;
                 }
                 EventDetails::WaitStart { wait_end_time } => {
-                    message = message.field("Wait Until", wait_end_time, false);
+                    if let Some(end) =
+                        parse_nina_timestamp_with_context(wait_end_time, Some(&event.time))
+                    {
+                        message = add_wait_timing_fields(message, end.with_timezone(&Utc), now);
+                    } else {
+                        message = message.field("Until", wait_end_time, false);
+                    }
                 }
                 EventDetails::AutofocusPointAdded { position, hfr } => {
                     message = message
@@ -4364,17 +4575,85 @@ impl ChatUpdater {
                         );
                     }
                 }
-                EventDetails::RotatorMoved { from, to } => {
-                    message = message
-                        .field("From", &format!("{from:.2}°"), true)
-                        .field("To", &format!("{to:.2}°"), true)
-                        .field("Δ", &format!("{:+.2}°", to - from), true);
+                EventDetails::RotatorMoveStarted {
+                    position,
+                    mechanical_position,
+                    motion_id,
+                    observed_in_progress,
+                } => {
+                    if let Some(position) = position {
+                        message = message.field("From position", &format!("{position:.2}°"), true);
+                    }
+                    if let Some(position) = mechanical_position {
+                        message =
+                            message.field("Mechanical from", &format!("{position:.2}°"), true);
+                    }
+                    message =
+                        add_motion_metadata(message, *motion_id, None, None, *observed_in_progress);
                 }
-                EventDetails::MountSlewed { from, to } => {
-                    message = message.field("From", &from.display(), false).field(
-                        "To",
-                        &to.display(),
-                        false,
+                EventDetails::RotatorMoved {
+                    from,
+                    to,
+                    position,
+                    mechanical_from,
+                    mechanical_to,
+                    mechanical_position,
+                    motion_id,
+                    duration_seconds,
+                    end_detection,
+                    observed_in_progress,
+                } => {
+                    message = add_rotator_end_fields(
+                        message,
+                        &event.event,
+                        *from,
+                        *to,
+                        *position,
+                        *mechanical_from,
+                        *mechanical_to,
+                        *mechanical_position,
+                    );
+                    message = add_motion_metadata(
+                        message,
+                        *motion_id,
+                        *duration_seconds,
+                        end_detection.as_deref(),
+                        *observed_in_progress,
+                    );
+                }
+                EventDetails::MountSlewStarted {
+                    from,
+                    target,
+                    motion_id,
+                    observed_in_progress,
+                } => {
+                    message = add_coordinate_field(message, "From position", from);
+                    if let Some(target) = target {
+                        message = add_coordinate_field(message, "Requested destination", target);
+                    }
+                    message =
+                        add_motion_metadata(message, *motion_id, None, None, *observed_in_progress);
+                }
+                EventDetails::MountSlewed {
+                    from,
+                    to,
+                    target,
+                    motion_id,
+                    duration_seconds,
+                    end_detection,
+                    observed_in_progress,
+                } => {
+                    message = add_coordinate_field(message, "From position", from);
+                    if let Some(target) = target {
+                        message = add_coordinate_field(message, "Requested destination", target);
+                    }
+                    message = add_coordinate_field(message, "To position", to);
+                    message = add_motion_metadata(
+                        message,
+                        *motion_id,
+                        *duration_seconds,
+                        end_detection.as_deref(),
+                        *observed_in_progress,
                     );
                 }
                 EventDetails::DomeSlewed { from, to } => {
@@ -4596,6 +4875,7 @@ impl ChatUpdater {
             message.fields.push(ChatField {
                 name: "Meridian Flip In".to_string(),
                 value: formatted,
+                discord_value: None,
                 inline: true,
             });
         }
@@ -4612,18 +4892,21 @@ impl ChatUpdater {
             message.fields.push(ChatField {
                 name: "Mount Position".to_string(),
                 value: format!("RA: {ra}\nDec: {dec}"),
+                discord_value: None,
                 inline: true,
             });
             if !alt.is_empty() && !az.is_empty() {
                 message.fields.push(ChatField {
                     name: "Alt/Az".to_string(),
                     value: format!("Alt: {alt}\nAz: {az}"),
+                    discord_value: None,
                     inline: true,
                 });
             }
             message.fields.push(ChatField {
                 name: "Pier Side".to_string(),
                 value: mount_info.get_side_of_pier().to_string(),
+                discord_value: None,
                 inline: true,
             });
 
@@ -4635,10 +4918,104 @@ impl ChatUpdater {
             message.fields.push(ChatField {
                 name: "Tracking".to_string(),
                 value: tracking_status.to_string(),
+                discord_value: None,
                 inline: true,
             });
         }
     }
+}
+
+fn add_coordinate_field(
+    message: ChatMessage,
+    name: &str,
+    coordinates: &crate::events::EventCoordinates,
+) -> ChatMessage {
+    let display = coordinates.display();
+    let display = if display.is_empty() {
+        "Position unavailable".to_string()
+    } else {
+        truncate_chat_value(&display)
+    };
+    message.field(name, &display, false)
+}
+
+fn motion_end_detection_display(value: &str) -> String {
+    match value {
+        "motion_state" => "Equipment first reported idle".to_string(),
+        "nina_slewed" => "N.I.N.A. slew event".to_string(),
+        "nina_moved" => "N.I.N.A. move event".to_string(),
+        _ => truncate_chat_value(value),
+    }
+}
+
+fn add_motion_metadata(
+    mut message: ChatMessage,
+    motion_id: Option<i64>,
+    duration_seconds: Option<f64>,
+    end_detection: Option<&str>,
+    observed_in_progress: Option<bool>,
+) -> ChatMessage {
+    if let Some(motion_id) = motion_id {
+        message = message.field("Motion", &format!("#{motion_id}"), true);
+    }
+    if let Some(duration_seconds) = duration_seconds {
+        message = message.field(
+            "Observed interval",
+            &format!("{duration_seconds:.2} s"),
+            true,
+        );
+    }
+    if let Some(end_detection) = end_detection.filter(|value| !value.trim().is_empty()) {
+        message = message.field(
+            "End detected by",
+            &motion_end_detection_display(end_detection),
+            true,
+        );
+    }
+    if observed_in_progress == Some(true) {
+        message = message.field("Capture", "Recovered after motion began", false);
+    }
+    message
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_rotator_end_fields(
+    mut message: ChatMessage,
+    event_name: &str,
+    from: Option<f64>,
+    to: Option<f64>,
+    position: Option<f64>,
+    mechanical_from: Option<f64>,
+    mechanical_to: Option<f64>,
+    mechanical_position: Option<f64>,
+) -> ChatMessage {
+    let mechanical_event = event_name == event_types::ROTATOR_MOVED_MECHANICAL;
+    let logical_from = (!mechanical_event).then_some(from).flatten();
+    let logical_to = position.or((!mechanical_event).then_some(to).flatten());
+    let mechanical_from = mechanical_from.or(mechanical_event.then_some(from).flatten());
+    let mechanical_to = mechanical_to
+        .or(mechanical_position)
+        .or(mechanical_event.then_some(to).flatten());
+
+    if let Some(value) = logical_from {
+        message = message.field("From position", &format!("{value:.2}°"), true);
+    }
+    if let Some(value) = logical_to {
+        message = message.field("To position", &format!("{value:.2}°"), true);
+    }
+    if let (Some(from), Some(to)) = (logical_from, logical_to) {
+        message = message.field("Position change", &format!("{:+.2}°", to - from), true);
+    }
+    if let Some(value) = mechanical_from {
+        message = message.field("Mechanical from", &format!("{value:.2}°"), true);
+    }
+    if let Some(value) = mechanical_to {
+        message = message.field("Mechanical to", &format!("{value:.2}°"), true);
+    }
+    if let (Some(from), Some(to)) = (mechanical_from, mechanical_to) {
+        message = message.field("Mechanical change", &format!("{:+.2}°", to - from), true);
+    }
+    message
 }
 
 fn get_event_color(event: &str) -> u32 {
@@ -4660,6 +5037,7 @@ fn get_event_color(event: &str) -> u32 {
         event_types::MOUNT_UNPARKED => colors::YELLOW,
         event_types::MOUNT_HOMED => colors::CYAN,
         event_types::MOUNT_CENTER => colors::CYAN,
+        event_types::MOUNT_SLEW_STARTED => colors::BLUE,
         event_types::MOUNT_SLEWED => colors::CYAN,
 
         // Focuser events
@@ -4674,6 +5052,7 @@ fn get_event_color(event: &str) -> u32 {
         // Rotator events
         event_types::ROTATOR_CONNECTED => colors::GREEN,
         event_types::ROTATOR_DISCONNECTED => colors::RED,
+        event_types::ROTATOR_MOVE_STARTED => colors::BLUE,
         event_types::ROTATOR_MOVED => colors::CYAN,
         event_types::ROTATOR_MOVED_MECHANICAL => colors::CYAN,
         event_types::ROTATOR_SYNCED => colors::CYAN,
@@ -4826,11 +5205,13 @@ fn get_event_title(event: &str) -> String {
     match event {
         event_types::FILTERWHEEL_CHANGED => "🔄 Filter Changed".to_string(),
         event_types::TS_TARGETSTART => "🎯 Target Started".to_string(),
-        event_types::TS_WAITSTART => "⏳ Sequence Waiting".to_string(),
+        event_types::TS_WAITSTART => "⏳ Target Scheduler wait".to_string(),
         event_types::AUTOFOCUS_POINT_ADDED => "📈 Autofocus Point".to_string(),
-        event_types::ROTATOR_MOVED => "🧭 Rotator Moved".to_string(),
-        event_types::ROTATOR_MOVED_MECHANICAL => "🧭 Rotator Moved (Mech.)".to_string(),
-        event_types::MOUNT_SLEWED => "🔭 Mount slew completed".to_string(),
+        event_types::ROTATOR_MOVE_STARTED => "🧭 Rotator move started".to_string(),
+        event_types::ROTATOR_MOVED => "🧭 Rotator move ended".to_string(),
+        event_types::ROTATOR_MOVED_MECHANICAL => "🧭 Rotator mechanical move ended".to_string(),
+        event_types::MOUNT_SLEW_STARTED => "🔭 Mount slew started".to_string(),
+        event_types::MOUNT_SLEWED => "🔭 Mount slew ended".to_string(),
         event_types::SEQUENCE_STARTING => "▶️ Sequence starting".to_string(),
         event_types::SEQUENCE_FINISHED => "🏁 Sequence ended".to_string(),
         event_types::SEQUENCE_ENTITY_FAILED => "❌ Sequence item failed".to_string(),
@@ -6048,7 +6429,10 @@ mod tests {
             .state
             .sequence_operations
             .insert(disabled_safety.operation.key.clone(), disabled_safety);
-        let status = updater.format_startup_status();
+        let status_time = DateTime::parse_from_rfc3339("2099-08-26T06:00:00Z")
+            .expect("status time")
+            .with_timezone(&Utc);
+        let status = updater.format_startup_status_at(status_time);
         assert!(status.contains("Waiting for a sequence condition"));
         assert!(status.contains("checks every 17s"));
         assert!(status.contains("Waiting for manual sequence resume"));
@@ -6163,7 +6547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suppressed_time_wait_clears_internal_wait_state_without_delivery() {
+    async fn suppressed_time_wait_preserves_independent_scheduler_wait_without_delivery() {
         let source = Arc::new(FlakyAutofocusSource::new(Event {
             time: "2026-08-25T22:30:00Z".to_string(),
             event: event_types::SEQUENCE_STARTING.to_string(),
@@ -6194,9 +6578,10 @@ mod tests {
             .state
             .sequence_operations
             .insert(key.clone(), time_wait);
-        updater.state.wait_until = Some(
-            DateTime::parse_from_rfc3339("2026-08-26T06:00:00Z").expect("valid wait timestamp"),
-        );
+        let scheduler_end = Utc::now() + chrono::Duration::minutes(5);
+        updater.state.scheduler_wait = Some(SchedulerWaitState {
+            end_at: scheduler_end,
+        });
         let mut suppressed_operation_keys = HashSet::new();
         suppressed_operation_keys.insert(key);
 
@@ -6205,7 +6590,7 @@ mod tests {
             .await;
 
         assert!(updater.state.sequence_operations.is_empty());
-        assert!(updater.state.wait_until.is_none());
+        assert_eq!(updater.state.scheduler_wait_end(), Some(scheduler_end));
         assert!(chat_state.deliveries.lock().unwrap().is_empty());
     }
 
@@ -6222,6 +6607,336 @@ mod tests {
                 coordinates: None,
             }),
         }
+    }
+
+    fn target_scheduler_wait_event(
+        event_time: &str,
+        wait_end_time: &str,
+        chat_enabled: bool,
+    ) -> Event {
+        Event {
+            time: event_time.to_string(),
+            event: event_types::TS_WAITSTART.to_string(),
+            chat_enabled,
+            details: chat_enabled.then(|| EventDetails::WaitStart {
+                wait_end_time: wait_end_time.to_string(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_and_sequence_waits_with_the_same_endpoint_are_independent() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let endpoint = DateTime::parse_from_rfc3339("2099-08-26T08:00:00Z").expect("wait endpoint");
+        let scheduler_event =
+            target_scheduler_wait_event("2099-08-26T06:00:00Z", "2099-08-26T08:00:00Z", true);
+
+        updater.handle_event(&scheduler_event).await;
+        updater
+            .reconcile_sequence_operations(
+                vec![operation(SequenceOperationKind::TimeWait {
+                    target_time: Some(endpoint),
+                    configured_duration: None,
+                })],
+                HashSet::new(),
+                None,
+                true,
+            )
+            .await;
+
+        let scheduler_endpoint = endpoint.with_timezone(&Utc);
+        assert_eq!(updater.state.scheduler_wait_end(), Some(scheduler_endpoint));
+        let tracked = updater
+            .state
+            .sequence_operations
+            .values()
+            .next()
+            .expect("generic time wait");
+        assert_eq!(tracked.estimated_end, Some(scheduler_endpoint));
+        {
+            let deliveries = chat_state.deliveries.lock().unwrap();
+            assert_eq!(deliveries.len(), 2);
+            assert!(
+                deliveries
+                    .iter()
+                    .any(|(message, _)| message.title.contains("Target Scheduler wait"))
+            );
+            assert!(
+                deliveries
+                    .iter()
+                    .any(|(message, _)| message.title.contains("Timed wait started"))
+            );
+        }
+        let status_time = DateTime::parse_from_rfc3339("2099-08-26T06:00:00Z")
+            .expect("status time")
+            .with_timezone(&Utc);
+        let status = updater.format_startup_status_at(status_time);
+        assert!(status.contains("Sequence wait until"));
+        assert!(status.contains("Target Scheduler wait until"));
+        let elapsed_status =
+            updater.format_startup_status_at(scheduler_endpoint + chrono::Duration::seconds(1));
+        assert!(elapsed_status.contains("Sequence wait reached its scheduled time"));
+        assert!(elapsed_status.contains("Target Scheduler reached its scheduled time"));
+
+        updater
+            .reconcile_sequence_operations(Vec::new(), HashSet::new(), None, true)
+            .await;
+
+        assert!(updater.state.sequence_operations.is_empty());
+        assert_eq!(updater.state.scheduler_wait_end(), Some(scheduler_endpoint));
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 3);
+        assert!(deliveries[2].0.title.contains("Timed wait ended"));
+        assert!(
+            deliveries[2]
+                .0
+                .fields
+                .iter()
+                .any(|field| field.name == "Planned until")
+        );
+        assert!(
+            !deliveries[2]
+                .0
+                .fields
+                .iter()
+                .any(|field| field.name == "Countdown")
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_wait_replacement_and_lifecycle_boundaries_are_explicit() {
+        let mut updater = state_test_updater();
+        let first_endpoint =
+            DateTime::parse_from_rfc3339("2099-08-26T07:00:00Z").expect("first endpoint");
+        let later_endpoint =
+            DateTime::parse_from_rfc3339("2099-08-26T08:00:00Z").expect("later endpoint");
+        let first =
+            target_scheduler_wait_event("2099-08-26T05:00:00Z", "2099-08-26T07:00:00Z", true);
+        let later =
+            target_scheduler_wait_event("2099-08-26T06:00:00Z", "2099-08-26T08:00:00Z", true);
+
+        updater.apply_event_state(&first);
+        updater.apply_event_state(&later);
+        updater.apply_event_state(&first);
+        assert_eq!(
+            updater.state.scheduler_wait_end(),
+            Some(later_endpoint.with_timezone(&Utc))
+        );
+
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T06:05:00Z",
+            "malformed-endpoint",
+            true,
+        ));
+        assert!(updater.state.scheduler_wait.is_none());
+
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T06:10:00Z",
+            "2099-08-26T08:00:00Z",
+            true,
+        ));
+        let mut target_started = target_event(true, "M42");
+        target_started.time = "2099-08-26T06:11:00Z".to_string();
+        updater.apply_event_state(&target_started);
+        assert!(updater.state.scheduler_wait.is_none());
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T06:10:00Z",
+            "2099-08-26T08:00:00Z",
+            true,
+        ));
+        assert!(updater.state.scheduler_wait.is_none());
+
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T06:20:00Z",
+            "2099-08-26T08:00:00Z",
+            true,
+        ));
+        updater.apply_event_state(&Event {
+            time: "2099-08-26T06:21:00Z".to_string(),
+            event: event_types::SEQUENCE_STARTING.to_string(),
+            chat_enabled: true,
+            details: None,
+        });
+        assert!(updater.state.scheduler_wait.is_none());
+
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T06:30:00Z",
+            "2099-08-26T08:00:00Z",
+            true,
+        ));
+        updater.apply_event_state(&Event {
+            time: "2099-08-26T06:31:00Z".to_string(),
+            event: event_types::SEQUENCE_FINISHED.to_string(),
+            chat_enabled: true,
+            details: None,
+        });
+        assert!(updater.state.scheduler_wait.is_none());
+
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T06:40:00Z",
+            "2099-08-26T08:00:00Z",
+            true,
+        ));
+        updater
+            .handle_event(&target_scheduler_wait_event(
+                "2099-08-26T06:41:00Z",
+                "2099-08-26T08:00:00Z",
+                false,
+            ))
+            .await;
+        assert!(updater.state.scheduler_wait.is_none());
+
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T06:50:00Z",
+            "2099-08-26T07:00:00Z",
+            true,
+        ));
+        assert_eq!(
+            updater.state.scheduler_wait_end(),
+            Some(first_endpoint.with_timezone(&Utc))
+        );
+        assert!(
+            updater
+                .format_startup_status_at(first_endpoint.with_timezone(&Utc))
+                .contains("reached its scheduled time")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_scheduler_wait_after_terminal_transition_is_not_delivered() {
+        let (mut updater, chat_state) = recording_test_updater();
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T06:00:00Z",
+            "2099-08-26T08:00:00Z",
+            true,
+        ));
+        let mut target_started = target_event(true, "M42");
+        target_started.time = "2099-08-26T06:10:00Z".to_string();
+        updater.apply_event_state(&target_started);
+
+        updater
+            .handle_event(&target_scheduler_wait_event(
+                "2099-08-26T05:00:00Z",
+                "2099-08-26T07:00:00Z",
+                true,
+            ))
+            .await;
+
+        assert!(updater.state.scheduler_wait.is_none());
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn baseline_scheduler_wait_restores_status_without_replaying_start() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let endpoint = DateTime::parse_from_rfc3339("2099-08-26T08:00:00Z").expect("wait endpoint");
+        let event =
+            target_scheduler_wait_event("2099-08-26T06:00:00Z", "2099-08-26T08:00:00Z", true);
+
+        updater.process_baseline_events(std::slice::from_ref(&event));
+
+        assert_eq!(
+            updater.state.scheduler_wait_end(),
+            Some(endpoint.with_timezone(&Utc))
+        );
+        let status_time = DateTime::parse_from_rfc3339("2099-08-26T06:00:00Z")
+            .expect("status time")
+            .with_timezone(&Utc);
+        assert!(
+            updater
+                .format_startup_status_at(status_time)
+                .contains("Target Scheduler wait until")
+        );
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+
+        updater.process_live_events(vec![event]).await;
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduler_wait_notification_uses_one_normalized_instant_and_a_countdown() {
+        let (updater, chat_state) = recording_test_updater();
+        let event = target_scheduler_wait_event(
+            "2026-09-02T01:55:00.6436653+00:00",
+            "2026-09-01T21:25:51.5404816-05:00",
+            true,
+        );
+        let now = DateTime::parse_from_rfc3339("2026-09-02T01:55:00.6436653Z")
+            .expect("fixed delivery time")
+            .with_timezone(&Utc);
+
+        updater
+            .send_generic_event_notification_at(&event, now)
+            .await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let message = &deliveries[0].0;
+        assert!(message.title.contains("Target Scheduler wait"));
+        assert_eq!(message.matrix_timestamp_label.as_deref(), Some("Started"));
+        let occurred_at = DateTime::parse_from_rfc3339(
+            message
+                .timestamp
+                .as_deref()
+                .expect("source occurrence timestamp"),
+        )
+        .expect("normalized occurrence timestamp");
+        assert_eq!(
+            occurred_at.with_timezone(&Utc).to_rfc3339(),
+            "2026-09-02T01:55:00.643665300+00:00"
+        );
+        assert!(
+            !message
+                .fields
+                .iter()
+                .any(|field| matches!(field.name.as_str(), "Time" | "Wait Until"))
+        );
+
+        let end = DateTime::parse_from_rfc3339("2026-09-02T02:25:51.5404816Z")
+            .expect("normalized wait endpoint")
+            .with_timezone(&Utc);
+        let until = message
+            .fields
+            .iter()
+            .find(|field| field.name == "Until")
+            .expect("Until field");
+        assert_eq!(until.value, "2026-09-02 02:25:51 UTC");
+        assert_eq!(
+            until.discord_value.as_deref(),
+            Some(format!("<t:{}:F>", end.timestamp()).as_str())
+        );
+        let countdown = message
+            .fields
+            .iter()
+            .find(|field| field.name == "Countdown")
+            .expect("Countdown field");
+        assert_eq!(countdown.value, "30m 50s remaining");
+        assert_eq!(
+            countdown.discord_value.as_deref(),
+            Some(format!("<t:{}:R>", end.timestamp()).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_scheduler_wait_timestamps_remain_visible_without_native_markup() {
+        let (updater, chat_state) = recording_test_updater();
+        let event = target_scheduler_wait_event("legacy-start", "legacy-end", true);
+
+        updater.send_generic_event_notification(&event).await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let message = &deliveries[0].0;
+        assert!(message.matrix_timestamp_label.is_none());
+        assert!(message.fields.iter().any(|field| {
+            field.name == "Started"
+                && field.value == "legacy-start"
+                && field.discord_value.is_none()
+        }));
+        assert!(message.fields.iter().any(|field| {
+            field.name == "Until" && field.value == "legacy-end" && field.discord_value.is_none()
+        }));
+        assert!(!message.fields.iter().any(|field| field.name == "Countdown"));
     }
 
     #[tokio::test]
@@ -6285,7 +7000,7 @@ mod tests {
         updater.process_baseline_events(&disabled_events);
         assert!(updater.state.current_target.is_none());
         assert!(updater.state.last_filter.is_none());
-        assert!(updater.state.wait_until.is_none());
+        assert!(updater.state.scheduler_wait.is_none());
         assert!(updater.state.last_mount_event.is_none());
         assert!(updater.state.last_guider_event.is_none());
         assert!(!updater.state.sequence_running);
@@ -6305,7 +7020,7 @@ mod tests {
         }
         assert!(updater.state.current_target.is_none());
         assert!(updater.state.last_filter.is_none());
-        assert!(updater.state.wait_until.is_none());
+        assert!(updater.state.scheduler_wait.is_none());
         assert!(updater.state.last_mount_event.is_none());
         assert!(updater.state.last_guider_event.is_none());
         assert!(!updater.state.sequence_running);
@@ -6375,7 +7090,7 @@ mod tests {
     }
 
     #[test]
-    fn target_scheduler_tombstone_removes_only_scheduler_wait_estimate() {
+    fn target_scheduler_tombstone_clears_only_scheduler_wait_state() {
         let source = Arc::new(FlakyAutofocusSource::new(target_event(true, "M31")));
         let mut updater = ChatUpdater::new(
             source,
@@ -6384,7 +7099,7 @@ mod tests {
             Arc::new(ChatServiceManager::new()),
         );
         let started = Utc::now();
-        let mut tracked = TrackedSequenceOperation::new(
+        let tracked = TrackedSequenceOperation::new(
             operation(SequenceOperationKind::TimeWait {
                 target_time: None,
                 configured_duration: Some(chrono::Duration::minutes(5)),
@@ -6393,18 +7108,55 @@ mod tests {
             None,
         );
         let intrinsic = tracked.estimated_end;
-        tracked.estimated_end = Some(started + chrono::Duration::hours(8));
-        tracked.estimated_end_from_target_scheduler = true;
+        updater.state.scheduler_wait = Some(SchedulerWaitState {
+            end_at: started + chrono::Duration::hours(8),
+        });
         updater
             .state
             .sequence_operations
             .insert(tracked.operation.key.clone(), tracked);
 
-        updater.revoke_state_for_disabled_event(event_types::TS_WAITSTART);
+        updater.revoke_state_for_disabled_event(event_types::TS_WAITSTART, None);
 
         let retained = updater.state.sequence_operations.values().next().unwrap();
         assert_eq!(retained.estimated_end, intrinsic);
-        assert!(!retained.estimated_end_from_target_scheduler);
+        assert!(updater.state.scheduler_wait.is_none());
+    }
+
+    #[test]
+    fn sequence_tombstone_preserves_independent_scheduler_wait_state() {
+        let mut updater = state_test_updater();
+        let wait =
+            target_scheduler_wait_event("2099-08-26T06:00:00Z", "2099-08-26T08:00:00Z", true);
+        updater.apply_event_state(&wait);
+        let endpoint = updater.state.scheduler_wait_end();
+
+        updater.revoke_state_for_disabled_event(
+            event_types::SEQUENCE_STARTING,
+            Some("2099-08-26T06:30:00Z"),
+        );
+
+        assert_eq!(updater.state.scheduler_wait_end(), endpoint);
+    }
+
+    #[test]
+    fn malformed_time_privacy_tombstone_still_clears_scheduler_wait() {
+        let mut updater = state_test_updater();
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T06:00:00Z",
+            "2099-08-26T08:00:00Z",
+            true,
+        ));
+
+        updater.revoke_state_for_disabled_event(event_types::TS_WAITSTART, Some("malformed"));
+        assert!(updater.state.scheduler_wait.is_none());
+
+        updater.apply_event_state(&target_scheduler_wait_event(
+            "2099-08-26T05:00:00Z",
+            "2099-08-26T07:00:00Z",
+            true,
+        ));
+        assert!(updater.state.scheduler_wait.is_none());
     }
 
     #[tokio::test]
@@ -6414,7 +7166,9 @@ mod tests {
             DateTime::parse_from_rfc3339("2099-08-26T08:00:00Z").expect("scheduler end");
         let intrinsic_end =
             DateTime::parse_from_rfc3339("2099-08-26T04:00:00-07:00").expect("item target");
-        updater.state.wait_until = Some(scheduler_end);
+        updater.state.scheduler_wait = Some(SchedulerWaitState {
+            end_at: scheduler_end.with_timezone(&Utc),
+        });
 
         updater
             .reconcile_sequence_operations(
@@ -6438,7 +7192,6 @@ mod tests {
             tracked.estimated_end,
             Some(intrinsic_end.with_timezone(&Utc))
         );
-        assert!(!tracked.estimated_end_from_target_scheduler);
     }
 
     #[test]
@@ -6516,9 +7269,11 @@ mod tests {
         }))
         .unwrap();
         updater.apply_event_state(&event);
-        let wait_until = updater.state.wait_until.expect("scheduler wait end");
-        assert_eq!(wait_until.offset().local_minus_utc(), -7 * 60 * 60);
-        assert_eq!(wait_until.to_rfc3339(), "2099-08-26T04:00:00-07:00");
+        let wait_until = updater
+            .state
+            .scheduler_wait_end()
+            .expect("scheduler wait end");
+        assert_eq!(wait_until.to_rfc3339(), "2099-08-26T11:00:00+00:00");
     }
 
     #[test]
@@ -6716,6 +7471,233 @@ mod tests {
             ),
             state,
         )
+    }
+
+    fn message_field<'a>(message: &'a ChatMessage, name: &str) -> Option<&'a str> {
+        message
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.value.as_str())
+    }
+
+    #[tokio::test]
+    async fn motion_edge_messages_use_event_time_positions_and_starts_are_not_durable_state() {
+        let (mut updater, chat_state) = recording_test_updater();
+        updater.state.last_mount_event = Some(event_types::MOUNT_PARKED.to_string());
+
+        let mount_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:00:00Z",
+            "Event": "MOUNT-SLEW-STARTED",
+            "MotionId": 42,
+            "From": {
+                "RAString": "01:15:00",
+                "DecString": "-12:30:00",
+                "Epoch": "J2000",
+                "Altitude": 31.25,
+                "Azimuth": 127.5
+            },
+            "Target": {
+                "RAString": "03:30:00",
+                "DecString": "+22:00:00",
+                "Epoch": "J2000"
+            }
+        }))
+        .unwrap();
+        updater.handle_event(&mount_start).await;
+        assert_eq!(
+            updater.state.last_mount_event.as_deref(),
+            Some(event_types::MOUNT_PARKED),
+            "a transient slew start must not replace durable mount state"
+        );
+
+        let mount_end: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:00:12Z",
+            "Event": "MOUNT-SLEWED",
+            "MotionId": 42,
+            "From": {
+                "RAString": "01:15:00",
+                "DecString": "-12:30:00",
+                "Epoch": "J2000",
+                "Altitude": 31.25,
+                "Azimuth": 127.5
+            },
+            "Target": {
+                "RAString": "03:30:00",
+                "DecString": "+22:00:00",
+                "Epoch": "J2000"
+            },
+            "To": {
+                "RAString": "03:29:59",
+                "DecString": "+21:59:58",
+                "Epoch": "J2000",
+                "Altitude": 52.0,
+                "Azimuth": 201.75
+            },
+            "DurationSeconds": 12.25,
+            "EndDetection": "motion_state"
+        }))
+        .unwrap();
+        updater.handle_event(&mount_end).await;
+
+        let rotator_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:01:00Z",
+            "Event": "ROTATOR-MOVE-STARTED",
+            "MotionId": 43,
+            "Position": 12.5,
+            "MechanicalPosition": 87.5
+        }))
+        .unwrap();
+        updater.handle_event(&rotator_start).await;
+
+        let rotator_end: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T01:01:02Z",
+            "Event": "ROTATOR-MOVED-MECHANICAL",
+            "MotionId": 43,
+            "From": 87.5,
+            "To": 90.0,
+            "Position": 15.0,
+            "MechanicalFrom": 87.5,
+            "MechanicalTo": 90.0,
+            "DurationSeconds": 2.0,
+            "EndDetection": "nina_moved"
+        }))
+        .unwrap();
+        updater.handle_event(&rotator_end).await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 4);
+
+        let mount_start_message = &deliveries[0].0;
+        assert!(mount_start_message.title.contains("Mount Slew Started"));
+        let start_position = message_field(mount_start_message, "From position").unwrap();
+        assert!(start_position.contains("RA 01:15:00 · Dec -12:30:00 (J2000)"));
+        assert!(start_position.contains("Alt 31.25° · Az 127.50°"));
+        assert!(message_field(mount_start_message, "Start position").is_none());
+        assert!(
+            message_field(mount_start_message, "Requested destination")
+                .unwrap()
+                .contains("RA 03:30:00 · Dec +22:00:00 (J2000)")
+        );
+
+        let mount_end_message = &deliveries[1].0;
+        assert!(mount_end_message.title.contains("Mount Slew Ended"));
+        assert!(!mount_end_message.title.contains("Completed"));
+        assert!(message_field(mount_end_message, "From position").is_some());
+        let end_position = message_field(mount_end_message, "To position").unwrap();
+        assert!(end_position.contains("RA 03:29:59 · Dec +21:59:58 (J2000)"));
+        assert!(end_position.contains("Alt 52.00° · Az 201.75°"));
+        assert!(message_field(mount_end_message, "End position").is_none());
+        assert_eq!(
+            message_field(mount_end_message, "Observed interval"),
+            Some("12.25 s")
+        );
+        assert_eq!(
+            message_field(mount_end_message, "End detected by"),
+            Some("Equipment first reported idle")
+        );
+
+        let rotator_start_message = &deliveries[2].0;
+        assert!(rotator_start_message.title.contains("Rotator move started"));
+        assert_eq!(
+            message_field(rotator_start_message, "From position"),
+            Some("12.50°")
+        );
+        assert_eq!(
+            message_field(rotator_start_message, "Mechanical from"),
+            Some("87.50°")
+        );
+        assert!(message_field(rotator_start_message, "Start position").is_none());
+        assert!(message_field(rotator_start_message, "Start mechanical position").is_none());
+
+        let rotator_end_message = &deliveries[3].0;
+        assert!(
+            rotator_end_message
+                .title
+                .contains("Rotator mechanical move ended")
+        );
+        assert_eq!(
+            message_field(rotator_end_message, "To position"),
+            Some("15.00°")
+        );
+        assert_eq!(
+            message_field(rotator_end_message, "Mechanical from"),
+            Some("87.50°")
+        );
+        assert_eq!(
+            message_field(rotator_end_message, "Mechanical to"),
+            Some("90.00°")
+        );
+        assert!(message_field(rotator_end_message, "End position").is_none());
+        assert!(message_field(rotator_end_message, "Mechanical start").is_none());
+        assert!(message_field(rotator_end_message, "Mechanical end").is_none());
+        assert_eq!(
+            message_field(rotator_end_message, "End detected by"),
+            Some("N.I.N.A. move event")
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_recovered_motion_starts_have_recovered_titles_without_an_interval() {
+        let (mut updater, chat_state) = recording_test_updater();
+
+        let mount_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T02:00:00Z",
+            "Event": "MOUNT-SLEW-STARTED",
+            "MotionId": 51,
+            "From": {
+                "RAString": "05:00:00",
+                "DecString": "+10:00:00",
+                "Epoch": "J2000"
+            },
+            "ObservedInProgress": true
+        }))
+        .unwrap();
+        updater.handle_event(&mount_start).await;
+
+        let rotator_start: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-08-31T02:00:01Z",
+            "Event": "ROTATOR-MOVE-STARTED",
+            "MotionId": 52,
+            "Position": 21.5,
+            "MechanicalPosition": 81.5,
+            "ObservedInProgress": true
+        }))
+        .unwrap();
+        updater.handle_event(&rotator_start).await;
+
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 2);
+
+        let mount_message = &deliveries[0].0;
+        assert!(mount_message.title.contains("Mount Slew Recovered"));
+        assert!(!mount_message.title.contains("Mount Slew Started"));
+        assert_eq!(
+            message_field(mount_message, "Capture"),
+            Some("Recovered after motion began")
+        );
+        assert!(message_field(mount_message, "Observed interval").is_none());
+        assert!(message_field(mount_message, "From position").is_some());
+        assert!(message_field(mount_message, "Start position").is_none());
+
+        let rotator_message = &deliveries[1].0;
+        assert!(rotator_message.title.contains("Rotator move recovered"));
+        assert!(!rotator_message.title.contains("Rotator move started"));
+        assert_eq!(
+            message_field(rotator_message, "Capture"),
+            Some("Recovered after motion began")
+        );
+        assert!(message_field(rotator_message, "Observed interval").is_none());
+        assert_eq!(
+            message_field(rotator_message, "From position"),
+            Some("21.50°")
+        );
+        assert_eq!(
+            message_field(rotator_message, "Mechanical from"),
+            Some("81.50°")
+        );
+        assert!(message_field(rotator_message, "Start position").is_none());
+        assert!(message_field(rotator_message, "Start mechanical position").is_none());
     }
 
     #[tokio::test]
@@ -6932,7 +7914,7 @@ mod tests {
         assert!(status.contains("gust 13.2 m/s"));
         assert!(status.contains("9.4 °C"));
 
-        updater.revoke_state_for_disabled_event(event_types::WEATHER_CHANGED);
+        updater.revoke_state_for_disabled_event(event_types::WEATHER_CHANGED, None);
         assert_eq!(updater.state.weather_conditions, None);
         assert_eq!(updater.state.weather_high_wind, Some(true));
         let high_wind_only = updater.format_startup_status();
@@ -6940,7 +7922,7 @@ mod tests {
         assert!(high_wind_only.contains("wind 9.5 m/s"));
         assert!(!high_wind_only.contains("9.4 °C"));
 
-        updater.revoke_state_for_disabled_event(event_types::WEATHER_HIGH_WIND);
+        updater.revoke_state_for_disabled_event(event_types::WEATHER_HIGH_WIND, None);
         assert_eq!(updater.state.weather_connected, Some(true));
         assert_eq!(updater.state.weather_high_wind, None);
         assert_eq!(updater.state.weather_high_wind_conditions, None);
@@ -7257,15 +8239,88 @@ mod tests {
         updater.state.dome_shutter_open = Some(true);
         updater.state.dome_azimuth = Some(30.0);
 
-        updater.revoke_state_for_disabled_event(event_types::DOME_SLEWED);
+        updater.revoke_state_for_disabled_event(event_types::DOME_SLEWED, None);
         assert_eq!(updater.state.dome_connected, Some(true));
         assert_eq!(updater.state.dome_shutter_open, None);
         assert_eq!(updater.state.dome_azimuth, None);
 
         updater.state.dome_shutter_open = Some(false);
-        updater.revoke_state_for_disabled_event(event_types::DOME_DISCONNECTED);
+        updater.revoke_state_for_disabled_event(event_types::DOME_DISCONNECTED, None);
         assert_eq!(updater.state.dome_connected, None);
         assert_eq!(updater.state.dome_shutter_open, Some(false));
+    }
+
+    #[tokio::test]
+    async fn motion_start_tombstones_are_transient_and_legacy_end_tombstones_keep_old_scopes() {
+        let mut updater = state_test_updater();
+        updater.state.last_mount_event = Some(event_types::MOUNT_PARKED.to_string());
+        updater.state.last_filter = Some(FilterInfo {
+            name: "L".to_string(),
+            id: 2,
+        });
+
+        let mount_start_tombstone = Event {
+            time: "2026-08-31T02:00:00Z".to_string(),
+            event: event_types::MOUNT_SLEW_STARTED.to_string(),
+            chat_enabled: false,
+            details: None,
+        };
+        updater.process_baseline_events(std::slice::from_ref(&mount_start_tombstone));
+        assert_eq!(
+            updater.state.last_mount_event.as_deref(),
+            Some(event_types::MOUNT_PARKED)
+        );
+        assert_eq!(
+            updater
+                .state
+                .last_filter
+                .as_ref()
+                .map(|filter| filter.name.as_str()),
+            Some("L")
+        );
+
+        let rotator_start_tombstone = Event {
+            time: "2026-08-31T02:00:01Z".to_string(),
+            event: event_types::ROTATOR_MOVE_STARTED.to_string(),
+            chat_enabled: false,
+            details: None,
+        };
+        updater
+            .process_live_events(vec![rotator_start_tombstone])
+            .await;
+        assert_eq!(
+            updater.state.last_mount_event.as_deref(),
+            Some(event_types::MOUNT_PARKED)
+        );
+        assert_eq!(
+            updater
+                .state
+                .last_filter
+                .as_ref()
+                .map(|filter| filter.name.as_str()),
+            Some("L")
+        );
+
+        updater.state.last_mount_event = Some(event_types::MOUNT_SLEWED.to_string());
+        updater
+            .process_live_events(vec![Event {
+                time: "2026-08-31T02:00:02Z".to_string(),
+                event: event_types::MOUNT_SLEWED.to_string(),
+                chat_enabled: false,
+                details: None,
+            }])
+            .await;
+        assert!(updater.state.last_mount_event.is_none());
+
+        updater
+            .process_live_events(vec![Event {
+                time: "2026-08-31T02:00:03Z".to_string(),
+                event: event_types::ROTATOR_MOVED.to_string(),
+                chat_enabled: false,
+                details: None,
+            }])
+            .await;
+        assert!(updater.state.last_filter.is_none());
     }
 
     #[test]
