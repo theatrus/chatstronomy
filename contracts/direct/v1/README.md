@@ -41,6 +41,12 @@ inferred duration, and lets the receiver label the reconstructed pair
 accordingly. Because N.I.N.A.'s completion callback has no start timestamp, its
 recovered `From` position contains RA/Dec but no historical altitude or azimuth.
 
+`fixtures/query-result-motion.json` covers state-observed and callback-recovered
+motion, including a location-redacted mount pair. The frozen
+`fixtures/query-result-motion-legacy.json` completion payloads omit motion IDs,
+start events, provenance, and delivery flags. Both use the existing unrestricted
+query-result payload in the v1 envelope schema.
+
 `last_autofocus` keeps N.I.N.A.'s common autofocus report as its required
 surface. Hocus Focus can add optional final-measurement provenance, fit-quality
 statistics, accepted-star counts, normalized region geometry, selected fit

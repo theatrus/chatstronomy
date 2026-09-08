@@ -1,0 +1,155 @@
+{
+  "type": "query_result",
+  "payload": {
+    "id": "7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e",
+    "ok": true,
+    "payload": {
+      "Response": [
+        {
+          "Time": "2026-09-02T01:00:00+00:00",
+          "Event": "MOUNT-SLEW-STARTED",
+          "ChatEnabled": true,
+          "MotionId": 101,
+          "From": {
+            "RA": 2,
+            "RADegrees": 30,
+            "Dec": 30,
+            "Epoch": "J2000",
+            "Altitude": 25,
+            "Azimuth": 110
+          },
+          "Target": {
+            "RA": 3,
+            "RADegrees": 45,
+            "Dec": 40,
+            "Epoch": "J2000"
+          }
+        },
+        {
+          "Time": "2026-09-02T01:00:12+00:00",
+          "Event": "MOUNT-SLEWED",
+          "ChatEnabled": true,
+          "MotionId": 101,
+          "From": {
+            "RA": 2,
+            "RADegrees": 30,
+            "Dec": 30,
+            "Epoch": "J2000",
+            "Altitude": 25,
+            "Azimuth": 110
+          },
+          "Target": {
+            "RA": 3,
+            "RADegrees": 45,
+            "Dec": 40,
+            "Epoch": "J2000"
+          },
+          "To": {
+            "RA": 3,
+            "RADegrees": 45,
+            "Dec": 40,
+            "Epoch": "J2000",
+            "Altitude": 35,
+            "Azimuth": 130
+          },
+          "DurationSeconds": 12,
+          "EndDetection": "motion_state"
+        },
+        {
+          "Time": "2026-09-02T01:01:00+00:00",
+          "Event": "ROTATOR-MOVE-STARTED",
+          "ChatEnabled": true,
+          "MotionId": 102,
+          "Position": 20,
+          "MechanicalPosition": 80
+        },
+        {
+          "Time": "2026-09-02T01:01:05+00:00",
+          "Event": "ROTATOR-MOVED",
+          "ChatEnabled": true,
+          "MotionId": 102,
+          "From": 20,
+          "To": 35,
+          "Position": 35,
+          "MechanicalFrom": 80,
+          "MechanicalTo": 95,
+          "MechanicalPosition": 95,
+          "DurationSeconds": 5,
+          "EndDetection": "motion_state"
+        },
+        {
+          "Time": "2026-09-02T01:02:00+00:00",
+          "Event": "ROTATOR-MOVE-STARTED",
+          "ChatEnabled": true,
+          "MotionId": 103,
+          "MechanicalPosition": 95,
+          "ObservedInProgress": true
+        },
+        {
+          "Time": "2026-09-02T01:02:00+00:00",
+          "Event": "ROTATOR-MOVED-MECHANICAL",
+          "ChatEnabled": true,
+          "MotionId": 103,
+          "From": 95,
+          "To": 105,
+          "Position": 45,
+          "MechanicalFrom": 95,
+          "MechanicalTo": 105,
+          "MechanicalPosition": 105,
+          "EndDetection": "nina_moved",
+          "ObservedInProgress": true
+        },
+        {
+          "Time": "2026-09-02T01:03:00+00:00",
+          "Event": "MOUNT-SLEW-STARTED",
+          "ChatEnabled": true,
+          "MotionId": 104,
+          "From": {
+            "RA": 3,
+            "RADegrees": 45,
+            "Dec": 40,
+            "Epoch": "J2000"
+          },
+          "Target": {
+            "RA": 4,
+            "RADegrees": 60,
+            "Dec": 50,
+            "Epoch": "J2000"
+          },
+          "ObservedInProgress": true
+        },
+        {
+          "Time": "2026-09-02T01:03:00+00:00",
+          "Event": "MOUNT-SLEWED",
+          "ChatEnabled": true,
+          "MotionId": 104,
+          "From": {
+            "RA": 3,
+            "RADegrees": 45,
+            "Dec": 40,
+            "Epoch": "J2000"
+          },
+          "Target": {
+            "RA": 4,
+            "RADegrees": 60,
+            "Dec": 50,
+            "Epoch": "J2000"
+          },
+          "To": {
+            "RA": 4,
+            "RADegrees": 60,
+            "Dec": 50,
+            "Epoch": "J2000"
+          },
+          "EndDetection": "nina_slewed",
+          "ObservedInProgress": true
+        }
+      ],
+      "Error": "",
+      "StatusCode": 200,
+      "Success": true,
+      "Type": "API"
+    },
+    "error": null
+  }
+}

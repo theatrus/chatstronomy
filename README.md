@@ -44,6 +44,12 @@ horizon, and safety waits; supported long-running Sequencer+ waits include
 condition and manual waits. Private condition expressions and pause reasons
 remain inside N.I.N.A.
 
+Timed sequence waits and Target Scheduler waits show their scheduled endpoint
+and remaining time. Discord displays times in each viewer's timezone with a
+live relative countdown; Matrix displays UTC times and the remaining duration
+when the message was sent. A scheduled time being reached does not by itself
+mean that the wait or sequence has completed.
+
 Slew and rotator movement diagnostics have independent per-profile event
 switches and start off. N.I.N.A. exposes completion callbacks but no public
 movement-start callbacks, so the plugin watches equipment motion state. When
