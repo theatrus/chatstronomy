@@ -125,7 +125,11 @@ impl DiscordBotService {
             embed = embed.color(color);
         }
         for field in &message.fields {
-            embed = embed.field(&field.name, &field.value, field.inline);
+            embed = embed.field(
+                &field.name,
+                field.discord_value.as_deref().unwrap_or(&field.value),
+                field.inline,
+            );
         }
         if let Some(footer) = &message.footer {
             embed = embed.footer(serenity::CreateEmbedFooter::new(footer));
@@ -1868,4 +1872,27 @@ async fn start_sequence(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn embed_prefers_discord_field_value_and_preserves_occurred_at() {
+        let occurred_at = Utc
+            .with_ymd_and_hms(2026, 8, 31, 23, 45, 6)
+            .single()
+            .expect("valid event timestamp");
+        let message = ChatMessage::new("Motion")
+            .field_with_discord_value("When", "2026-08-31 23:45:06 UTC", "<t:1788219906:F>", false)
+            .occurred_at("Occurred", occurred_at);
+
+        let embed = serde_json::to_value(DiscordBotService::build_embed(&message))
+            .expect("Discord embed serializes");
+
+        assert_eq!(embed["fields"][0]["value"], "<t:1788219906:F>");
+        assert_eq!(embed["timestamp"], "2026-08-31T23:45:06Z");
+    }
 }

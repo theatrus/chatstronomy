@@ -1,0 +1,44 @@
+{
+  "type": "query_result",
+  "payload": {
+    "id": "7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e",
+    "ok": true,
+    "payload": {
+      "Response": [
+        {
+          "Time": "2025-08-06T21:00:12-07:00",
+          "Event": "MOUNT-SLEWED",
+          "From": {
+            "RA": 2,
+            "RADegrees": 30,
+            "Dec": 30,
+            "Epoch": "J2000"
+          },
+          "To": {
+            "RA": 3,
+            "RADegrees": 45,
+            "Dec": 40,
+            "Epoch": "J2000"
+          }
+        },
+        {
+          "Time": "2025-08-06T21:01:05-07:00",
+          "Event": "ROTATOR-MOVED",
+          "From": 20,
+          "To": 35
+        },
+        {
+          "Time": "2025-08-06T21:02:00-07:00",
+          "Event": "ROTATOR-MOVED-MECHANICAL",
+          "From": 95,
+          "To": 105
+        }
+      ],
+      "Error": "",
+      "StatusCode": 200,
+      "Success": true,
+      "Type": "API"
+    },
+    "error": null
+  }
+}

@@ -148,6 +148,19 @@ impl MatrixChatService {
 
     fn format_message(message: &ChatMessage) -> String {
         let mut formatted = format!("**{}**\n\n", message.title);
+        if let (Some(label), Some(timestamp)) =
+            (&message.matrix_timestamp_label, &message.timestamp)
+        {
+            let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp)
+                .map(|value| {
+                    value
+                        .with_timezone(&chrono::Utc)
+                        .format("%Y-%m-%d %H:%M:%S UTC")
+                        .to_string()
+                })
+                .unwrap_or_else(|_| timestamp.clone());
+            formatted.push_str(&format!("**{label}**: {timestamp}\n"));
+        }
         if !message.fields.is_empty() {
             for field in &message.fields {
                 formatted.push_str(&format!("**{}**: {}\n", field.name, field.value));
@@ -270,5 +283,45 @@ impl ChatService for MatrixChatService {
 
     fn can_route(&self, target: &ChatTarget) -> bool {
         target.matrix_room_id.is_some() || self.default_room_id.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matrix_uses_portable_values_and_renders_labeled_occurrence_in_utc() {
+        let occurred_at = chrono::DateTime::parse_from_rfc3339("2026-08-17T04:00:00-07:00")
+            .expect("valid occurrence timestamp")
+            .with_timezone(&chrono::Utc);
+        let message = ChatMessage::new("Timed wait")
+            .occurred_at("Started", occurred_at)
+            .field_with_discord_value(
+                "Until",
+                "2026-08-17 12:00:00 UTC",
+                "<t:1786968000:F>",
+                false,
+            )
+            .field("Status", "Waiting", true);
+
+        let formatted = MatrixChatService::format_message(&message);
+
+        assert!(formatted.contains("**Started**: 2026-08-17 11:00:00 UTC"));
+        assert!(formatted.contains("**Until**: 2026-08-17 12:00:00 UTC"));
+        assert!(formatted.contains("**Status**: Waiting"));
+        assert!(!formatted.contains("<t:"));
+    }
+
+    #[test]
+    fn matrix_omits_unlabeled_message_timestamp() {
+        let mut message = ChatMessage::new("Ordinary update").field("Status", "Ready", false);
+        message.timestamp = Some("2026-08-17T04:00:00-07:00".to_string());
+
+        let formatted = MatrixChatService::format_message(&message);
+
+        assert!(!formatted.contains("2026-08-17"));
+        assert!(!formatted.contains("**Started**:"));
+        assert!(formatted.contains("**Status**: Ready"));
     }
 }

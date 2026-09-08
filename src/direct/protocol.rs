@@ -643,6 +643,8 @@ mod tests {
             include_str!("../../contracts/direct/v1/fixtures/query-command.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-autofocus-hocus.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-result-motion.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-result-motion-legacy.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-resource-not-ready.json"),
             include_str!("../../contracts/direct/v1/fixtures/heartbeat.json"),
             include_str!("../../contracts/direct/v1/fixtures/error.json"),
@@ -671,5 +673,154 @@ mod tests {
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../contracts/direct/v1/schema.json")).unwrap();
         assert_eq!(schema["title"], "Chatstronomy Direct protocol v1");
+    }
+
+    #[test]
+    fn published_motion_fixtures_decode_typed_current_and_legacy_events() {
+        use crate::events::{EventDetails, EventHistoryResponse, event_types};
+
+        for (fixture, legacy) in [
+            (
+                include_str!("../../contracts/direct/v1/fixtures/query-result-motion.json"),
+                false,
+            ),
+            (
+                include_str!("../../contracts/direct/v1/fixtures/query-result-motion-legacy.json"),
+                true,
+            ),
+        ] {
+            let message: DirectMessage = serde_json::from_str(fixture).unwrap();
+            let DirectMessage::QueryResult(result) = message else {
+                panic!("expected a motion QueryResult fixture");
+            };
+            assert!(result.ok);
+            let history: EventHistoryResponse = serde_json::from_value(result.payload).unwrap();
+            assert!(history.success);
+            let mut event_names = std::collections::HashSet::new();
+
+            for event in history.response {
+                assert!(event.chat_enabled, "legacy payloads default to enabled");
+                event_names.insert(event.event.clone());
+                match (event.event.as_str(), event.details) {
+                    (
+                        event_types::MOUNT_SLEW_STARTED,
+                        Some(EventDetails::MountSlewStarted {
+                            from,
+                            motion_id,
+                            observed_in_progress,
+                            ..
+                        }),
+                    ) if !legacy => {
+                        assert!(motion_id.is_some());
+                        if observed_in_progress == Some(true) {
+                            assert_eq!(motion_id, Some(104));
+                            assert!(from.altitude.is_none());
+                            assert!(from.azimuth.is_none());
+                        } else {
+                            assert_eq!(from.altitude, Some(25.0));
+                            assert_eq!(from.azimuth, Some(110.0));
+                        }
+                    }
+                    (
+                        event_types::ROTATOR_MOVE_STARTED,
+                        Some(EventDetails::RotatorMoveStarted {
+                            position,
+                            mechanical_position,
+                            motion_id,
+                            observed_in_progress,
+                        }),
+                    ) if !legacy => {
+                        assert!(motion_id.is_some());
+                        if observed_in_progress == Some(true) {
+                            assert_eq!(position, None);
+                            assert_eq!(mechanical_position, Some(95.0));
+                        } else {
+                            assert_eq!(position, Some(20.0));
+                            assert_eq!(mechanical_position, Some(80.0));
+                        }
+                    }
+                    (
+                        event_types::MOUNT_SLEWED,
+                        Some(EventDetails::MountSlewed {
+                            from,
+                            to,
+                            motion_id,
+                            duration_seconds,
+                            end_detection,
+                            observed_in_progress,
+                            ..
+                        }),
+                    ) => {
+                        assert!(!from.display().is_empty());
+                        assert!(!to.display().is_empty());
+                        assert_eq!(motion_id.is_none(), legacy);
+                        assert_eq!(
+                            duration_seconds.is_none(),
+                            legacy || observed_in_progress == Some(true)
+                        );
+                        assert_eq!(end_detection.is_none(), legacy);
+                        if motion_id == Some(104) {
+                            assert_eq!(from.ra, Some(3.0));
+                            assert_eq!(to.ra, Some(4.0));
+                            assert!(from.altitude.is_none() && from.azimuth.is_none());
+                            assert!(to.altitude.is_none() && to.azimuth.is_none());
+                            assert_eq!(end_detection.as_deref(), Some("nina_slewed"));
+                        } else if !legacy {
+                            assert_eq!(duration_seconds, Some(12.0));
+                            assert_eq!(to.altitude, Some(35.0));
+                            assert_eq!(to.azimuth, Some(130.0));
+                        }
+                    }
+                    (
+                        event_types::ROTATOR_MOVED | event_types::ROTATOR_MOVED_MECHANICAL,
+                        Some(EventDetails::RotatorMoved {
+                            from,
+                            to,
+                            motion_id,
+                            duration_seconds,
+                            end_detection,
+                            position,
+                            mechanical_to,
+                            observed_in_progress,
+                            ..
+                        }),
+                    ) => {
+                        assert!(to.is_some());
+                        assert_eq!(motion_id.is_none(), legacy);
+                        assert_eq!(
+                            duration_seconds.is_none(),
+                            legacy || observed_in_progress == Some(true)
+                        );
+                        assert_eq!(end_detection.is_none(), legacy);
+                        if legacy {
+                            assert!(from.is_some());
+                        } else if motion_id == Some(103) {
+                            assert_eq!(position, Some(45.0));
+                            assert_eq!(mechanical_to, Some(105.0));
+                            assert_eq!(end_detection.as_deref(), Some("nina_moved"));
+                        } else {
+                            assert_eq!(duration_seconds, Some(5.0));
+                            assert_eq!(position, Some(35.0));
+                            assert_eq!(mechanical_to, Some(95.0));
+                        }
+                    }
+                    (name, details) => {
+                        panic!("motion fixture decoded incorrectly: {name}: {details:?}")
+                    }
+                }
+            }
+
+            for required in [
+                event_types::MOUNT_SLEWED,
+                event_types::ROTATOR_MOVED,
+                event_types::ROTATOR_MOVED_MECHANICAL,
+            ] {
+                assert!(event_names.contains(required));
+            }
+            if !legacy {
+                assert!(event_names.contains(event_types::MOUNT_SLEW_STARTED));
+                assert!(event_names.contains(event_types::ROTATOR_MOVE_STARTED));
+            }
+        }
     }
 }

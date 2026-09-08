@@ -63,6 +63,10 @@ fn thumbnail_is_still_preparing(error: &RigSourceError) -> bool {
 pub struct ChatField {
     pub name: String,
     pub value: String,
+    /// Optional Discord-specific rendering for values such as native
+    /// timestamps. Matrix always receives `value`, so Discord markup never
+    /// leaks into Matrix rooms.
+    pub discord_value: Option<String>,
     pub inline: bool,
 }
 
@@ -74,6 +78,9 @@ pub struct ChatMessage {
     pub fields: Vec<ChatField>,
     pub footer: Option<String>,
     pub timestamp: Option<String>,
+    /// Matrix does not have Discord's embed timestamp. When set, render the
+    /// timestamp as a canonical UTC field under this label for Matrix only.
+    pub matrix_timestamp_label: Option<String>,
 }
 
 impl ChatMessage {
@@ -84,6 +91,7 @@ impl ChatMessage {
             fields: Vec::new(),
             footer: None,
             timestamp: Some(chrono::Utc::now().to_rfc3339()),
+            matrix_timestamp_label: None,
         }
     }
 
@@ -96,8 +104,35 @@ impl ChatMessage {
         self.fields.push(ChatField {
             name: name.to_string(),
             value: value.to_string(),
+            discord_value: None,
             inline,
         });
+        self
+    }
+
+    /// Add a field whose Discord representation differs from the portable
+    /// Matrix/plain-text value.
+    pub fn field_with_discord_value(
+        mut self,
+        name: &str,
+        value: &str,
+        discord_value: &str,
+        inline: bool,
+    ) -> Self {
+        self.fields.push(ChatField {
+            name: name.to_string(),
+            value: value.to_string(),
+            discord_value: Some(discord_value.to_string()),
+            inline,
+        });
+        self
+    }
+
+    /// Attribute a notification to the source event time. Discord renders it
+    /// as the embed timestamp; Matrix renders a labeled canonical UTC field.
+    pub fn occurred_at(mut self, label: &str, timestamp: chrono::DateTime<chrono::Utc>) -> Self {
+        self.timestamp = Some(timestamp.to_rfc3339());
+        self.matrix_timestamp_label = Some(label.to_string());
         self
     }
 
