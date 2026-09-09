@@ -2,6 +2,7 @@ use crate::autofocus::AutofocusResponse;
 use crate::camera::CameraInfo;
 use crate::chat::{ChatAttachment, ChatField, ChatMessage, ChatServiceManager, ChatTarget};
 use crate::discord::colors;
+use crate::event_rate_limit::EventRateLimiter;
 use crate::events::{
     Event, EventDeliveryScope, EventDetails, FilterInfo, TargetCoordinates, WeatherConditions,
     event_delivery_scope, event_types,
@@ -1088,6 +1089,7 @@ impl UpdaterState {
 pub struct ChatUpdater {
     source: SharedRigSource,
     state: UpdaterState,
+    event_rate_limiter: EventRateLimiter,
     chat_manager: Arc<ChatServiceManager>,
     chat_target: ChatTarget,
     image_cooldown: Duration,
@@ -1167,6 +1169,7 @@ impl ChatUpdater {
         Self {
             source,
             state: UpdaterState::new(),
+            event_rate_limiter: EventRateLimiter::new(),
             chat_manager,
             chat_target,
             image_cooldown: Duration::from_secs(60),
@@ -2587,6 +2590,9 @@ impl ChatUpdater {
     }
 
     async fn process_live_events(&mut self, events: Vec<Event>) {
+        // One admission time for the whole response: Discord backpressure must
+        // not refill diagnostic budgets while we traverse an old event flood.
+        let received_at = TokioInstant::now();
         let mut privacy_boundaries = HashMap::new();
         for (index, event) in events.iter().enumerate() {
             if !event.chat_enabled {
@@ -2614,6 +2620,12 @@ impl ChatUpdater {
             }
 
             if !self.state.has_seen_event(&event) {
+                if !self.event_rate_limiter.allow(&event, received_at) {
+                    // Consume the record permanently, but preserve sequence
+                    // failure/outcome state in the original event order.
+                    self.apply_event_state(&event);
+                    continue;
+                }
                 self.print_new_event(&event);
                 self.handle_event(&event).await;
             }
@@ -7479,6 +7491,82 @@ mod tests {
             .iter()
             .find(|field| field.name == name)
             .map(|field| field.value.as_str())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostic_flood_is_dropped_without_replay_or_blocking_safety_and_recovery() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let failures: Vec<Event> = (0..10_000)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "Event": "SEQUENCE-ENTITY-FAILED",
+                    "Time": format!("2026-09-09T04:41:09.{i:07}Z"),
+                    "Entity": if i % 2 == 0 { "TakeExposure" } else { "SetReadoutMode" },
+                    "EntityType": "Instruction",
+                    "Error": "Camera not connected"
+                }))
+                .unwrap()
+            })
+            .collect();
+        updater.process_live_events(failures.clone()).await;
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 2);
+        assert_eq!(
+            updater.state.sequence_failure.as_ref().unwrap().entity,
+            "SetReadoutMode"
+        );
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        updater.process_live_events(failures).await;
+        assert_eq!(
+            chat_state.deliveries.lock().unwrap().len(),
+            2,
+            "dropped history must never replay after refill"
+        );
+
+        let recovery = [
+            serde_json::json!({"Event": "SAFETY-CHANGED", "IsSafe": false}),
+            serde_json::json!({"Event": "CAMERA-CONNECTED"}),
+            serde_json::json!({"Event": "SEQUENCE-FINISHED", "Outcome": "failed", "Status": "FAILED", "HadFailures": true}),
+        ].into_iter().map(|mut value| {
+            value["Time"] = "2026-09-09T04:42:10Z".into();
+            serde_json::from_value(value).unwrap()
+        }).collect();
+        updater.process_live_events(recovery).await;
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 5);
+        assert_eq!(updater.state.safety_state, SafetyState::Unsafe);
+        assert_eq!(updater.state.sequence_outcome.as_deref(), Some("failed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suppressed_failure_state_follows_sequence_start_and_privacy_order() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let failure: Event = serde_json::from_value(serde_json::json!({
+            "Event": "SEQUENCE-ENTITY-FAILED", "Time": "2026-09-09T04:41:09Z",
+            "Entity": "TakeExposure", "EntityType": "Instruction", "Error": "Camera not connected"
+        }))
+        .unwrap();
+        updater.process_live_events(vec![failure.clone()]).await;
+        let mut repeat = failure.clone();
+        repeat.time = "2026-09-09T04:41:11Z".into();
+        let start = Event {
+            time: "2026-09-09T04:41:10Z".into(),
+            event: event_types::SEQUENCE_STARTING.into(),
+            chat_enabled: true,
+            details: None,
+        };
+        updater.process_live_events(vec![start, repeat]).await;
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 2);
+        assert_eq!(
+            updater.state.sequence_failure.as_ref().unwrap().error,
+            "Camera not connected"
+        );
+
+        let mut disabled = failure.clone();
+        disabled.chat_enabled = false;
+        disabled.time = "2026-09-09T04:41:12Z".into();
+        updater.process_live_events(vec![failure, disabled]).await;
+        assert!(updater.state.sequence_failure.is_none());
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

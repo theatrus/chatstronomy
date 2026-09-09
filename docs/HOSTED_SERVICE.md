@@ -104,6 +104,17 @@ Use HTTPS/WSS at the public edge. Health is exposed at `/healthz`.
 
 ## Runtime behavior
 
+Diagnostic flood protection runs per telescope before chat delivery, including
+for older plugins. The same event and details can be posted once per minute.
+Errors and warnings share a budget of five initial messages, replenished at one
+every 12 seconds; ordinary logs and popup notifications have a separate budget
+of ten, replenished at one every six seconds. Excess records are dropped and
+marked consumed, so repeated history polls or a slow Discord connection cannot
+turn them into a delivery backlog. Sequence failure state still updates.
+Safety transitions, equipment recovery, sequence lifecycle, autofocus results,
+and accepted remote-command outcomes are not subject to this diagnostic limit.
+The budgets survive ordinary plugin transport reconnects.
+
 The plugin answers independently permitted event, image, sequence, chart,
 equipment, and typed-command queries. Hub updaters reconstruct available target,
 sequence, built-in timed and astronomical waits, supported Sequencer+ waits,

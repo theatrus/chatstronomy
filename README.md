@@ -109,6 +109,15 @@ start disabled and must be enabled individually because logs can contain local
 equipment, paths, or other private details. N.I.N.A. logs are not read while
 every log level is off.
 
+Chat delivery automatically drops diagnostic floods per telescope. Repeated
+errors, logs, and popup notifications are shown at most once per minute for the
+same event and details. Errors and warnings allow an initial burst of five,
+then one additional message every 12 seconds; other logs and popups allow ten,
+then one every six seconds. Excess records are discarded, not queued for later.
+Safety transitions, equipment recovery, sequence lifecycle, autofocus results,
+and outcomes of accepted remote commands remain outside these limits. The same
+protection applies to hosted Hub and local Discord/Matrix delivery.
+
 Telescope control is **disabled by default in N.I.N.A.** for every delivery
 mode. To allow hardware commands, the telescope owner must enable the plugin's
 local master switch and separately approve each individual operation; sequence
