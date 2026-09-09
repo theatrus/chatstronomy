@@ -645,6 +645,7 @@ mod tests {
             include_str!("../../contracts/direct/v1/fixtures/query-result-autofocus-hocus.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-motion.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-motion-legacy.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-result-elided-events.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-resource-not-ready.json"),
             include_str!("../../contracts/direct/v1/fixtures/heartbeat.json"),
             include_str!("../../contracts/direct/v1/fixtures/error.json"),

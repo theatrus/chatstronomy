@@ -47,6 +47,34 @@ motion, including a location-redacted mount pair. The frozen
 start events, provenance, and delivery flags. Both use the existing unrestricted
 query-result payload in the v1 envelope schema.
 
+An event-history response may include `ElidedEvents`, an array of cumulative
+plugin rate-limit counters. Each entry contains `Event`, optional `Level`,
+`Count` (an unsigned 64-bit integer), and `Epoch` (an opaque identifier for the
+current profile/permission epoch). Counters contain no message text or event
+details. A counter counts events actually dropped by the plugin rate limiter;
+locally disabled categories and log levels must not produce counters.
+
+Clients that support counters send every supported, locally permitted slot,
+including slots with `Count: 0`. Omitted slots revoke permission to publish any
+pending notice for that category/level; zero counters allow a receiver to keep
+its own pending notice when it, rather than the plugin, dropped events. An
+explicit empty array authoritatively clears all prior counter state. Missing
+metadata means an older client and is not a permission update. A profile or
+permission change rotates the epoch and zeros all counters; counts from an
+earlier epoch must never replay. Consumers baseline the first snapshot without
+a notice and report only later increases, so repeated polls do not repeat a
+notice. `fixtures/query-result-elided-events.json` is an additive payload-v3
+example; older event-history fixtures remain unchanged.
+
+The receiver considers at most 128 entries. Event names and epochs are limited
+to 64 ASCII letters, digits, hyphens, or underscores; levels use the same
+characters with a 16-character limit. All identifiers must be nonempty.
+A malformed container, any malformed entry, duplicate canonical event/log-level
+keys, or more than 128 entries makes the entire metadata snapshot absent.
+Partial snapshots must not revoke valid
+permissions or reset cumulative watermarks. Valid events in the same history
+response remain available even when its metadata is ignored.
+
 `last_autofocus` keeps N.I.N.A.'s common autofocus report as its required
 surface. Hocus Focus can add optional final-measurement provenance, fit-quality
 statistics, accepted-star counts, normalized region geometry, selected fit
