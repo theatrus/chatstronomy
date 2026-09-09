@@ -138,7 +138,7 @@ mod tests {
         serde_json::from_value(json!({
             "Event": "SEQUENCE-ENTITY-FAILED",
             "Time": format!("2026-09-09T04:41:{index}Z"),
-            "Entity": if index % 2 == 0 { "TakeExposure" } else { "SetReadoutMode" },
+            "Entity": if index.is_multiple_of(2) { "TakeExposure" } else { "SetReadoutMode" },
             "EntityType": "Instruction",
             "Error": "Camera not connected"
         }))
