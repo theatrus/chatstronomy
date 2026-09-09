@@ -118,6 +118,12 @@ Safety transitions, equipment recovery, sequence lifecycle, autofocus results,
 and outcomes of accepted remote commands remain outside these limits. The same
 protection applies to hosted Hub and local Discord/Matrix delivery.
 
+Chat reports how many messages were elided, at most once per minute. Counts
+include both Hub-side drops and plugin-side drops when the connected plugin
+supports elision counters. A final notice still appears after a flood stops;
+repeated history polls do not replay counts. Elision notices contain counts,
+not discarded message text, and respect the original event-sharing controls.
+
 Telescope control is **disabled by default in N.I.N.A.** for every delivery
 mode. To allow hardware commands, the telescope owner must enable the plugin's
 local master switch and separately approve each individual operation; sequence

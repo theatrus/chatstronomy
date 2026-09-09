@@ -115,6 +115,15 @@ Safety transitions, equipment recovery, sequence lifecycle, autofocus results,
 and accepted remote-command outcomes are not subject to this diagnostic limit.
 The budgets survive ordinary plugin transport reconnects.
 
+One aggregate **Messages elided (+N skipped)** notice reports dropped
+diagnostics, no more than once per minute. Empty history polls flush any final
+pending count after a flood stops. With supporting plugins, this includes
+records dropped inside N.I.N.A. before transmission. Their optional cumulative
+`ElidedEvents` metadata carries only counts and permission-epoch identifiers;
+the Hub tracks deltas so retries and reconnects do not repeat them. Startup
+adopts existing totals silently. Revoking event sharing clears pending counts
+for that category, and no discarded error or log text is included in notices.
+
 The plugin answers independently permitted event, image, sequence, chart,
 equipment, and typed-command queries. Hub updaters reconstruct available target,
 sequence, built-in timed and astronomical waits, supported Sequencer+ waits,

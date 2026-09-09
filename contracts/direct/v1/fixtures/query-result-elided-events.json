@@ -1,0 +1,47 @@
+{
+  "type": "query_result",
+  "payload": {
+    "id": "7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e",
+    "ok": true,
+    "payload": {
+      "Response": [
+        {
+          "Time": "2026-09-08T23:41:09+00:00",
+          "Event": "SEQUENCE-ENTITY-FAILED",
+          "ChatEnabled": true,
+          "Entity": "TakeExposure",
+          "EntityType": "PlanTakeExposure",
+          "Error": "Camera not connected"
+        }
+      ],
+      "ElidedEvents": [
+        {
+          "Event": "SEQUENCE-ENTITY-FAILED",
+          "Count": 2400,
+          "Epoch": "071d22c0627646aeb4b9a38912e9dfca"
+        },
+        {
+          "Event": "NINA-LOG",
+          "Level": "ERROR",
+          "Count": 1500,
+          "Epoch": "071d22c0627646aeb4b9a38912e9dfca"
+        },
+        {
+          "Event": "IMAGE-SAVE-FAILED",
+          "Count": 0,
+          "Epoch": "071d22c0627646aeb4b9a38912e9dfca"
+        },
+        {
+          "Event": "CAMERA-DOWNLOAD-TIMEOUT",
+          "Count": 0,
+          "Epoch": "071d22c0627646aeb4b9a38912e9dfca"
+        }
+      ],
+      "Error": "",
+      "StatusCode": 200,
+      "Success": true,
+      "Type": "API"
+    },
+    "error": null
+  }
+}

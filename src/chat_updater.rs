@@ -2,6 +2,7 @@ use crate::autofocus::AutofocusResponse;
 use crate::camera::CameraInfo;
 use crate::chat::{ChatAttachment, ChatField, ChatMessage, ChatServiceManager, ChatTarget};
 use crate::discord::colors;
+use crate::event_elision::EventElisionReporter;
 use crate::event_rate_limit::EventRateLimiter;
 use crate::events::{
     Event, EventDeliveryScope, EventDetails, FilterInfo, TargetCoordinates, WeatherConditions,
@@ -1090,6 +1091,7 @@ pub struct ChatUpdater {
     source: SharedRigSource,
     state: UpdaterState,
     event_rate_limiter: EventRateLimiter,
+    event_elisions: EventElisionReporter,
     chat_manager: Arc<ChatServiceManager>,
     chat_target: ChatTarget,
     image_cooldown: Duration,
@@ -1170,6 +1172,7 @@ impl ChatUpdater {
             source,
             state: UpdaterState::new(),
             event_rate_limiter: EventRateLimiter::new(),
+            event_elisions: EventElisionReporter::default(),
             chat_manager,
             chat_target,
             image_cooldown: Duration::from_secs(60),
@@ -2046,6 +2049,10 @@ impl ChatUpdater {
         // Load events and find latest TS-TARGETSTART
         if capabilities.event_history {
             let events = self.source.get_event_history().await?;
+            self.event_elisions.observe_source(
+                events.elided_events.as_deref(),
+                !self.event_baseline_complete,
+            );
             if self.event_baseline_complete {
                 self.process_live_events(events.response).await;
             } else {
@@ -2578,6 +2585,8 @@ impl ChatUpdater {
         }
         match self.source.get_event_history().await {
             Ok(events) => {
+                self.event_elisions
+                    .observe_source(events.elided_events.as_deref(), false);
                 self.process_live_events(events.response).await;
                 self.expire_target_scheduler_target(Utc::now());
                 true
@@ -2597,6 +2606,8 @@ impl ChatUpdater {
         for (index, event) in events.iter().enumerate() {
             if !event.chat_enabled {
                 privacy_boundaries.insert(event_delivery_scope(&event.event), index);
+                self.event_elisions
+                    .revoke_scope(event_delivery_scope(&event.event));
             }
         }
         for (index, event) in events.into_iter().enumerate() {
@@ -2621,6 +2632,7 @@ impl ChatUpdater {
 
             if !self.state.has_seen_event(&event) {
                 if !self.event_rate_limiter.allow(&event, received_at) {
+                    self.event_elisions.dropped_at_hub(&event);
                     // Consume the record permanently, but preserve sequence
                     // failure/outcome state in the original event order.
                     self.apply_event_state(&event);
@@ -2629,6 +2641,16 @@ impl ChatUpdater {
                 self.print_new_event(&event);
                 self.handle_event(&event).await;
             }
+        }
+        if self.chat_manager.service_count() > 0
+            && let Some(count) = self.event_elisions.take_notice(TokioInstant::now())
+        {
+            let message = ChatMessage::new(&self.titled(format!("🔇 Messages elided (+{count} skipped)")))
+                .color(colors::YELLOW)
+                .field("Flood protection", "Additional error, log, or notification messages were dropped to keep this chat readable.", false);
+            self.chat_manager
+                .send_message(&message, &self.chat_target)
+                .await;
         }
     }
 
@@ -5421,6 +5443,7 @@ mod tests {
             };
             Ok(EventHistoryResponse {
                 response,
+                elided_events: None,
                 error: String::new(),
                 status_code: 200,
                 success: true,
@@ -7509,7 +7532,13 @@ mod tests {
             })
             .collect();
         updater.process_live_events(failures.clone()).await;
-        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 2);
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 3);
+        assert!(
+            chat_state.deliveries.lock().unwrap()[2]
+                .0
+                .title
+                .contains("+9998 skipped")
+        );
         assert_eq!(
             updater.state.sequence_failure.as_ref().unwrap().entity,
             "SetReadoutMode"
@@ -7519,7 +7548,7 @@ mod tests {
         updater.process_live_events(failures).await;
         assert_eq!(
             chat_state.deliveries.lock().unwrap().len(),
-            2,
+            3,
             "dropped history must never replay after refill"
         );
 
@@ -7532,7 +7561,7 @@ mod tests {
             serde_json::from_value(value).unwrap()
         }).collect();
         updater.process_live_events(recovery).await;
-        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 5);
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 6);
         assert_eq!(updater.state.safety_state, SafetyState::Unsafe);
         assert_eq!(updater.state.sequence_outcome.as_deref(), Some("failed"));
     }
@@ -7555,7 +7584,7 @@ mod tests {
             details: None,
         };
         updater.process_live_events(vec![start, repeat]).await;
-        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 2);
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 3);
         assert_eq!(
             updater.state.sequence_failure.as_ref().unwrap().error,
             "Camera not connected"
@@ -7566,6 +7595,54 @@ mod tests {
         disabled.time = "2026-09-09T04:41:12Z".into();
         updater.process_live_events(vec![failure, disabled]).await;
         assert!(updater.state.sequence_failure.is_none());
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plugin_elisions_flush_on_empty_polls_and_respect_legacy_privacy_markers() {
+        use crate::events::ElidedEventCount;
+        let (mut updater, chat_state) = recording_test_updater();
+        let counter = |count| ElidedEventCount {
+            event: "SEQUENCE-ENTITY-FAILED".into(),
+            level: None,
+            count,
+            epoch: "profile".into(),
+        };
+        updater
+            .event_elisions
+            .observe_source(Some(&[counter(100)]), false);
+        updater.process_live_events(Vec::new()).await;
+        assert!(
+            chat_state.deliveries.lock().unwrap()[0]
+                .0
+                .title
+                .contains("+100 skipped")
+        );
+        updater
+            .event_elisions
+            .observe_source(Some(&[counter(120)]), false);
+        updater.process_live_events(Vec::new()).await;
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 1);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        updater.process_live_events(Vec::new()).await;
+        assert!(
+            chat_state.deliveries.lock().unwrap()[1]
+                .0
+                .title
+                .contains("+20 skipped")
+        );
+        updater
+            .event_elisions
+            .observe_source(Some(&[counter(150)]), false);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        updater
+            .process_live_events(vec![Event {
+                time: "2026-09-09T01:00:00Z".into(),
+                event: "SEQUENCE-ENTITY-FAILED".into(),
+                chat_enabled: false,
+                details: None,
+            }])
+            .await;
         assert_eq!(chat_state.deliveries.lock().unwrap().len(), 2);
     }
 

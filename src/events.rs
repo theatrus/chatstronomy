@@ -3,16 +3,111 @@ use crate::serde_helpers::{
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct EventHistoryResponse {
     pub response: Vec<Event>,
+    /// Cumulative plugin-side rate-limit counts for the current permission
+    /// epoch. `None` denotes a legacy/invalid snapshot; `Some([])` explicitly
+    /// clears the counters after permissions or the profile change.
+    #[serde(
+        default,
+        deserialize_with = "de_elided_events_tolerant",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub elided_events: Option<Vec<ElidedEventCount>>,
     pub error: String,
     pub status_code: i32,
     pub success: bool,
     #[serde(rename = "Type")]
     pub response_type: String,
+}
+
+/// Rate-limit metadata carries only an event category, optional log level,
+/// opaque epoch identifier, and cumulative count. It never carries log/error
+/// messages or other event details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ElidedEventCount {
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    pub count: u64,
+    pub epoch: String,
+}
+
+/// Shared by wire validation and rate-limit accounting so log aliases cannot
+/// introduce multiple cumulative watermarks for the same effective log level.
+pub(crate) fn normalize_elision_log_level(level: Option<&str>) -> String {
+    let normalized = level
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(16)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    match normalized.as_str() {
+        "INFO" => "INFORMATION".into(),
+        "WARN" => "WARNING".into(),
+        "FATAL" | "CRITICAL" => "ERROR".into(),
+        "VERBOSE" => "TRACE".into(),
+        _ => normalized,
+    }
+}
+
+fn de_elided_events_tolerant<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ElidedEventCount>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let Value::Array(entries) = value else {
+        return Ok(None);
+    };
+    // This array is an authoritative permission snapshot. Accept it atomically:
+    // filtering a bad entry or truncating the array would turn corruption into
+    // apparent revocation and reset an otherwise valid cumulative watermark.
+    if entries.len() > 128 {
+        return Ok(None);
+    }
+    let is_identifier = |value: &str, max_len: usize| {
+        !value.is_empty()
+            && value.len() <= max_len
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    let mut counts = Vec::with_capacity(entries.len());
+    let mut keys = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let Ok(entry) = serde_json::from_value::<ElidedEventCount>(entry) else {
+            return Ok(None);
+        };
+        if !is_identifier(&entry.event, 64)
+            || !is_identifier(&entry.epoch, 64)
+            || !entry
+                .level
+                .as_deref()
+                .is_none_or(|level| is_identifier(level, 16))
+        {
+            return Ok(None);
+        }
+        let level = if entry.event == "NINA-LOG" {
+            normalize_elision_log_level(entry.level.as_deref())
+        } else {
+            String::new()
+        };
+        if !keys.insert((entry.event.clone(), level)) {
+            // Conflicting epochs for a duplicate key could otherwise flip
+            // its watermark on every poll and repeatedly announce old counts.
+            return Ok(None);
+        }
+        counts.push(entry);
+    }
+    Ok(Some(counts))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1275,6 +1370,189 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_fixture(fixture: &str) -> Value {
+        let mut frame: Value = serde_json::from_str(fixture).unwrap();
+        frame["payload"]["payload"].take()
+    }
+
+    #[test]
+    fn legacy_event_history_omits_elision_metadata() {
+        for fixture in [
+            include_str!("../contracts/direct/v1/fixtures/query-result-motion.json"),
+            include_str!("../contracts/direct/v1/fixtures/query-result-motion-legacy.json"),
+        ] {
+            let history: EventHistoryResponse =
+                serde_json::from_value(history_fixture(fixture)).unwrap();
+            assert!(!history.response.is_empty());
+            assert!(history.elided_events.is_none());
+            assert!(
+                serde_json::to_value(history)
+                    .unwrap()
+                    .get("ElidedEvents")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn event_history_elision_counters_round_trip_and_empty_is_authoritative() {
+        let payload = history_fixture(include_str!(
+            "../contracts/direct/v1/fixtures/query-result-elided-events.json"
+        ));
+        let history: EventHistoryResponse = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(history.response.len(), 1);
+        let counts = history.elided_events.as_ref().unwrap();
+        assert_eq!(counts.len(), 4);
+        assert_eq!(counts[0].event, "SEQUENCE-ENTITY-FAILED");
+        assert_eq!(counts[0].count, 2400);
+        assert!(counts[0].level.is_none());
+        assert_eq!(counts[1].level.as_deref(), Some("ERROR"));
+        assert_eq!(counts[1].count, 1500);
+        assert!(counts[2..].iter().all(|entry| entry.count == 0));
+        assert_eq!(counts[0].epoch, counts[1].epoch);
+        assert_eq!(
+            serde_json::to_value(&history).unwrap()["ElidedEvents"],
+            payload["ElidedEvents"]
+        );
+
+        let mut cleared = payload;
+        cleared["ElidedEvents"] = serde_json::json!([]);
+        let history: EventHistoryResponse = serde_json::from_value(cleared).unwrap();
+        assert_eq!(history.elided_events, Some(vec![]));
+        assert_eq!(
+            serde_json::to_value(history).unwrap()["ElidedEvents"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn malformed_elision_metadata_does_not_discard_valid_events() {
+        let payload = history_fixture(include_str!(
+            "../contracts/direct/v1/fixtures/query-result-elided-events.json"
+        ));
+        for malformed in [
+            Value::Null,
+            serde_json::json!({"Event": "SEQUENCE-ENTITY-FAILED"}),
+            serde_json::json!("invalid"),
+            serde_json::json!(10),
+            serde_json::json!(false),
+        ] {
+            let mut input = payload.clone();
+            input["ElidedEvents"] = malformed;
+            let history: EventHistoryResponse = serde_json::from_value(input).unwrap();
+            assert_eq!(history.response.len(), 1);
+            assert!(history.elided_events.is_none());
+        }
+
+        let valid = payload["ElidedEvents"][0].clone();
+        let mut invalid_entries =
+            vec![Value::Null, serde_json::json!({}), serde_json::json!(false)];
+        for (field, invalid) in [
+            ("Count", serde_json::json!(-1)),
+            ("Count", serde_json::json!(1.5)),
+            ("Count", serde_json::json!("2400")),
+            (
+                "Count",
+                serde_json::from_str("18446744073709551616").unwrap(),
+            ),
+            ("Event", serde_json::json!("x".repeat(65))),
+            ("Event", serde_json::json!("Camera not connected")),
+            ("Level", serde_json::json!("x".repeat(17))),
+            ("Level", serde_json::json!({"Message": "private"})),
+            ("Epoch", serde_json::json!("x".repeat(65))),
+            ("Epoch", serde_json::json!("")),
+            ("Epoch", serde_json::json!("/private/file")),
+        ] {
+            let mut entry = valid.clone();
+            entry[field] = invalid;
+            invalid_entries.push(entry);
+        }
+        for invalid in invalid_entries {
+            for entries in [vec![invalid.clone()], vec![valid.clone(), invalid]] {
+                let mut input = payload.clone();
+                input["ElidedEvents"] = Value::Array(entries);
+                let history: EventHistoryResponse = serde_json::from_value(input).unwrap();
+                assert_eq!(history.response.len(), 1);
+                assert!(history.elided_events.is_none());
+            }
+        }
+        let next_valid: EventHistoryResponse = serde_json::from_value(payload).unwrap();
+        assert_eq!(next_valid.elided_events.unwrap()[0].count, 2400);
+    }
+
+    #[test]
+    fn elision_metadata_is_bounded() {
+        let mut payload = history_fixture(include_str!(
+            "../contracts/direct/v1/fixtures/query-result-elided-events.json"
+        ));
+        let entry = payload["ElidedEvents"][0].clone();
+        let entries = (0..129)
+            .map(|index| {
+                let mut entry = entry.clone();
+                entry["Event"] = serde_json::json!(format!("ERROR-{index}"));
+                entry
+            })
+            .collect::<Vec<_>>();
+        payload["ElidedEvents"] = Value::Array(entries[..128].to_vec());
+        let history: EventHistoryResponse = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(history.response.len(), 1);
+        assert_eq!(history.elided_events.unwrap().len(), 128);
+        payload["ElidedEvents"] = Value::Array(entries);
+        let history: EventHistoryResponse = serde_json::from_value(payload).unwrap();
+        assert_eq!(history.response.len(), 1);
+        assert!(history.elided_events.is_none());
+    }
+
+    #[test]
+    fn duplicate_elision_keys_reject_the_metadata_even_with_different_epochs() {
+        let mut payload = history_fixture(include_str!(
+            "../contracts/direct/v1/fixtures/query-result-elided-events.json"
+        ));
+        let first = payload["ElidedEvents"][0].clone();
+        let mut second = first.clone();
+        second["Epoch"] = serde_json::json!("successor-epoch");
+        second["Count"] = serde_json::json!(1);
+        for level in [Value::Null, serde_json::json!("ERROR")] {
+            // Non-log categories ignore Level, matching receiver accounting.
+            second["Level"] = level;
+            payload["ElidedEvents"] = serde_json::json!([first, second]);
+            let history: EventHistoryResponse = serde_json::from_value(payload.clone()).unwrap();
+            assert_eq!(history.response.len(), 1);
+            assert!(history.elided_events.is_none());
+        }
+    }
+
+    #[test]
+    fn elision_log_aliases_share_one_key_but_distinct_levels_remain_valid() {
+        let mut payload = history_fixture(include_str!(
+            "../contracts/direct/v1/fixtures/query-result-elided-events.json"
+        ));
+        let mut first = payload["ElidedEvents"][1].clone();
+        let mut second = first.clone();
+        second["Epoch"] = serde_json::json!("successor-epoch");
+        for (alias, canonical) in [
+            ("INFO", "information"),
+            ("WARN", "WARNING"),
+            ("FATAL", "ERROR"),
+            ("CRITICAL", "ERROR"),
+            ("VERBOSE", "TRACE"),
+            ("DEBUG", "debug"),
+        ] {
+            first["Level"] = serde_json::json!(alias);
+            second["Level"] = serde_json::json!(canonical);
+            payload["ElidedEvents"] = serde_json::json!([first, second]);
+            let history: EventHistoryResponse = serde_json::from_value(payload.clone()).unwrap();
+            assert_eq!(history.response.len(), 1);
+            assert!(history.elided_events.is_none());
+        }
+        first["Level"] = serde_json::json!("ERROR");
+        second["Level"] = serde_json::json!("WARN");
+        payload["ElidedEvents"] = serde_json::json!([first, second]);
+        let history: EventHistoryResponse = serde_json::from_value(payload).unwrap();
+        assert_eq!(history.response.len(), 1);
+        assert_eq!(history.elided_events.unwrap().len(), 2);
+    }
 
     #[test]
     fn command_failures_preserve_the_operation_and_error_details() {
