@@ -11,6 +11,7 @@ pub mod config;
 pub mod direct;
 pub mod discord;
 pub mod error;
+mod event_rate_limit;
 pub mod events;
 pub mod filterwheel;
 pub mod focuser;
