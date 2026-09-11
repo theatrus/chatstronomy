@@ -289,13 +289,6 @@ function hostedPolicyLinks() {
     '" target="_blank" rel="noopener noreferrer">terms</a>';
 }
 
-function localPrivacyNotice() {
-  return '<p class="hint">Choose what to share in N.I.N.A. before pairing. ' +
-    'Disabled event categories are never sent to the Hub. Images, logs, and ' +
-    'location have separate controls. Hardware commands require the local ' +
-    'master switch and individual command permissions.</p>';
-}
-
 function toast(msg) {
   const el = document.getElementById("toast");
   const announcer = document.getElementById("announcer");
@@ -330,7 +323,6 @@ async function boot() {
       '<div class="card"><h2 style="margin-top:0">Bring your observatory into Discord</h2>' +
       '<p>Follow your N.I.N.A. sessions in Discord: images, focus curves, ' +
       "guiding, and status updates.</p>" +
-      localPrivacyNotice() +
       '<p><a href="/login"><button class="primary">Log in with Discord</button></a></p>' +
       '<p class="hint">Read the ' + hostedPolicyLinks() + ' before signing in.</p></div>';
     return;
@@ -498,8 +490,7 @@ function renderMyTelescopes(telescopes, target) {
   card.className = "card";
   let html = '<div class="head"><h2>' + ico("telescope") + "My telescopes</h2>" +
     '' +
-    '<div class="badges"><span class="hint">across your servers</span></div></div>' +
-    localPrivacyNotice();
+    '<div class="badges"><span class="hint">across your servers</span></div></div>';
   if (!telescopes.length) {
     html += '<div class="steps"><span><b>1</b> Add a telescope</span>' +
       "<span><b>2</b> Attach it to a server</span>" +
@@ -918,8 +909,6 @@ mod tests {
             "t.commands_enabled",
             "a.commands_enabled",
             "commands locked in N.I.N.A.",
-            "Hardware commands require the local",
-            "master switch and individual command permissions",
             "enable the master switch and each command's permission",
             "Only commands approved in N.I.N.A. are allowed",
             "Server roles cannot override that",
@@ -929,17 +918,13 @@ mod tests {
     }
 
     #[test]
-    fn page_explains_the_local_event_and_privacy_boundary() {
-        for needle in [
-            "function localPrivacyNotice()",
-            "Choose what to share in N.I.N.A. before pairing",
-            "Disabled event categories are never sent to the Hub",
-            "Images, logs, and",
-            "location have separate controls",
-        ] {
-            assert!(INDEX_HTML.contains(needle), "missing {needle}");
-        }
-        assert!(INDEX_HTML.matches("localPrivacyNotice()").count() >= 3);
+    fn page_keeps_the_intro_focused_on_features() {
+        assert!(
+            INDEX_HTML.contains("Follow your N.I.N.A. sessions in Discord: images, focus curves")
+        );
+        assert!(INDEX_HTML.contains("guiding, and status updates"));
+        assert!(!INDEX_HTML.contains("localPrivacyNotice"));
+        assert!(!INDEX_HTML.contains("Choose what to share in N.I.N.A. before pairing"));
     }
 
     #[test]
