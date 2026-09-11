@@ -1,0 +1,11 @@
+{
+  "type": "query",
+  "payload": {
+    "id": "7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e",
+    "expires_at": 1900000000,
+    "kind": "command",
+    "command": {
+      "kind": "slew_to_target"
+    }
+  }
+}

@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
+use uuid::Uuid;
 
 /// How a rig supplies N.I.N.A. data to Chatstronomy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,13 @@ pub struct RigCapabilities {
     pub autofocus_details: bool,
     pub guider_graph: bool,
     pub commands: bool,
+    /// Supports the additive current-target command kinds, independently of local consent.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub target_commands: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl RigCapabilities {
@@ -56,6 +64,7 @@ impl RigCapabilities {
             autofocus_details: false,
             guider_graph: false,
             commands: false,
+            target_commands: false,
         }
     }
 
@@ -69,6 +78,7 @@ impl RigCapabilities {
             autofocus_details: true,
             guider_graph: true,
             commands: true,
+            target_commands: true,
         }
     }
 }
@@ -109,17 +119,45 @@ pub type SharedRigSource = Arc<dyn RigSource>;
 pub enum RigCommand {
     UnparkMount,
     HomeMount,
-    ChangeFilter { filter_id: i32 },
-    StartGuiding { calibrate: bool },
+    ChangeFilter {
+        filter_id: i32,
+    },
+    StartGuiding {
+        calibrate: bool,
+    },
     StopGuiding,
-    CoolCamera { temperature: f64, minutes: f64 },
-    WarmCamera { minutes: f64 },
+    CoolCamera {
+        temperature: f64,
+        minutes: f64,
+    },
+    WarmCamera {
+        minutes: f64,
+    },
+    /// The plugin starts while idle or queues its trigger in the active advanced sequence.
     StartAutofocus,
+    /// Cancels only the plugin's own queued or running autofocus request.
     CancelAutofocus,
+    /// Moves to the target resolved locally by the plugin, without remote coordinates.
+    SlewToTarget,
+    /// Plate-solves and centers the locally resolved target.
+    CenterTarget,
+    /// Centers and rotates to the locally resolved target and position angle.
+    CenterRotateTarget,
     ParkMount,
     AbortExposure,
     StopSequence,
-    StartSequence { skip_validation: bool },
+    StartSequence {
+        skip_validation: bool,
+    },
+}
+
+impl RigCommand {
+    pub fn is_target_command(&self) -> bool {
+        matches!(
+            self,
+            Self::SlewToTarget | Self::CenterTarget | Self::CenterRotateTarget
+        )
+    }
 }
 
 /// Source-neutral read and command surface used by Chatstronomy's runtime.
@@ -131,6 +169,12 @@ pub enum RigCommand {
 pub trait RigSource: Send + Sync {
     fn kind(&self) -> RigSourceKind;
     fn capabilities(&self) -> RigCapabilities;
+
+    /// Opaque identity of an exact command transport. Reconnecting changes it.
+    /// Sources without one must retain the same Arc to revalidate a command.
+    fn command_connection_id(&self) -> Option<Uuid> {
+        None
+    }
 
     async fn get_event_history(&self) -> RigSourceResult<EventHistoryResponse>;
     async fn get_all_image_history(&self) -> RigSourceResult<ImageHistoryResponse>;
@@ -160,7 +204,35 @@ mod tests {
     }
 
     #[test]
+    fn legacy_capabilities_never_enable_new_target_commands() {
+        let mut value = serde_json::to_value(RigCapabilities::all()).unwrap();
+        value.as_object_mut().unwrap().remove("target_commands");
+        let legacy: RigCapabilities = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.commands);
+        assert!(!legacy.target_commands);
+        value["target_commands"] = serde_json::json!(false);
+        assert!(
+            !serde_json::from_value::<RigCapabilities>(value)
+                .unwrap()
+                .target_commands
+        );
+        assert!(RigCapabilities::all().target_commands);
+    }
+
+    #[test]
     fn commands_have_stable_semantic_wire_names() {
+        for (command, kind) in [
+            (RigCommand::SlewToTarget, "slew_to_target"),
+            (RigCommand::CenterTarget, "center_target"),
+            (RigCommand::CenterRotateTarget, "center_rotate_target"),
+        ] {
+            let value = serde_json::to_value(&command).unwrap();
+            assert_eq!(value, serde_json::json!({"kind": kind}));
+            assert_eq!(
+                serde_json::from_value::<RigCommand>(value).unwrap(),
+                command
+            );
+        }
         assert_eq!(
             serde_json::to_value(RigCommand::CoolCamera {
                 temperature: -10.0,

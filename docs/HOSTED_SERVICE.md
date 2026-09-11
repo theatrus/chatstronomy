@@ -55,6 +55,71 @@ were accepted; if an accepted operation later fails, that terminal failure is
 always posted as part of the command exchange and is not controlled by optional
 event switches.
 
+## Autofocus and sequence commands
+
+The hosted and local Discord bots share the `/chatstronomy` command group:
+
+Use plugin **0.1.0.28 or newer** for the local sequence guards and trigger
+queues described here. Existing command kinds retain the connected plugin's
+behavior; updating the Hub alone cannot add local safety checks to an older
+plugin.
+
+| Command | Behavior enforced in N.I.N.A. |
+| --- | --- |
+| `autofocus` | Starts while idle only when camera ownership can be acquired; during an advanced sequence, queues a request for the Chatstronomy Autofocus trigger. |
+| `autofocus cancel:true` | Cancels only Chatstronomy's own queued or running autofocus request. |
+| `change-filter filter:<name>` | Changes the named filter while idle, or queues it before a light exposure through the matching trigger. |
+| `slew-target` | Slews to the target resolved inside N.I.N.A., while idle or through the matching sequence trigger. |
+| `center-target` | Plate-solves and centers the locally resolved target, while idle or through the matching trigger. |
+| `center-rotate-target` | Centers and rotates to the locally resolved target and position angle, while idle or through the matching trigger. |
+| `start-sequence` | Starts the loaded sequence while idle; pre-run validation is enabled unless separately permitted and explicitly skipped. |
+| `stop-sequence` | Requests a coordinated stop of the currently active sequence. |
+| `cool` / `warm` | Changes camera temperature while idle or during a sequence, when locally permitted. |
+
+For requests during an advanced sequence, add the corresponding trigger to the
+target's enclosing instruction set or an ancestor containing its exposures:
+
+| Command | N.I.N.A. trigger |
+| --- | --- |
+| `autofocus` | Chatstronomy Autofocus |
+| `change-filter` | Chatstronomy Filter Change |
+| `slew-target` | Chatstronomy Slew to Target |
+| `center-target` | Chatstronomy Center Target |
+| `center-rotate-target` | Chatstronomy Center and Rotate Target |
+
+A queued request runs before the next eligible **light** exposure. If the
+running sequence has no matching trigger, the plugin rejects the request; the
+simple sequencer does not support this queue. Only one Chatstronomy autofocus
+request can be pending or running at once. Requests expire and do not carry
+into another sequence, profile, or permission session. Canceling a Chatstronomy
+autofocus request never cancels a run started by N.I.N.A. or another plugin.
+
+Target motion requires an unambiguous target selected locally in N.I.N.A.
+The commands have no coordinate or rotation-angle arguments; center-and-rotate
+also uses the target's local position angle. Each operation requires its own
+local permission. When idle, operations using the camera must acquire capture
+ownership. Missing targets or equipment are reported as rejections.
+
+Unpark, home, park, guiding changes, exposure abortion, and another sequence
+start are rejected while a sequence is active. Use `stop-sequence` instead of
+aborting an exposure owned by the sequencer. Cooling and warming remain
+available during a sequence. These decisions use live state inside N.I.N.A.,
+even when sequence event sharing is disabled or the Hub's displayed state is
+stale.
+
+Confirmation sends a request to N.I.N.A.; it does not prove that the operation
+has started. Queued and asynchronously accepted requests carry status 202 and
+are shown with a pending indicator. The plugin's rejection reason is preserved
+in the response. Later failures of accepted commands remain visible through
+the command exchange independently of optional event delivery.
+The bot rechecks server policy and attachment access when dispatching and uses
+the confirming interaction's current roles and permissions. A confirmation
+cannot carry across a replaced telescope connection or a different telescope
+that reused its name. Older plugins that do not advertise current-target
+command support receive no unknown command; chat asks the owner to update.
+Matrix and Discord webhooks support outbound notifications; interactive
+hardware commands are provided through the Discord bot.
+
 ## Locally enforced event transmission and privacy
 
 Event switches in the N.I.N.A. plugin are transmission and privacy controls, not

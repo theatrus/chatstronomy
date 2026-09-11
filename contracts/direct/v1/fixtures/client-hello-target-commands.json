@@ -1,0 +1,25 @@
+{
+  "type": "client_hello",
+  "payload": {
+    "protocol_version": 1,
+    "payload_version": 3,
+    "node_id": "363db028-9d79-4fdc-8940-1b1ff52b9e8d",
+    "session_id": "7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e",
+    "process_id": 4242,
+    "profile_id": "460a8c62-28ce-4781-92e5-ab2440982175",
+    "profile_name": "North Rig",
+    "plugin_version": "0.1.0.28",
+    "nina_version": "3.2.0.9001",
+    "capabilities": {
+      "event_history": true,
+      "image_history": true,
+      "thumbnails": true,
+      "sequence": true,
+      "equipment_snapshots": true,
+      "autofocus_details": true,
+      "guider_graph": true,
+      "commands": true,
+      "target_commands": true
+    }
+  }
+}

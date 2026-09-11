@@ -40,7 +40,8 @@
         "equipment_snapshots": { "type": "boolean" },
         "autofocus_details": { "type": "boolean" },
         "guider_graph": { "type": "boolean" },
-        "commands": { "type": "boolean" }
+        "commands": { "type": "boolean" },
+        "target_commands": { "type": "boolean", "default": false }
       }
     },
     "client_hello": {
@@ -232,6 +233,9 @@
                 "stop_guiding",
                 "start_autofocus",
                 "cancel_autofocus",
+                "slew_to_target",
+                "center_target",
+                "center_rotate_target",
                 "park_mount",
                 "abort_exposure",
                 "stop_sequence"

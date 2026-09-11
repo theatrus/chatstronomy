@@ -5,8 +5,10 @@
 //! command set serves both a self-hosted bot (static config maps) and the
 //! hub (database-backed, per-guild tenancy, live rig connections).
 
-use crate::source::SharedRigSource;
+use crate::api_types::CommandResponse;
+use crate::source::{RigCommand, RigSourceError, RigSourceResult, SharedRigSource};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Facts about a slash-command invocation that resolution and authorization
 /// may use.
@@ -50,6 +52,41 @@ pub trait RigResolver: Send + Sync {
         self.write_allowed(invocation, &resolved.0)?;
         Ok(resolved)
     }
+
+    /// Recheck current policy after confirmation or other asynchronous work,
+    /// without redirecting the command to a replacement that reused the name.
+    fn resolve_for_dispatch(
+        &self,
+        invocation: &CommandContext,
+        telescope: &str,
+        expected: &SharedRigSource,
+    ) -> Result<SharedRigSource, String> {
+        let (_, current) = self.resolve_for_write(invocation, Some(telescope))?;
+        let same_connection = expected
+            .command_connection_id()
+            .zip(current.command_connection_id())
+            .is_some_and(|(expected, current)| expected == current);
+        if !Arc::ptr_eq(expected, &current) && !same_connection {
+            return Err("The telescope connection changed. Run the command again for the current connection.".to_string());
+        }
+        Ok(current)
+    }
+}
+
+pub(crate) async fn execute_authorized_command(
+    resolver: &dyn RigResolver,
+    invocation: &CommandContext,
+    telescope: &str,
+    expected: &SharedRigSource,
+    command: RigCommand,
+) -> RigSourceResult<CommandResponse> {
+    let source = resolver
+        .resolve_for_dispatch(invocation, telescope, expected)
+        .map_err(|reason| RigSourceError::Rejected {
+            kind: expected.kind(),
+            reason,
+        })?;
+    source.execute_command(command).await
 }
 
 /// Config-file-backed resolver used by the local bot: fixed telescope maps
@@ -299,6 +336,36 @@ mod tests {
                 .err()
                 .unwrap()
                 .contains("No telescope mapped")
+        );
+    }
+
+    #[test]
+    fn local_dispatch_revalidation_requires_the_same_source_and_current_acl() {
+        let mut resolver = resolver();
+        let invocation = invocation(42, 7);
+        let (name, expected) = resolver.resolve_for_write(&invocation, None).unwrap();
+        assert!(Arc::ptr_eq(
+            &expected,
+            &resolver
+                .resolve_for_dispatch(&invocation, &name, &expected)
+                .unwrap()
+        ));
+        resolver.write_acl.clear();
+        assert!(
+            resolver
+                .resolve_for_dispatch(&invocation, &name, &expected)
+                .is_err()
+        );
+        resolver.write_acl.insert(7);
+        resolver
+            .rig_sources
+            .insert(name.clone(), Arc::new(TestDirectSource { commands: true }));
+        assert!(
+            resolver
+                .resolve_for_dispatch(&invocation, &name, &expected)
+                .err()
+                .unwrap()
+                .contains("connection changed")
         );
     }
 

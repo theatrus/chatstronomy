@@ -166,6 +166,13 @@ impl RigSource for DirectRigSource {
         RigSourceKind::NinaDirect
     }
 
+    fn command_connection_id(&self) -> Option<Uuid> {
+        match &self.connection {
+            DirectConnection::Pinned(connection) => Some(connection.connection_id),
+            DirectConnection::Current { .. } => None,
+        }
+    }
+
     fn capabilities(&self) -> RigCapabilities {
         match &self.connection {
             DirectConnection::Pinned(connection) => connection.capabilities,
@@ -235,6 +242,12 @@ impl RigSource for DirectRigSource {
                 capability: "commands",
             });
         }
+        if command.is_target_command() && !connection.capabilities.target_commands {
+            return Err(RigSourceError::Unsupported {
+                kind: RigSourceKind::NinaDirect,
+                capability: "current-target commands (update the Chatstronomy N.I.N.A. plugin)",
+            });
+        }
         let payload = self
             .query_value_on(connection, QueryKind::Command { command })
             .await?;
@@ -251,6 +264,95 @@ mod tests {
     use uuid::Uuid;
 
     #[tokio::test]
+    async fn autofocus_and_sequence_dispatch_preserve_pending_outcomes() {
+        for (command, message) in [
+            (
+                RigCommand::ChangeFilter { filter_id: 3 },
+                "Filter change queued before the next light exposure",
+            ),
+            (
+                RigCommand::SlewToTarget,
+                "Target slew queued before the next light exposure",
+            ),
+            (
+                RigCommand::CenterTarget,
+                "Target centering queued before the next light exposure",
+            ),
+            (
+                RigCommand::CenterRotateTarget,
+                "Target centering and rotation queued before the next light exposure",
+            ),
+            (
+                RigCommand::StartAutofocus,
+                "Autofocus queued for the next exposure boundary",
+            ),
+            (
+                RigCommand::CancelAutofocus,
+                "Autofocus cancellation requested",
+            ),
+            (
+                RigCommand::StartSequence {
+                    skip_validation: false,
+                },
+                "Sequence start requested",
+            ),
+            (RigCommand::StopSequence, "Sequence stop requested"),
+        ] {
+            let (connection, mut outgoing) = RigConnection::stub(7, Uuid::new_v4());
+            let source = DirectRigSource::new(connection.clone());
+            let expected = command.clone();
+            let exchange = tokio::spawn(async move { source.execute_command(command).await });
+            let request = match outgoing.recv().await.expect("command request") {
+                DirectMessage::Query(request) => request,
+                other => panic!("expected command query, got {other:?}"),
+            };
+            assert_eq!(request.kind, QueryKind::Command { command: expected });
+            assert!(request.expires_at.is_some());
+            connection.resolve(QueryResult {
+                id: request.id,
+                ok: true,
+                payload: serde_json::json!({
+                    "Response": message,
+                    "Error": "",
+                    "StatusCode": 202,
+                    "Success": true,
+                    "Type": "API"
+                }),
+                error: None,
+                error_code: None,
+            });
+            let response = exchange.await.unwrap().unwrap();
+            assert!(response.is_pending());
+            assert_eq!(response.summary(), message);
+        }
+    }
+
+    #[tokio::test]
+    async fn sequence_ownership_rejection_is_preserved_without_retry() {
+        let (connection, mut outgoing) = RigConnection::stub(7, Uuid::new_v4());
+        let source = DirectRigSource::new(connection.clone());
+        let exchange =
+            tokio::spawn(async move { source.execute_command(RigCommand::AbortExposure).await });
+        let request = match outgoing.recv().await.expect("command request") {
+            DirectMessage::Query(request) => request,
+            other => panic!("expected command query, got {other:?}"),
+        };
+        let reason = "A sequence owns the camera. Use /stop-sequence to stop it.";
+        connection.resolve(QueryResult {
+            id: request.id,
+            ok: false,
+            payload: serde_json::Value::Null,
+            error: Some(reason.to_string()),
+            error_code: None,
+        });
+        assert!(matches!(
+            exchange.await.unwrap(),
+            Err(RigSourceError::Rejected { reason: actual, .. }) if actual == reason
+        ));
+        assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
     async fn locally_disabled_commands_never_reach_the_rig() {
         let (mut connection, mut outgoing) = RigConnection::stub(1, Uuid::new_v4());
         Arc::get_mut(&mut connection)
@@ -259,19 +361,54 @@ mod tests {
             .commands = false;
         let source = DirectRigSource::new(connection);
 
-        let error = source
-            .execute_command(RigCommand::ParkMount)
-            .await
-            .expect_err("a read-only rig must reject commands");
+        for command in [
+            RigCommand::ParkMount,
+            RigCommand::SlewToTarget,
+            RigCommand::CenterTarget,
+            RigCommand::CenterRotateTarget,
+        ] {
+            let error = source
+                .execute_command(command)
+                .await
+                .expect_err("a read-only rig must reject commands");
 
-        assert!(matches!(
-            error,
-            RigSourceError::Unsupported {
-                kind: RigSourceKind::NinaDirect,
-                capability: "commands",
-            }
-        ));
+            assert!(matches!(
+                error,
+                RigSourceError::Unsupported {
+                    kind: RigSourceKind::NinaDirect,
+                    capability: "commands",
+                }
+            ));
+        }
         assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn legacy_rigs_never_receive_unknown_target_command_kinds() {
+        for target_support in [None, Some(false)] {
+            let (mut connection, mut outgoing) = RigConnection::stub(1, Uuid::new_v4());
+            let mut capabilities = serde_json::to_value(RigCapabilities::all()).unwrap();
+            capabilities
+                .as_object_mut()
+                .unwrap()
+                .remove("target_commands");
+            if let Some(supported) = target_support {
+                capabilities["target_commands"] = serde_json::json!(supported);
+            }
+            Arc::get_mut(&mut connection).unwrap().capabilities =
+                serde_json::from_value(capabilities).unwrap();
+            let source = DirectRigSource::new(connection);
+            for command in [
+                RigCommand::SlewToTarget,
+                RigCommand::CenterTarget,
+                RigCommand::CenterRotateTarget,
+            ] {
+                assert!(
+                    matches!(source.execute_command(command).await, Err(RigSourceError::Unsupported { capability, .. }) if capability.contains("current-target commands"))
+                );
+            }
+            assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+        }
     }
 
     #[test]
