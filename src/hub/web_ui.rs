@@ -285,22 +285,15 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
 
 function hostedPolicyLinks() {
   return '<a href="' + HOSTED_PRIVACY_URL + '" target="_blank" rel="noopener noreferrer">' +
-    'hosted privacy statement</a> and <a href="' + HOSTED_TERMS_URL +
-    '" target="_blank" rel="noopener noreferrer">hosted terms</a>';
+    'Hub privacy policy</a> and <a href="' + HOSTED_TERMS_URL +
+    '" target="_blank" rel="noopener noreferrer">terms</a>';
 }
 
 function localPrivacyNotice() {
-  return '<p class="hint">Ordinary event categories, images, and popup ' +
-    'notifications start on by default. Review your N.I.N.A. event selections ' +
-    'before pairing: disabled categories never reach this Hub, even for state ' +
-    'reconstruction. Accepted command failures are still reported. ' +
-    'Turning off images also blocks ' +
-    'existing image history and thumbnails. Allowed equipment and status ' +
-    'snapshots remain available, but Hub state may be incomplete. N.I.N.A. log ' +
-    'forwarding, observatory location sharing, and hardware control start off. ' +
-    'Hardware control requires the N.I.N.A. master switch plus individual ' +
-    'command approvals. N.I.N.A. also checks live sequence state before ' +
-    'applying a command.</p>';
+  return '<p class="hint">Choose what to share in N.I.N.A. before pairing. ' +
+    'Disabled event categories are never sent to the Hub. Images, logs, and ' +
+    'location have separate controls. Hardware commands require the local ' +
+    'master switch and individual command permissions.</p>';
 }
 
 function toast(msg) {
@@ -335,9 +328,8 @@ async function boot() {
     who.innerHTML = "";
     app.innerHTML =
       '<div class="card"><h2 style="margin-top:0">Bring your observatory into Discord</h2>' +
-      '<p>Add your telescopes, attach them to your servers, and let everyone ' +
-      "watch sessions unfold — images, autofocus runs, guiding graphs, and " +
-      "optional remote commands authorized locally in N.I.N.A.</p>" +
+      '<p>Follow your N.I.N.A. sessions in Discord: images, focus curves, ' +
+      "guiding, and status updates.</p>" +
       localPrivacyNotice() +
       '<p><a href="/login"><button class="primary">Log in with Discord</button></a></p>' +
       '<p class="hint">Read the ' + hostedPolicyLinks() + ' before signing in.</p></div>';
@@ -418,10 +410,9 @@ async function renderAll(tab = ACTIVE_TAB, focusAttachmentId = null) {
   if (guilds.bot_configured === false) {
     const banner = document.createElement("div");
     banner.className = "banner";
-    banner.innerHTML = "<b>This hub is running without a Discord bot token.</b> " +
-      "Channel and role pickers, install checks, notifications, and slash commands " +
-      "are all disabled until the hub operator sets <code>discord.bot_token</code> " +
-      "and restarts the hub.";
+    banner.innerHTML = "<b>Discord is not configured.</b> " +
+      "Channels, roles, notifications, and commands are unavailable. " +
+      "The Hub operator must set <code>discord.bot_token</code> and restart the Hub.";
     deliveryPanel.appendChild(banner);
   }
   renderMyTelescopes(mine.telescopes, telescopePanel);
@@ -429,8 +420,8 @@ async function renderAll(tab = ACTIVE_TAB, focusAttachmentId = null) {
   if (!GUILDS.length) {
     const note = document.createElement("div");
     note.className = "card";
-    note.innerHTML = "<p>No servers where you hold <b>Manage Server</b>. " +
-      "Ask a server admin, or check your Discord permissions.</p>";
+    note.innerHTML = "<p>No manageable servers. Ask a server admin for " +
+      "<b>Manage Server</b> permission.</p>";
     deliveryPanel.appendChild(note);
   }
   bindTabs();
@@ -467,23 +458,23 @@ function nextStep(t, targets) {
   if (!t.attachments.length) {
     if (!targets.length) {
       return '<div class="next"><span class="step">Next</span>' +
-        '<span class="next-copy">Set up a Discord server first, then return here to ' +
-        'attach this telescope.</span><button type="button" class="b-open-delivery">' +
+        '<span class="next-copy">Set up a Discord server first.</span>' +
+        '<button type="button" class="b-open-delivery">' +
         "Open Discord delivery</button></div>";
     }
     return '<div class="next"><span class="step">Next</span>' +
-      '<span class="next-copy">Attach this telescope to a server here, then choose ' +
-      "its channels in Discord delivery.</span></div>";
+      '<span class="next-copy">Attach to a server, then pick channels in ' +
+      "Discord delivery.</span></div>";
   }
   if (!hasChannels) {
     return '<div class="next"><span class="step">Next</span>' +
-      '<span class="next-copy">Choose at least one Discord channel so this telescope ' +
-      'has somewhere to post.</span><button type="button" class="b-open-delivery">' +
+      '<span class="next-copy">Pick a channel for updates.</span>' +
+      '<button type="button" class="b-open-delivery">' +
       "Open Discord delivery</button></div>";
   }
   if (!t.connected) {
     return '<div class="next"><span class="step">Next</span>' +
-      '<span class="next-copy">Connect your rig: get a pairing token and paste it into ' +
+      '<span class="next-copy">Get a pairing code and paste it into ' +
       "the N.I.N.A. plugin.</span></div>";
   }
   return "";
@@ -507,7 +498,7 @@ function renderMyTelescopes(telescopes, target) {
   card.className = "card";
   let html = '<div class="head"><h2>' + ico("telescope") + "My telescopes</h2>" +
     '' +
-    '<div class="badges"><span class="hint">yours across every server</span></div></div>' +
+    '<div class="badges"><span class="hint">across your servers</span></div></div>' +
     localPrivacyNotice();
   if (!telescopes.length) {
     html += '<div class="steps"><span><b>1</b> Add a telescope</span>' +
@@ -521,7 +512,7 @@ function renderMyTelescopes(telescopes, target) {
           '<span class="chip on">' + esc(a.guild_name || a.guild_id) +
           (a.can_command ? "" : ' <span class="badge">feed only</span>') + "</span>").join("") +
         "</div>"
-      : '<span class="hint">Not attached to any server yet.</span>';
+      : '<span class="hint">No servers attached.</span>';
     const targets = attachTargets(t);
     const attachControls = targets.length
       ? '<div class="controls"><select class="pick f-attach">' + targets.map((g) =>
@@ -539,7 +530,7 @@ function renderMyTelescopes(telescopes, target) {
       '<div class="section"><label>' + ico("globe") + "Servers</label>" + '' + servers + attachControls + "</div>" +
       '<div class="section"><label>' + ico("clock") + "Image cooldown</label>" + '' +
       '<div class="controls"><input class="num f-cooldown" type="number" min="0" max="86400" value="' +
-      t.image_cooldown_seconds + '"><span class="hint">Seconds between image posts — applies on change.</span>' +
+      t.image_cooldown_seconds + '"><span class="hint">Seconds between posts. Changes apply immediately.</span>' +
       "</div></div>" +
       '<div class="footer-links">' +
       '<a href="javascript:;" class="b-revoke">Reset rig access</a>' +
@@ -590,10 +581,10 @@ function renderMyTelescopes(telescopes, target) {
     row.querySelector(".b-token").onclick = async () => {
       try {
         const out = await api("/api/telescopes/" + id + "/pairing-token", { method: "POST" });
-        showToken(row, "key", "Pairing token — shown once, valid " +
+        showToken(row, "key", "Pairing code — single use, valid " +
           Math.round(out.expires_in_seconds / 60) + " minutes", out.token,
-          "Paste into the N.I.N.A. plugin, then connect. " +
-          "Issuing a new token cancels this one. Review the " +
+          "Shown only once. Paste into the N.I.N.A. plugin, then connect. " +
+          "A new code replaces this one. Read the " +
           hostedPolicyLinks() + " before pairing.");
       } catch (e) { toast(e.message); }
     };
@@ -602,14 +593,13 @@ function renderMyTelescopes(telescopes, target) {
         const out = await api("/api/telescopes/" + id + "/share-code", { method: "POST" });
         showToken(row, "share", "Share code — single use, valid " +
           Math.round(out.expires_in_seconds / 86400) + " days", out.code,
-          "Give this to a manager of another server. They redeem it on their server " +
-          "card, against one of their channels. Their server gets the feed and read " +
-          "commands; only servers you attach yourself can drive the telescope.");
+          "Give this to another server's manager to redeem in Discord delivery. " +
+          "It grants updates and read-only commands, never hardware control.");
       } catch (e) { toast(e.message); }
     };
     row.querySelector(".b-revoke").onclick = async () => {
-      if (!confirm("Reset this telescope's rig access? The connected rig is cut off " +
-        "and must pair again with a new token.")) return;
+      if (!confirm("Reset rig access? This disconnects the rig and requires " +
+        "a new pairing code.")) return;
       try {
         await api("/api/telescopes/" + id + "/credentials", { method: "DELETE" });
         await api("/api/telescopes/" + id + "/pairing-tokens", { method: "DELETE" });
@@ -618,8 +608,8 @@ function renderMyTelescopes(telescopes, target) {
       } catch (e) { toast(e.message); }
     };
     row.querySelector(".b-delete").onclick = async () => {
-      if (!confirm("Delete this telescope everywhere? All attachments, channels, " +
-        "and rig credentials go with it.")) return;
+      if (!confirm("Delete this telescope everywhere? This removes its server " +
+        "links, delivery settings, and rig credentials.")) return;
       try {
         await api("/api/telescopes/" + id, { method: "DELETE" });
         toast("Telescope deleted");
@@ -722,7 +712,7 @@ function channelPicker(options, used, cls) {
 
 function channelChips(a) {
   if (!a.channels.length) {
-    return '<span class="hint">No channels yet — this telescope is not posting here.</span>';
+    return '<span class="hint">No channels selected. Updates are not posted here.</span>';
   }
   return '<div class="chips">' + a.channels.map((route) => {
     const name = route.channel_name ? '#' + route.channel_name : "channel " + route.channel_id;
@@ -764,27 +754,27 @@ async function renderAttachments(g, el) {
     const owner = a.owned_by_me ? "" :
       '<span class="sub-note">shared by ' + esc(a.owner_name) + "</span>";
     const consentHint = a.connected && !a.commands_enabled
-      ? "Remote control is off in N.I.N.A. The telescope owner must enable the master switch and approve each command individually."
-      : "Only commands individually approved in N.I.N.A. are available; server permissions cannot grant additional access.";
+      ? "Control is locked in N.I.N.A. The owner must enable the master switch and each command's permission."
+      : "Only commands approved in N.I.N.A. are allowed. Server roles cannot override that.";
     const commands = a.can_command
-      ? '<div class="section"><label>' + ico("zap") + "Commands — who may drive this telescope here</label>" + '' +
+      ? '<div class="section"><label>' + ico("zap") + "Who can send hardware commands</label>" + '' +
         '<div class="controls"><select class="pick f-policy">' +
         POLICY_OPTIONS.map(([v, label]) =>
           '<option value="' + v + '"' + (a.write_policy === v ? " selected" : "") + ">" +
           label + "</option>").join("") +
-        '</select><span class="hint">Applies on change.</span></div>' +
+        '</select><span class="hint">Changes apply immediately.</span></div>' +
         '<div class="roles-field" style="margin-top:.5rem' +
         (a.write_policy === "roles" ? "" : ";display:none") + '">' +
         roleChips(options, a.allowed_role_ids) + "</div>" +
         '<p class="hint">' + consentHint + "</p></div>"
       : '<div class="section"><label>' + ico("zap") + "Commands</label>" + '' +
-        '<span class="hint">This server receives the feed and read commands only.</span></div>';
+        '<span class="hint">Updates and read-only commands only.</span></div>';
     html +=
       '<div class="sub attachment" data-id="' + a.attachment_id + '">' +
       '<div class="head"><b>' + ico("telescope") + esc(a.telescope_name) + "</b>" + owner +
       '<div class="badges">' + badges +
       '<button class="subtle danger b-detach">Detach</button></div></div>' +
-      '<div class="section"><label># Channels — where this telescope posts</label>' +
+      '<div class="section"><label># Channels</label>' +
       channelChips(a) +
       '<div class="controls">' + channelPicker(options, usedChannels, "f-addchan") +
       '<button class="b-addchan"' + (canAddChannel ? "" : " disabled") +
@@ -793,12 +783,11 @@ async function renderAttachments(g, el) {
       "</div>";
   }
   if (!data.attachments.length) {
-    html += '<p class="hint" style="margin:.8rem 0 0">No telescopes here yet. Attach one of ' +
-      "yours from “My telescopes”, or redeem a share code below.</p>";
+    html += '<p class="hint" style="margin:.8rem 0 0">No telescopes attached. Add yours ' +
+      "from “My telescopes”, or use a share code below.</p>";
   }
   html +=
-    '<details class="redeem"><summary>Have a share code from another server’s ' +
-    "telescope owner? Redeem it here</summary>" +
+    '<details class="redeem"><summary>Use a share code</summary>' +
     '<div class="controls">' +
     '<input class="name share-code" placeholder="share code (cssh_…)">' +
     channelPicker(options, usedChannels, "sub-channel") +
@@ -867,7 +856,7 @@ async function renderAttachments(g, el) {
       };
     });
     row.querySelector(".b-detach").onclick = async () => {
-      if (!confirm("Detach this telescope from this server? Its channels here are removed.")) return;
+      if (!confirm("Detach this telescope? Its channel links on this server will be removed.")) return;
       try {
         await api("/api/attachments/" + id, { method: "DELETE" });
         toast("Detached");
@@ -929,11 +918,11 @@ mod tests {
             "t.commands_enabled",
             "a.commands_enabled",
             "commands locked in N.I.N.A.",
-            "hardware control start off",
-            "Hardware control requires the N.I.N.A. master switch plus individual",
-            "command approvals",
-            "enable the master switch and approve each command individually",
-            "Only commands individually approved in N.I.N.A. are available",
+            "Hardware commands require the local",
+            "master switch and individual command permissions",
+            "enable the master switch and each command's permission",
+            "Only commands approved in N.I.N.A. are allowed",
+            "Server roles cannot override that",
         ] {
             assert!(INDEX_HTML.contains(needle), "missing {needle}");
         }
@@ -943,14 +932,10 @@ mod tests {
     fn page_explains_the_local_event_and_privacy_boundary() {
         for needle in [
             "function localPrivacyNotice()",
-            "Ordinary event categories, images, and popup",
-            "notifications start on by default",
-            "before pairing: disabled categories never reach this Hub",
-            "Accepted command failures are still reported",
-            "Turning off images also blocks",
-            "existing image history and thumbnails",
-            "snapshots remain available, but Hub state may be incomplete",
-            "forwarding, observatory location sharing, and hardware control start off",
+            "Choose what to share in N.I.N.A. before pairing",
+            "Disabled event categories are never sent to the Hub",
+            "Images, logs, and",
+            "location have separate controls",
         ] {
             assert!(INDEX_HTML.contains(needle), "missing {needle}");
         }
@@ -1072,7 +1057,7 @@ mod tests {
         // between instant channels and save-button permissions.
         assert!(!INDEX_HTML.contains("Save permissions"));
         assert!(!INDEX_HTML.contains(">Save<"));
-        assert!(INDEX_HTML.contains("applies on change"));
+        assert!(INDEX_HTML.contains("Changes apply immediately"));
         assert!(INDEX_HTML.contains("savePermissions()"));
     }
 
@@ -1104,9 +1089,28 @@ mod tests {
     }
 
     #[test]
+    fn concise_copy_preserves_token_and_removal_consequences() {
+        for needle in [
+            "Pairing code — single use, valid",
+            "Shown only once",
+            "A new code replaces this one",
+            "Share code — single use, valid",
+            "updates and read-only commands, never hardware control",
+            "This disconnects the rig and requires",
+            "a new pairing code",
+            "Delete this telescope everywhere?",
+            "links, delivery settings, and rig credentials",
+            "Its channel links on this server will be removed",
+        ] {
+            assert!(INDEX_HTML.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
     fn page_surfaces_missing_bot_token() {
         // A hub without a bot token must say so, not just look broken.
         assert!(INDEX_HTML.contains("bot_configured"));
-        assert!(INDEX_HTML.contains("without a Discord bot token"));
+        assert!(INDEX_HTML.contains("Discord is not configured"));
+        assert!(INDEX_HTML.contains("discord.bot_token"));
     }
 }
