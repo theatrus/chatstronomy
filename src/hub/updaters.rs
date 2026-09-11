@@ -304,6 +304,7 @@ impl UpdaterManager {
                 target,
                 self.chat_manager.clone(),
             )
+            .with_autofocus_delivery_store(self.db.clone(), telescope_id, connection.profile_id)
             .with_image_cooldown(telescope.image_cooldown_seconds.max(0) as u64)
             // Presence is announced from connection state instead. A shorter
             // Hub retry window catches a replacement socket promptly without

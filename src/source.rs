@@ -47,6 +47,9 @@ pub struct RigCapabilities {
     /// Supports the additive current-target command kinds, independently of local consent.
     #[serde(default, skip_serializing_if = "is_false")]
     pub target_commands: bool,
+    /// Supports retiring a completed notification without granting hardware control.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub autofocus_delivery_ack: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -65,6 +68,7 @@ impl RigCapabilities {
             guider_graph: false,
             commands: false,
             target_commands: false,
+            autofocus_delivery_ack: false,
         }
     }
 
@@ -79,6 +83,7 @@ impl RigCapabilities {
             guider_graph: true,
             commands: true,
             target_commands: true,
+            autofocus_delivery_ack: true,
         }
     }
 }
@@ -181,6 +186,10 @@ pub trait RigSource: Send + Sync {
     async fn get_sequence(&self) -> RigSourceResult<SequenceResponse>;
     async fn get_thumbnail(&self, index: u32) -> RigSourceResult<ThumbnailResponse>;
     async fn get_last_autofocus(&self) -> RigSourceResult<AutofocusResponse>;
+    /// Notification receipt, not a hardware command. Older peers need no receipt.
+    async fn acknowledge_autofocus_delivery(&self, _report_timestamp: &str) -> RigSourceResult<()> {
+        Ok(())
+    }
     async fn get_mount_info(&self) -> RigSourceResult<MountInfoResponse>;
     async fn get_camera_info(&self) -> RigSourceResult<CameraInfoResponse>;
     async fn get_filterwheel_info(&self) -> RigSourceResult<FilterWheelInfoResponse>;
@@ -217,6 +226,40 @@ mod tests {
                 .target_commands
         );
         assert!(RigCapabilities::all().target_commands);
+    }
+
+    #[test]
+    fn autofocus_receipts_are_additive_and_independent_of_hardware_control() {
+        let mut value = serde_json::to_value(RigCapabilities::all()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("autofocus_delivery_ack");
+        let legacy: RigCapabilities = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.autofocus_delivery_ack);
+        assert!(legacy.commands);
+
+        value["autofocus_delivery_ack"] = serde_json::json!(false);
+        let disabled: RigCapabilities = serde_json::from_value(value.clone()).unwrap();
+        assert!(!disabled.autofocus_delivery_ack);
+        assert!(
+            serde_json::to_value(disabled)
+                .unwrap()
+                .get("autofocus_delivery_ack")
+                .is_none()
+        );
+
+        value["autofocus_delivery_ack"] = serde_json::json!(true);
+        value["commands"] = serde_json::json!(false);
+        let read_only: RigCapabilities = serde_json::from_value(value).unwrap();
+        assert!(read_only.autofocus_delivery_ack);
+        assert!(!read_only.commands);
+        assert_eq!(
+            serde_json::to_value(read_only).unwrap()["autofocus_delivery_ack"],
+            true
+        );
+        assert!(!RigCapabilities::none().autofocus_delivery_ack);
+        assert!(RigCapabilities::all().autofocus_delivery_ack);
     }
 
     #[test]

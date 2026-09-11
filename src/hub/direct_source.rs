@@ -203,6 +203,21 @@ impl RigSource for DirectRigSource {
         self.query_as(QueryKind::LastAutofocus).await
     }
 
+    async fn acknowledge_autofocus_delivery(&self, report_timestamp: &str) -> RigSourceResult<()> {
+        let connection = self.current_connection()?;
+        if !connection.capabilities.autofocus_delivery_ack {
+            return Ok(());
+        }
+        self.query_value_on(
+            connection,
+            QueryKind::AcknowledgeAutofocus {
+                report_timestamp: report_timestamp.to_string(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn get_mount_info(&self) -> RigSourceResult<MountInfoResponse> {
         self.query_as(QueryKind::MountInfo).await
     }
@@ -262,6 +277,236 @@ mod tests {
     use crate::direct::protocol::{DirectMessage, QueryErrorCode, QueryResult};
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
+
+    const AF_REPORT_TIMESTAMP: &str = "2026-09-11T01:02:03.4567890+00:00";
+
+    #[tokio::test]
+    async fn legacy_rigs_never_receive_unknown_autofocus_receipt_queries() {
+        for receipt_support in [None, Some(false)] {
+            let (mut connection, mut outgoing) = RigConnection::stub(7, Uuid::new_v4());
+            let mut capabilities = serde_json::to_value(RigCapabilities::all()).unwrap();
+            capabilities
+                .as_object_mut()
+                .unwrap()
+                .remove("autofocus_delivery_ack");
+            if let Some(supported) = receipt_support {
+                capabilities["autofocus_delivery_ack"] = serde_json::json!(supported);
+            }
+            Arc::get_mut(&mut connection).unwrap().capabilities =
+                serde_json::from_value(capabilities).unwrap();
+            let source = DirectRigSource::new(connection);
+
+            source
+                .acknowledge_autofocus_delivery(AF_REPORT_TIMESTAMP)
+                .await
+                .unwrap();
+            assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+        }
+    }
+
+    #[tokio::test]
+    async fn autofocus_receipts_do_not_require_local_hardware_command_permission() {
+        let (mut connection, mut outgoing) = RigConnection::stub(7, Uuid::new_v4());
+        Arc::get_mut(&mut connection).unwrap().capabilities.commands = false;
+        let source = DirectRigSource::new(connection.clone());
+        let exchange = tokio::spawn(async move {
+            source
+                .acknowledge_autofocus_delivery(AF_REPORT_TIMESTAMP)
+                .await
+        });
+        let request = match outgoing.recv().await.expect("receipt query") {
+            DirectMessage::Query(request) => request,
+            other => panic!("expected receipt query, got {other:?}"),
+        };
+        assert_eq!(
+            request.kind,
+            QueryKind::AcknowledgeAutofocus {
+                report_timestamp: AF_REPORT_TIMESTAMP.to_string(),
+            }
+        );
+        assert!(request.expires_at.is_some());
+        connection.resolve(QueryResult {
+            id: request.id,
+            ok: true,
+            payload: serde_json::json!({"Acknowledged": true}),
+            error: None,
+            error_code: None,
+        });
+        exchange.await.unwrap().unwrap();
+        assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn failed_autofocus_receipt_is_not_reported_as_acknowledged_or_retried() {
+        let (connection, mut outgoing) = RigConnection::stub(7, Uuid::new_v4());
+        let source = DirectRigSource::new(connection.clone());
+        let exchange = tokio::spawn(async move {
+            source
+                .acknowledge_autofocus_delivery(AF_REPORT_TIMESTAMP)
+                .await
+        });
+        let request = match outgoing.recv().await.expect("receipt query") {
+            DirectMessage::Query(request) => request,
+            other => panic!("expected receipt query, got {other:?}"),
+        };
+        connection.resolve(QueryResult {
+            id: request.id,
+            ok: false,
+            payload: serde_json::Value::Null,
+            error: Some("receipt rejected".to_string()),
+            error_code: None,
+        });
+        assert!(matches!(
+            exchange.await.unwrap(),
+            Err(RigSourceError::Rejected { reason, .. }) if reason == "receipt rejected"
+        ));
+        assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn autofocus_receipt_negotiation_uses_the_current_socket_capabilities() {
+        for replacement_supports_receipts in [false, true] {
+            let connections = Arc::new(RigConnections::default());
+            let (mut first, mut first_outgoing) = RigConnection::stub(7, Uuid::new_v4());
+            Arc::get_mut(&mut first)
+                .unwrap()
+                .capabilities
+                .autofocus_delivery_ack = !replacement_supports_receipts;
+            let session_id = first.session_id;
+            let profile_id = first.profile_id;
+            connections.insert(first.clone());
+            let source = DirectRigSource::current(connections.clone(), first);
+            let (mut replacement, mut replacement_outgoing) =
+                RigConnection::stub_with_identity(7, Uuid::new_v4(), session_id, profile_id);
+            let replacement_capabilities =
+                &mut Arc::get_mut(&mut replacement).unwrap().capabilities;
+            replacement_capabilities.autofocus_delivery_ack = replacement_supports_receipts;
+            replacement_capabilities.commands = false;
+            connections.insert(replacement.clone());
+
+            assert_eq!(
+                source.capabilities().autofocus_delivery_ack,
+                !replacement_supports_receipts
+            );
+            let exchange = tokio::spawn(async move {
+                source
+                    .acknowledge_autofocus_delivery(AF_REPORT_TIMESTAMP)
+                    .await
+            });
+            if replacement_supports_receipts {
+                let request = match replacement_outgoing
+                    .recv()
+                    .await
+                    .expect("current receipt query")
+                {
+                    DirectMessage::Query(request) => request,
+                    other => panic!("expected receipt query, got {other:?}"),
+                };
+                assert_eq!(
+                    request.kind,
+                    QueryKind::AcknowledgeAutofocus {
+                        report_timestamp: AF_REPORT_TIMESTAMP.to_string(),
+                    }
+                );
+                replacement.resolve(QueryResult {
+                    id: request.id,
+                    ok: true,
+                    payload: serde_json::Value::Null,
+                    error: None,
+                    error_code: None,
+                });
+            }
+            exchange.await.unwrap().unwrap();
+            assert!(!matches!(
+                first_outgoing.try_recv(),
+                Ok(DirectMessage::Query(_))
+            ));
+            assert!(matches!(
+                replacement_outgoing.try_recv(),
+                Err(TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn autofocus_receipts_never_reach_a_replacement_profile_or_session() {
+        for change_profile in [true, false] {
+            let connections = Arc::new(RigConnections::default());
+            let (first, mut first_outgoing) = RigConnection::stub(7, Uuid::new_v4());
+            let old_session = first.session_id;
+            let old_profile = first.profile_id;
+            connections.insert(first.clone());
+            let source = DirectRigSource::current(connections.clone(), first.clone());
+            let (replacement, mut replacement_outgoing) = RigConnection::stub_with_identity(
+                7,
+                Uuid::new_v4(),
+                if change_profile {
+                    old_session
+                } else {
+                    Uuid::new_v4()
+                },
+                if change_profile {
+                    Uuid::new_v4()
+                } else {
+                    old_profile
+                },
+            );
+            connections.insert(replacement);
+
+            assert!(matches!(
+                source
+                    .acknowledge_autofocus_delivery(AF_REPORT_TIMESTAMP)
+                    .await,
+                Err(RigSourceError::Unavailable { .. })
+            ));
+            assert!(matches!(
+                first_outgoing.try_recv(),
+                Err(TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                replacement_outgoing.try_recv(),
+                Err(TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn in_flight_autofocus_receipt_is_not_accepted_after_socket_replacement() {
+        let connections = Arc::new(RigConnections::default());
+        let (first, mut outgoing) = RigConnection::stub(7, Uuid::new_v4());
+        let session_id = first.session_id;
+        let profile_id = first.profile_id;
+        connections.insert(first.clone());
+        let source = DirectRigSource::current(connections.clone(), first.clone());
+        let exchange = tokio::spawn(async move {
+            source
+                .acknowledge_autofocus_delivery(AF_REPORT_TIMESTAMP)
+                .await
+        });
+        let request = match outgoing.recv().await.expect("receipt query") {
+            DirectMessage::Query(request) => request,
+            other => panic!("expected receipt query, got {other:?}"),
+        };
+        let (replacement, mut replacement_outgoing) =
+            RigConnection::stub_with_identity(7, Uuid::new_v4(), session_id, profile_id);
+        connections.insert(replacement);
+        first.resolve(QueryResult {
+            id: request.id,
+            ok: true,
+            payload: serde_json::Value::Null,
+            error: None,
+            error_code: None,
+        });
+
+        assert!(matches!(
+            exchange.await.unwrap(),
+            Err(RigSourceError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            replacement_outgoing.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
 
     #[tokio::test]
     async fn autofocus_and_sequence_dispatch_preserve_pending_outcomes() {

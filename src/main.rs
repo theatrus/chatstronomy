@@ -52,6 +52,9 @@ enum Commands {
         guider_output: String,
         #[arg(long)]
         autofocus_output: String,
+        /// Exercise a notification receipt against an isolated test rig only.
+        #[arg(long)]
+        verify_autofocus_receipt: bool,
     },
 }
 
@@ -86,7 +89,10 @@ async fn main() {
         Commands::DirectHubProbe {
             guider_output,
             autofocus_output,
-        } => cmd_direct_hub_probe(&guider_output, &autofocus_output).await,
+            verify_autofocus_receipt,
+        } => {
+            cmd_direct_hub_probe(&guider_output, &autofocus_output, verify_autofocus_receipt).await
+        }
     };
 
     if let Err(error) = result {
@@ -141,6 +147,7 @@ async fn cmd_direct_render_probe(
 async fn cmd_direct_hub_probe(
     guider_output: &str,
     autofocus_output: &str,
+    verify_autofocus_receipt: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use chatstronomy::hub::{
         config::HubConfig,
@@ -207,6 +214,14 @@ async fn cmd_direct_hub_probe(
         autofocus_output,
         chatstronomy::charts::render_autofocus_graph_png(&autofocus.response)?,
     )?;
+    if verify_autofocus_receipt {
+        if !source.capabilities().autofocus_delivery_ack {
+            return Err("test rig did not advertise autofocus delivery receipts".into());
+        }
+        source
+            .acknowledge_autofocus_delivery(&autofocus.response.timestamp)
+            .await?;
+    }
 
     println!("{}", serde_json::json!({"probe": "direct_hub_complete"}));
     std::io::stdout().flush()?;

@@ -204,6 +204,18 @@ impl RigSource for DirectPipeRigSource {
         self.query_as(QueryKind::MountInfo).await
     }
 
+    async fn acknowledge_autofocus_delivery(&self, report_timestamp: &str) -> RigSourceResult<()> {
+        if !self.capabilities.autofocus_delivery_ack {
+            return Ok(());
+        }
+        let _: serde_json::Value = self
+            .query_as(QueryKind::AcknowledgeAutofocus {
+                report_timestamp: report_timestamp.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn get_camera_info(&self) -> RigSourceResult<CameraInfoResponse> {
         if !self.capabilities.equipment_snapshots {
             return Err(Self::unsupported("equipment snapshots"));

@@ -120,6 +120,38 @@ command support receive no unknown command; chat asks the owner to update.
 Matrix and Discord webhooks support outbound notifications; interactive
 hardware commands are provided through the Discord bot.
 
+## Autofocus delivery across reconnects
+
+The Hub records successful autofocus notifications per telescope, N.I.N.A.
+profile, report timestamp, and Discord channel. Restarting the Hub does not
+repost a report already delivered to that channel. A failed channel can retry
+without duplicating another channel's successful delivery. Terminal
+"Report Unavailable" notices use the same tracking.
+For older plugins without receipt support, the Hub also ignores completion
+events at least ten minutes old when first seen, if their timestamps include an
+explicit time zone. This protects a first upgrade with no prior receipts, but
+requires the older rig's clock to be reasonably accurate. It uses completion
+event time, not the report's run-start timestamp. Current plugins use monotonic
+expiry instead, and recent completions can recover without an observed start.
+
+Compatible plugins advertise `autofocus_delivery_ack`. After all current
+destinations have accepted a notification and the Hub has stored its receipts,
+the Hub sends `acknowledge_autofocus` with `report_timestamp`. This is a
+notification receipt, not a hardware command, and requires no control permission.
+It retires reconnect replay without deleting the cached report used by `/focus`.
+Older plugins receive no unknown query; the Hub still deduplicates their named
+reports. Legacy events without a report identity cannot acknowledge a missing
+report's fallback notice.
+
+The updated plugin also stops special replay after a newer autofocus run starts
+or ten minutes elapse, including with older Hubs. Recent undelivered completions
+can still recover across reconnects; merely reading a report is not delivery.
+
+Receipts contain only the scoped identity and delivery time, not graph or report
+contents. They remain until the telescope is deleted. This is restart-resistant
+duplicate suppression, not exactly-once delivery: a crash after Discord accepts
+a message but before SQLite commits its receipt can still cause a duplicate.
+
 ## Locally enforced event transmission and privacy
 
 Event switches in the N.I.N.A. plugin are transmission and privacy controls, not

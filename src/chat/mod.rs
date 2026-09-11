@@ -640,6 +640,36 @@ impl ChatServiceManager {
     pub fn service_count(&self) -> usize {
         self.services.len()
     }
+
+    /// Unlike best-effort notifications, delivery receipts require a real
+    /// success from every routable service. The Hub calls this once per channel
+    /// so Discord's partial fan-out success cannot acknowledge a failed route.
+    pub async fn send_message_with_attachments_checked(
+        &self,
+        message: &ChatMessage,
+        target: &ChatTarget,
+        attachments: &[ChatAttachment],
+    ) -> bool {
+        let mut routed = false;
+        let mut successful = true;
+        for service in &self.services {
+            if !service.can_route(target) {
+                continue;
+            }
+            routed = true;
+            if let Err(error) = service
+                .send_message_with_attachments(message, target, attachments)
+                .await
+            {
+                eprintln!(
+                    "Failed to deliver autofocus to {}: {error}",
+                    service.service_name()
+                );
+                successful = false;
+            }
+        }
+        routed && successful
+    }
 }
 
 impl Default for ChatServiceManager {
