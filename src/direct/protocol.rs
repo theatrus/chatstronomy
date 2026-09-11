@@ -226,8 +226,14 @@ pub enum QueryKind {
     EventHistory,
     ImageHistory,
     Sequence,
-    Thumbnail { index: u32 },
+    Thumbnail {
+        index: u32,
+    },
     LastAutofocus,
+    /// Additive query, sent only to peers advertising autofocus_delivery_ack.
+    AcknowledgeAutofocus {
+        report_timestamp: String,
+    },
     MountInfo,
     CameraInfo,
     FilterwheelInfo,
@@ -235,7 +241,9 @@ pub enum QueryKind {
     GuiderGraph,
     RotatorInfo,
     FocuserInfo,
-    Command { command: RigCommand },
+    Command {
+        command: RigCommand,
+    },
 }
 
 /// Answer to a [`QueryRequest`]. On success `payload` holds the JSON of the
@@ -703,6 +711,55 @@ mod tests {
             };
             assert_eq!(hello.capabilities.target_commands, expected);
         }
+    }
+
+    #[test]
+    fn published_pre_receipt_hellos_do_not_enable_autofocus_acknowledgments() {
+        for fixture in [
+            include_str!("../../contracts/direct/v1/fixtures/client-hello.json"),
+            include_str!("../../contracts/direct/v1/fixtures/client-hello-legacy.json"),
+            include_str!("../../contracts/direct/v1/fixtures/client-hello-target-commands.json"),
+        ] {
+            let DirectMessage::ClientHello(hello) = serde_json::from_str(fixture).unwrap() else {
+                panic!("expected hello");
+            };
+            assert!(!hello.capabilities.autofocus_delivery_ack);
+        }
+    }
+
+    #[test]
+    fn autofocus_acknowledgment_has_stable_additive_query_envelope() {
+        let id = Uuid::parse_str("c463c275-c332-49ef-a9e9-f190b0d47e91").unwrap();
+        let report_timestamp = "2026-09-11T01:02:03.4567890+00:00";
+        let request = DirectMessage::Query(QueryRequest {
+            id,
+            expires_at: Some(1_789_091_234),
+            kind: QueryKind::AcknowledgeAutofocus {
+                report_timestamp: report_timestamp.to_string(),
+            },
+        });
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "query",
+                "payload": {
+                    "id": id.to_string(),
+                    "expires_at": 1_789_091_234,
+                    "kind": "acknowledge_autofocus",
+                    "report_timestamp": report_timestamp,
+                },
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<DirectMessage>(value).unwrap(),
+            request
+        );
+        assert!(
+            !serde_json::to_string(&request)
+                .unwrap()
+                .contains("\"command\"")
+        );
     }
 
     #[test]

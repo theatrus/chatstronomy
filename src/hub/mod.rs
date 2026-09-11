@@ -9,6 +9,7 @@
 //! See `docs/HOSTED_SERVICE.md` for the full design.
 
 pub mod auth;
+pub mod autofocus_delivery;
 pub mod config;
 pub mod db;
 pub mod direct_server;

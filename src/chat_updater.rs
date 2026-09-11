@@ -1110,6 +1110,8 @@ pub struct ChatUpdater {
     announce_lifecycle: bool,
     autofocus_retry: AutofocusRetryPolicy,
     pending_autofocus_deliveries: Vec<PendingAutofocusDelivery>,
+    #[cfg(feature = "hub")]
+    autofocus_delivery_store: Option<HubAutofocusDeliveryStore>,
     /// Initialization is retried stream-by-stream. Once event history has
     /// established its baseline, every later event response is a live delta
     /// even if another capability (such as image history) is still offline.
@@ -1128,13 +1130,15 @@ struct PendingAutofocusDelivery {
     next_attempt_at: TokioInstant,
     retry_delay: Duration,
     retry: AutofocusRetryPolicy,
+    /// A chat failure must not be reported as a missing N.I.N.A. report.
+    report_obtained: bool,
 }
 
-struct AutofocusNotificationTask {
-    chat_manager: Arc<ChatServiceManager>,
-    chat_target: ChatTarget,
-    telescope_name: String,
-    autofocus_data: AutofocusResponse,
+#[cfg(feature = "hub")]
+struct HubAutofocusDeliveryStore {
+    db: crate::hub::db::Db,
+    telescope_id: i64,
+    profile_id: String,
 }
 
 fn sequence_container_counts(sequence: &SequenceResponse) -> (usize, usize) {
@@ -1144,21 +1148,6 @@ fn sequence_container_counts(sequence: &SequenceResponse) -> (usize, usize) {
         .filter(|container| container.status.eq_ignore_ascii_case("RUNNING"))
         .count();
     (containers.len(), running)
-}
-
-impl AutofocusNotificationTask {
-    async fn run(self) {
-        ChatUpdater::display_autofocus_results(&self.autofocus_data);
-        if self.chat_manager.service_count() > 0 {
-            ChatUpdater::send_autofocus_notification_to(
-                &self.chat_manager,
-                &self.chat_target,
-                &self.telescope_name,
-                &self.autofocus_data,
-            )
-            .await;
-        }
-    }
 }
 
 impl ChatUpdater {
@@ -1182,6 +1171,8 @@ impl ChatUpdater {
             announce_lifecycle: true,
             autofocus_retry: DEFAULT_AUTOFOCUS_RETRY,
             pending_autofocus_deliveries: Vec::new(),
+            #[cfg(feature = "hub")]
+            autofocus_delivery_store: None,
             event_baseline_complete: false,
         }
     }
@@ -1189,6 +1180,21 @@ impl ChatUpdater {
     /// Telescope identifier this updater is wired to.
     pub fn telescope_name(&self) -> &str {
         &self.telescope_name
+    }
+
+    #[cfg(feature = "hub")]
+    pub fn with_autofocus_delivery_store(
+        mut self,
+        db: crate::hub::db::Db,
+        telescope_id: i64,
+        profile_id: uuid::Uuid,
+    ) -> Self {
+        self.autofocus_delivery_store = Some(HubAutofocusDeliveryStore {
+            db,
+            telescope_id,
+            profile_id: profile_id.to_string(),
+        });
+        self
     }
 
     /// Format a chat-message title with the telescope name prefix.
@@ -2881,6 +2887,19 @@ impl ChatUpdater {
     }
 
     async fn handle_autofocus_finished(&mut self, event: &Event) {
+        #[cfg(feature = "hub")]
+        if self.autofocus_delivery_store.is_some()
+            && stale_legacy_autofocus(
+                &event.time,
+                self.source.capabilities().autofocus_delivery_ack,
+                Utc::now(),
+            )
+        {
+            // First-upgrade defense before this Hub has any durable receipts.
+            // Current plugins expire replay monotonically; do not impose Hub
+            // clock agreement on them. Decide only once, before queueing.
+            return;
+        }
         println!("[AUTOFOCUS FINISHED] {}", event.time);
         println!("Queued autofocus results for delivery after the poll cycle.");
 
@@ -2925,6 +2944,7 @@ impl ChatUpdater {
                 next_attempt_at: queued_at,
                 retry_delay: self.autofocus_retry.initial_delay,
                 retry: self.autofocus_retry,
+                report_obtained: false,
             });
     }
 
@@ -2942,6 +2962,24 @@ impl ChatUpdater {
             return;
         };
         let mut delivery = self.pending_autofocus_deliveries.remove(index);
+        if let Some(timestamp) = delivery.report_timestamp.as_deref() {
+            match self.pending_autofocus_targets(timestamp) {
+                Ok(targets) if targets.is_empty() => {
+                    // A restarted Hub can recognize an old completion before
+                    // even requesting its report, including when N.I.N.A. no
+                    // longer has that report cached.
+                    self.acknowledge_autofocus(timestamp).await;
+                    return;
+                }
+                Err(error) => {
+                    delivery.report_obtained = true;
+                    delivery.attempts += 1;
+                    self.retry_autofocus_delivery(delivery, &error).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self
             .expire_autofocus_delivery_if_timed_out(
                 &delivery,
@@ -3003,18 +3041,20 @@ impl ChatUpdater {
                     &autofocus_data.response.timestamp,
                 ) =>
             {
-                // Keep graph rendering and delivery inside the updater task.
-                // Awaiting the updater handle is then a complete cancellation
-                // barrier for route removal or consent revocation: no detached
-                // child can post after that barrier returns.
-                AutofocusNotificationTask {
-                    chat_manager: self.chat_manager.clone(),
-                    chat_target: self.chat_target.clone(),
-                    telescope_name: self.telescope_name.clone(),
-                    autofocus_data,
+                delivery.report_obtained = true;
+                // Delivery and its durable receipt stay in this task so route
+                // removal/consent revocation retain their cancellation barrier.
+                match self.deliver_autofocus_report(&autofocus_data).await {
+                    Ok(true) => {
+                        self.acknowledge_autofocus(&autofocus_data.response.timestamp)
+                            .await
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        delivery.attempts += 1;
+                        self.retry_autofocus_delivery(delivery, &error).await;
+                    }
                 }
-                .run()
-                .await;
             }
             Ok(autofocus_data) => {
                 delivery.attempts += 1;
@@ -3148,6 +3188,13 @@ impl ChatUpdater {
     }
 
     async fn send_autofocus_unavailable(&self, delivery: &PendingAutofocusDelivery) {
+        if delivery.report_obtained {
+            eprintln!(
+                "[{}] Autofocus chat delivery did not complete within its retry budget.",
+                self.telescope_name
+            );
+            return;
+        }
         if self.chat_manager.service_count() == 0 {
             return;
         }
@@ -3178,9 +3225,26 @@ impl ChatUpdater {
         if let Some(temperature) = delivery.temperature {
             message = message.field("Temperature", &format!("{temperature:.1} °C"), true);
         }
-        self.chat_manager
-            .send_message(&message, &self.chat_target)
-            .await;
+        if let Some(timestamp) = delivery.report_timestamp.as_deref() {
+            // This is a terminal completion notification too. Do not announce
+            // the same missing report again after every Hub restart.
+            match self
+                .deliver_autofocus_message(timestamp, &message, &[])
+                .await
+            {
+                Ok(true) => self.acknowledge_autofocus(timestamp).await,
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "[{}] Could not deliver autofocus fallback: {error}",
+                    self.telescope_name
+                ),
+            }
+        } else {
+            // Legacy completions do not identify the report to acknowledge.
+            self.chat_manager
+                .send_message(&message, &self.chat_target)
+                .await;
+        }
     }
 
     async fn handle_mount_event(&self, event: &Event) {
@@ -4035,14 +4099,117 @@ impl ChatUpdater {
             .await;
     }
 
-    async fn send_autofocus_notification_to(
-        chat_manager: &ChatServiceManager,
-        chat_target: &ChatTarget,
+    fn pending_autofocus_targets(&self, report_timestamp: &str) -> Result<Vec<ChatTarget>, String> {
+        #[cfg(feature = "hub")]
+        if let Some(store) = &self.autofocus_delivery_store {
+            let identity = autofocus_report_identity(report_timestamp)?;
+            let mut pending = Vec::new();
+            for channel in self.chat_target.all_discord_channels() {
+                if !store
+                    .db
+                    .autofocus_delivered(
+                        store.telescope_id,
+                        &store.profile_id,
+                        channel as i64,
+                        &identity,
+                    )
+                    .map_err(|error| format!("could not check autofocus delivery: {error}"))?
+                {
+                    pending.push(ChatTarget {
+                        discord_channel_id: Some(channel),
+                        ..ChatTarget::default()
+                    });
+                }
+            }
+            return Ok(pending);
+        }
+        let _ = report_timestamp;
+        Ok(vec![self.chat_target.clone()])
+    }
+
+    async fn deliver_autofocus_report(&self, af: &AutofocusResponse) -> Result<bool, String> {
+        let targets = self.pending_autofocus_targets(&af.response.timestamp)?;
+        if targets.is_empty() {
+            return Ok(true);
+        }
+        let (message, attachments) =
+            Self::build_autofocus_notification(&self.telescope_name, af)
+                .ok_or_else(|| "autofocus report response was unsuccessful".to_string())?;
+        Self::display_autofocus_results(af);
+        self.deliver_autofocus_message(&af.response.timestamp, &message, &attachments)
+            .await
+    }
+
+    async fn deliver_autofocus_message(
+        &self,
+        report_timestamp: &str,
+        message: &ChatMessage,
+        attachments: &[ChatAttachment],
+    ) -> Result<bool, String> {
+        let targets = self.pending_autofocus_targets(report_timestamp)?;
+        let mut failed = false;
+        for target in targets {
+            if !self
+                .chat_manager
+                .send_message_with_attachments_checked(message, &target, attachments)
+                .await
+            {
+                failed = true;
+                continue;
+            }
+            #[cfg(feature = "hub")]
+            if let Some(store) = &self.autofocus_delivery_store {
+                let identity = autofocus_report_identity(report_timestamp)?;
+                store
+                    .db
+                    .record_autofocus_delivery(
+                        store.telescope_id,
+                        &store.profile_id,
+                        target
+                            .discord_channel_id
+                            .expect("Hub autofocus targets contain one channel")
+                            as i64,
+                        &identity,
+                    )
+                    .map_err(|error| format!("could not persist autofocus delivery: {error}"))?;
+            }
+        }
+        if failed {
+            #[cfg(feature = "hub")]
+            if self.autofocus_delivery_store.is_some() {
+                return Err("one or more autofocus chat destinations rejected delivery".to_string());
+            }
+        }
+        // Local mode retains its existing best-effort behavior. Retrying all
+        // services after one fails could duplicate a successful Discord/Matrix
+        // post; without per-service receipts, do not retry or acknowledge it.
+        Ok(!failed)
+    }
+
+    async fn acknowledge_autofocus(&self, report_timestamp: &str) {
+        if self.source.capabilities().autofocus_delivery_ack {
+            // Failed receipts do not undo accepted Discord posts. Persistent
+            // Hub receipts suppress a replay and allow acknowledgement again
+            // on a later transport without sending the graph twice.
+            if let Err(error) = self
+                .source
+                .acknowledge_autofocus_delivery(report_timestamp)
+                .await
+            {
+                eprintln!(
+                    "[{}] Could not acknowledge autofocus delivery: {error}",
+                    self.telescope_name
+                );
+            }
+        }
+    }
+
+    fn build_autofocus_notification(
         telescope_name: &str,
         af: &AutofocusResponse,
-    ) {
+    ) -> Option<(ChatMessage, Vec<ChatAttachment>)> {
         if !af.success {
-            return;
+            return None;
         }
 
         let af_data = &af.response;
@@ -4142,9 +4309,7 @@ impl ChatUpdater {
                 Vec::new()
             }
         };
-        chat_manager
-            .send_message_with_attachments(&message, chat_target, &attachments)
-            .await;
+        Some((message, attachments))
     }
 
     async fn send_mount_event_notification(&self, event: &Event) {
@@ -5212,6 +5377,24 @@ fn autofocus_report_matches(expected: Option<&str>, actual: &str) -> bool {
     }
 }
 
+#[cfg(feature = "hub")]
+fn autofocus_report_identity(timestamp: &str) -> Result<String, String> {
+    parse_nina_timestamp(timestamp)
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        })
+        .ok_or_else(|| "autofocus completion has an invalid report timestamp".to_string())
+}
+
+#[cfg(feature = "hub")]
+fn stale_legacy_autofocus(event_time: &str, supports_receipts: bool, now: DateTime<Utc>) -> bool {
+    !supports_receipts
+        && DateTime::parse_from_rfc3339(event_time)
+            .is_ok_and(|occurred| now.signed_duration_since(occurred).num_seconds() >= 600)
+}
+
 fn truncate_to(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         return value.to_string();
@@ -5420,7 +5603,12 @@ mod tests {
                 capabilities.image_history = true;
                 capabilities
             } else {
-                RigCapabilities::all()
+                // This report-only fixture models an older plugin; receipt
+                // exchanges are exercised by the real Direct source tests.
+                RigCapabilities {
+                    autofocus_delivery_ack: false,
+                    ..RigCapabilities::all()
+                }
             }
         }
 
@@ -5607,6 +5795,301 @@ mod tests {
 
         fn can_route(&self, _target: &ChatTarget) -> bool {
             true
+        }
+    }
+
+    #[cfg(feature = "hub")]
+    mod autofocus_receipts {
+        use super::*;
+        use crate::hub::db::Db;
+
+        #[derive(Default)]
+        struct Destinations {
+            delivered: Mutex<Vec<u64>>,
+            failures: Mutex<HashSet<u64>>,
+        }
+
+        struct DestinationChat(Arc<Destinations>);
+
+        #[async_trait]
+        impl ChatService for DestinationChat {
+            async fn send_message(
+                &self,
+                _: &ChatMessage,
+                target: &ChatTarget,
+            ) -> Result<(), ChatError> {
+                let channels = target.all_discord_channels();
+                assert_eq!(channels.len(), 1, "receipts must be per destination");
+                let channel = channels[0];
+                if self.0.failures.lock().unwrap().contains(&channel) {
+                    return Err("test destination unavailable".into());
+                }
+                self.0.delivered.lock().unwrap().push(channel);
+                Ok(())
+            }
+            async fn send_message_with_image(
+                &self,
+                message: &ChatMessage,
+                target: &ChatTarget,
+                _: &[u8],
+                _: &str,
+            ) -> Result<(), ChatError> {
+                self.send_message(message, target).await
+            }
+            fn service_name(&self) -> &'static str {
+                "test destinations"
+            }
+            fn can_route(&self, target: &ChatTarget) -> bool {
+                !target.all_discord_channels().is_empty()
+            }
+        }
+
+        fn database() -> Db {
+            let db = Db::open_in_memory().unwrap();
+            db.with_conn(|conn| conn.execute_batch(
+                "INSERT INTO users(discord_user_id, username, created_at, last_auth_at) VALUES(1, 'owner', 0, 0);
+                 INSERT INTO guilds(guild_id, name, registered_by, created_at, updated_at) VALUES(10, 'guild', 1, 0, 0);
+                 INSERT INTO telescopes(id, owner_id, name, created_at) VALUES(1, 1, 'scope', 0);
+                 INSERT INTO telescope_channels(telescope_id, guild_id, channel_id, created_by, created_at) VALUES(1, 10, 11, 1, 0), (1, 10, 12, 1, 0);"
+            )).unwrap();
+            db
+        }
+
+        fn report() -> AutofocusResponse {
+            serde_json::from_str(include_str!("../example_last_af.json")).unwrap()
+        }
+
+        fn completion() -> Event {
+            Event {
+                time: Utc::now().to_rfc3339(),
+                event: event_types::AUTOFOCUS_FINISHED.to_string(),
+                chat_enabled: true,
+                details: Some(EventDetails::AutofocusFinished {
+                    report_timestamp: report().response.timestamp,
+                    filter: None,
+                    position: None,
+                    temperature: None,
+                }),
+            }
+        }
+
+        fn updater(
+            db: &Db,
+            destinations: &Arc<Destinations>,
+            event: Event,
+            channels: Vec<u64>,
+        ) -> (ChatUpdater, Arc<FlakyAutofocusSource>) {
+            let source = Arc::new(FlakyAutofocusSource::unavailable_for(event, 0));
+            let mut chat = ChatServiceManager::new();
+            chat.add_service(Box::new(DestinationChat(destinations.clone())));
+            let updater = ChatUpdater::new(
+                source.clone(),
+                "scope".into(),
+                ChatTarget {
+                    discord_channel_ids: channels,
+                    ..ChatTarget::default()
+                },
+                Arc::new(chat),
+            )
+            .with_lifecycle_announcements(false)
+            .with_autofocus_delivery_store(db.clone(), 1, uuid::Uuid::nil());
+            (updater, source)
+        }
+
+        #[tokio::test]
+        async fn restarted_hub_suppresses_replayed_completion_before_reading_old_report() {
+            let db = database();
+            let destinations = Arc::new(Destinations::default());
+            let (mut first, _) = updater(&db, &destinations, completion(), vec![11]);
+            first.poll_events().await;
+            first.poll_autofocus_delivery().await;
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11]);
+            drop(first);
+
+            // Reproduce the old plugin's empty reconnect baseline, followed by
+            // its old completion on the next live poll. No report read needed.
+            let (mut restarted, source) = updater(&db, &destinations, completion(), vec![11]);
+            restarted.process_baseline_events(&[]);
+            restarted.poll_events().await;
+            restarted.poll_autofocus_delivery().await;
+            assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 0);
+            assert!(restarted.pending_autofocus_deliveries.is_empty());
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11]);
+        }
+
+        #[tokio::test]
+        async fn first_upgraded_hub_drops_ancient_replay_without_prior_receipts() {
+            let db = database();
+            let destinations = Arc::new(Destinations::default());
+            let mut old = completion();
+            old.time = (Utc::now() - chrono::Duration::minutes(11)).to_rfc3339();
+            let (mut fresh_hub, source) = updater(&db, &destinations, old, vec![11]);
+            fresh_hub.poll_events().await;
+            fresh_hub.poll_autofocus_delivery().await;
+            assert!(fresh_hub.pending_autofocus_deliveries.is_empty());
+            assert!(destinations.delivered.lock().unwrap().is_empty());
+            assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 0);
+
+            // A genuinely recent completion can still recover without the Hub
+            // observing its start, even when its report timestamp is much older.
+            let mut recent = completion();
+            recent.time = (Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+            let (mut fresh_hub, _) = updater(&db, &destinations, recent, vec![11]);
+            fresh_hub.poll_events().await;
+            fresh_hub.poll_autofocus_delivery().await;
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11]);
+        }
+
+        #[test]
+        fn legacy_freshness_guard_does_not_guess_timezones_or_require_current_rig_clock_sync() {
+            let now = Utc::now();
+            let old = (now - chrono::Duration::minutes(11)).to_rfc3339();
+            assert!(stale_legacy_autofocus(&old, false, now));
+            assert!(!stale_legacy_autofocus(&old, true, now));
+            assert!(!stale_legacy_autofocus("2020-01-01T00:00:00", false, now));
+            assert!(!stale_legacy_autofocus("invalid", false, now));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn partial_failure_retries_only_unconfirmed_channels() {
+            let db = database();
+            let destinations = Arc::new(Destinations::default());
+            destinations.failures.lock().unwrap().insert(12);
+            let (mut first, _) = updater(&db, &destinations, completion(), vec![11, 12]);
+            first.poll_events().await;
+            first.poll_autofocus_delivery().await;
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11]);
+            assert_eq!(first.pending_autofocus_deliveries.len(), 1);
+            drop(first);
+
+            // Even restarting between partial success and retry must not
+            // duplicate the channel that accepted the original graph.
+            destinations.failures.lock().unwrap().clear();
+            let (mut restarted, _) = updater(&db, &destinations, completion(), vec![11, 12]);
+            restarted.poll_events().await;
+            restarted.poll_autofocus_delivery().await;
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11, 12]);
+            assert!(restarted.pending_autofocus_deliveries.is_empty());
+        }
+
+        #[tokio::test]
+        async fn equivalent_timestamp_offsets_and_legacy_events_share_receipts() {
+            let db = database();
+            let destinations = Arc::new(Destinations::default());
+            let (first, _) = updater(&db, &destinations, completion(), vec![11]);
+            first.deliver_autofocus_report(&report()).await.unwrap();
+            let mut equivalent = completion();
+            let Some(EventDetails::AutofocusFinished {
+                report_timestamp, ..
+            }) = &mut equivalent.details
+            else {
+                panic!()
+            };
+            *report_timestamp = parse_nina_timestamp(report_timestamp)
+                .unwrap()
+                .with_timezone(&Utc)
+                .to_rfc3339();
+            let (mut restarted, source) = updater(&db, &destinations, equivalent, vec![11]);
+            restarted.poll_events().await;
+            restarted.poll_autofocus_delivery().await;
+            assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 0);
+
+            let mut legacy = completion();
+            legacy.details = None;
+            let (mut restarted, source) = updater(&db, &destinations, legacy, vec![11]);
+            restarted.poll_events().await;
+            restarted.poll_autofocus_delivery().await;
+            assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 1);
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11]);
+        }
+
+        #[tokio::test]
+        async fn a_new_completion_or_new_destination_is_not_suppressed() {
+            let db = database();
+            let destinations = Arc::new(Destinations::default());
+            let (first, _) = updater(&db, &destinations, completion(), vec![11]);
+            first.deliver_autofocus_report(&report()).await.unwrap();
+            let mut next_report = report();
+            next_report.response.timestamp = "2026-09-11T01:00:00Z".into();
+            first.deliver_autofocus_report(&next_report).await.unwrap();
+            let (new_route, _) = updater(&db, &destinations, completion(), vec![11, 12]);
+            new_route
+                .deliver_autofocus_report(&next_report)
+                .await
+                .unwrap();
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11, 11, 12]);
+        }
+
+        #[tokio::test]
+        async fn delivery_database_failure_is_fail_closed() {
+            let db = database();
+            let destinations = Arc::new(Destinations::default());
+            let (first, _) = updater(&db, &destinations, completion(), vec![11]);
+            db.with_conn(|conn| conn.execute_batch("DROP TABLE autofocus_deliveries"))
+                .unwrap();
+            assert!(first.deliver_autofocus_report(&report()).await.is_err());
+            assert!(destinations.delivered.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failed_chat_is_not_misreported_as_an_unavailable_report() {
+            let db = database();
+            let destinations = Arc::new(Destinations::default());
+            destinations.failures.lock().unwrap().insert(12);
+            let (mut first, _) = updater(&db, &destinations, completion(), vec![11, 12]);
+            first.autofocus_retry.max_attempts = 1;
+            first.poll_events().await;
+            first.poll_autofocus_delivery().await;
+            assert!(first.pending_autofocus_deliveries.is_empty());
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11]);
+        }
+
+        #[tokio::test]
+        async fn restarted_hub_does_not_repeat_terminal_report_unavailable_notice() {
+            let db = database();
+            let destinations = Arc::new(Destinations::default());
+            let (mut first, _) = updater(&db, &destinations, completion(), vec![11]);
+            first.handle_autofocus_finished(&completion()).await;
+            let delivery = first.pending_autofocus_deliveries.remove(0);
+            first.send_autofocus_unavailable(&delivery).await;
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11]);
+            drop(first);
+
+            let (mut restarted, source) = updater(&db, &destinations, completion(), vec![11]);
+            restarted.poll_events().await;
+            restarted.poll_autofocus_delivery().await;
+            assert!(restarted.pending_autofocus_deliveries.is_empty());
+            assert_eq!(source.autofocus_queries.load(Ordering::SeqCst), 0);
+            assert_eq!(*destinations.delivered.lock().unwrap(), vec![11]);
+        }
+
+        #[tokio::test]
+        async fn local_partial_service_failure_does_not_duplicate_successful_service() {
+            let source = Arc::new(FlakyAutofocusSource::unavailable_for(completion(), 0));
+            let recording = Arc::new(RecordingChatState::default());
+            let failing = Arc::new(Destinations::default());
+            failing.failures.lock().unwrap().insert(11);
+            let mut chat = ChatServiceManager::new();
+            chat.add_service(Box::new(RecordingChatService {
+                state: recording.clone(),
+            }));
+            chat.add_service(Box::new(DestinationChat(failing)));
+            let mut local = ChatUpdater::new(
+                source,
+                "local scope".into(),
+                ChatTarget {
+                    discord_channel_id: Some(11),
+                    ..ChatTarget::default()
+                },
+                Arc::new(chat),
+            );
+            local.poll_events().await;
+            local.poll_autofocus_delivery().await;
+            assert_eq!(recording.deliveries.lock().unwrap().len(), 1);
+            assert!(local.pending_autofocus_deliveries.is_empty());
+            local.poll_events().await;
+            local.poll_autofocus_delivery().await;
+            assert_eq!(recording.deliveries.lock().unwrap().len(), 1);
         }
     }
 

@@ -256,6 +256,18 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE telescopes;
     ALTER TABLE telescopes_v9 RENAME TO telescopes;
     CREATE INDEX idx_telescopes_owner ON telescopes(owner_id);",
+    // V10: successful autofocus deliveries survive Hub restarts. Keep only
+    // the normalized report identity, never report contents or equipment
+    // metadata. Do not expire old identities: plugins may retain the latest
+    // report indefinitely. Telescope deletion removes its delivery history.
+    "CREATE TABLE autofocus_deliveries (
+        telescope_id INTEGER NOT NULL REFERENCES telescopes(id) ON DELETE CASCADE,
+        profile_id TEXT NOT NULL,
+        channel_id INTEGER NOT NULL,
+        report_identity TEXT NOT NULL,
+        delivered_at INTEGER NOT NULL,
+        PRIMARY KEY (telescope_id, profile_id, channel_id, report_identity)
+    ) STRICT;",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -567,6 +579,41 @@ mod tests {
         db.set_setting("k", "v1").unwrap();
         db.set_setting("k", "v2").unwrap();
         assert_eq!(db.get_setting("k").unwrap().as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn upgrade_from_v9_preserves_telescope_and_adds_autofocus_ledger() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(9).enumerate() {
+            conn.execute_batch(&format!(
+                "BEGIN;\n{sql}\nPRAGMA user_version = {};\nCOMMIT;",
+                i + 1
+            ))
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO users (discord_user_id, username, created_at, last_auth_at)
+                 VALUES (1, 'owner', 0, 0);
+             INSERT INTO telescopes (id, owner_id, name, created_at)
+                 VALUES (1, 1, 'retained telescope', 0);",
+        )
+        .unwrap();
+
+        let db = Db::from_connection(conn).unwrap();
+        assert_eq!(db.schema_version().unwrap() as usize, MIGRATIONS.len());
+        let name: String = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT name FROM telescopes WHERE id = 1", [], |r| r.get(0))
+            })
+            .unwrap();
+        assert_eq!(name, "retained telescope");
+        assert!(!db.autofocus_delivered(1, "profile", 100, "report").unwrap());
+        db.with_conn(|conn| {
+            migrate(conn).expect("migration remains idempotent after the ledger upgrade");
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
