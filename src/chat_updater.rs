@@ -5603,7 +5603,12 @@ mod tests {
                 capabilities.image_history = true;
                 capabilities
             } else {
-                RigCapabilities::all()
+                // This report-only fixture models an older plugin; receipt
+                // exchanges are exercised by the real Direct source tests.
+                RigCapabilities {
+                    autofocus_delivery_ack: false,
+                    ..RigCapabilities::all()
+                }
             }
         }
 
