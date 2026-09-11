@@ -293,12 +293,14 @@ function localPrivacyNotice() {
   return '<p class="hint">Ordinary event categories, images, and popup ' +
     'notifications start on by default. Review your N.I.N.A. event selections ' +
     'before pairing: disabled categories never reach this Hub, even for state ' +
-    'reconstruction or command-failure reporting. Turning off images also blocks ' +
+    'reconstruction. Accepted command failures are still reported. ' +
+    'Turning off images also blocks ' +
     'existing image history and thumbnails. Allowed equipment and status ' +
     'snapshots remain available, but Hub state may be incomplete. N.I.N.A. log ' +
     'forwarding, observatory location sharing, and hardware control start off. ' +
     'Hardware control requires the N.I.N.A. master switch plus individual ' +
-    'command approvals.</p>';
+    'command approvals. N.I.N.A. also checks live sequence state before ' +
+    'applying a command.</p>';
 }
 
 function toast(msg) {
@@ -944,7 +946,7 @@ mod tests {
             "Ordinary event categories, images, and popup",
             "notifications start on by default",
             "before pairing: disabled categories never reach this Hub",
-            "reconstruction or command-failure reporting",
+            "Accepted command failures are still reported",
             "Turning off images also blocks",
             "existing image history and thumbnails",
             "snapshots remain available, but Hub state may be incomplete",

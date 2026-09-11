@@ -13,10 +13,14 @@
 
 use super::rig_resolver::{CommandContext, RigResolver};
 use super::status_state::{StatusMessage, StatusState};
-use super::{ChatAttachment, ChatMessage, ChatService, ChatTarget, DiscordBotConfig};
+use super::{
+    ChatAttachment, ChatMessage, ChatService, ChatTarget, DiscordBotConfig,
+    execute_authorized_command,
+};
+use crate::api_types::CommandResponse;
 use crate::error::ChatError;
 use crate::sequence::{SequenceOperation, SequenceOperationKind};
-use crate::source::{RigCommand, SharedRigSource};
+use crate::source::{RigCommand, RigSourceResult, SharedRigSource};
 use async_trait::async_trait;
 use poise::serenity_prelude::{self as serenity, CreateAttachment, CreateMessage};
 use std::path::PathBuf;
@@ -421,6 +425,9 @@ pub async fn run_bot(
         "cool",
         "warm",
         "autofocus",
+        "slew_target",
+        "center_target",
+        "center_rotate_target",
         "abort_capture",
         "stop_sequence",
         "start_sequence",
@@ -438,19 +445,19 @@ fn phase1_commands() -> Vec<poise::Command<BotData, BotError>> {
 /// Facts about this invocation for the resolver: where it happened and who
 /// invoked it, including the member's roles when in a guild.
 async fn command_context(ctx: Context<'_>) -> CommandContext {
-    let (role_ids, member_manages) = match ctx.author_member().await {
+    let (role_ids, permissions) = match ctx.author_member().await {
         Some(member) => {
             // Slash-command interactions carry the member's computed
             // permissions from Discord itself.
-            let manages = member.permissions.is_some_and(|permissions| {
-                permissions.administrator() || permissions.manage_guild()
-            });
-            (member.roles.iter().map(|r| r.get()).collect(), manages)
+            (
+                member.roles.iter().map(|r| r.get()).collect(),
+                member.permissions,
+            )
         }
-        None => (Vec::new(), false),
+        None => (Vec::new(), None),
     };
-    // Guild owners manage regardless of roles. The cache holds the guild
-    // thanks to the GUILDS intent; the ref must drop before any await.
+    // Use cached guild ownership only when interaction permissions are absent.
+    // The cache ref must drop before any await.
     let is_owner = ctx
         .guild()
         .map(|guild| guild.owner_id == ctx.author().id)
@@ -460,8 +467,18 @@ async fn command_context(ctx: Context<'_>) -> CommandContext {
         channel_id: ctx.channel_id().get(),
         user_id: ctx.author().id.get(),
         role_ids,
-        manages_guild: member_manages || is_owner,
+        manages_guild: invocation_manages_guild(permissions, is_owner),
     }
+}
+
+fn invocation_manages_guild(
+    permissions: Option<serenity::Permissions>,
+    cached_owner: bool,
+) -> bool {
+    // An ownership change during confirmation can make the guild cache stale.
+    permissions
+        .map(|permissions| permissions.administrator() || permissions.manage_guild())
+        .unwrap_or(cached_owner)
 }
 
 /// Shorthand for "resolve telescope, send an ephemeral error to the user if
@@ -1469,8 +1486,11 @@ async fn last_image(
 // ---------- Phase 3: write commands (ACL-gated) ----------
 
 /// Post a Confirm / Cancel button pair and wait for the invoker to click.
-/// Returns `Ok(true)` on Confirm, `Ok(false)` on Cancel or 30s timeout.
-async fn confirm_destructive(ctx: Context<'_>, action: &str) -> Result<bool, BotError> {
+/// Returns fresh invocation permissions on Confirm, or None on cancellation.
+async fn confirm_destructive(
+    ctx: Context<'_>,
+    action: &str,
+) -> Result<Option<CommandContext>, BotError> {
     let prompt =
         format!("⚠️ Confirm **{action}**?\nThis is a destructive operation — you have 30 seconds.");
     let row = serenity::CreateActionRow::Buttons(vec![
@@ -1498,10 +1518,32 @@ async fn confirm_destructive(ctx: Context<'_>, action: &str) -> Result<bool, Bot
         .await;
 
     let (confirmed, response_text) = match interaction.as_ref().map(|i| i.data.custom_id.as_str()) {
-        Some("chatstronomy-confirm") => (true, "✅ Confirmed, running command…"),
+        Some("chatstronomy-confirm") => (true, "⏳ Confirmed. Sending request to N.I.N.A.…"),
         Some("chatstronomy-cancel") => (false, "❎ Cancelled."),
         _ => (false, "⏱️ Timed out — no action taken."),
     };
+    let invocation = interaction
+        .as_ref()
+        .filter(|i| {
+            confirmed
+                && i.user.id == ctx.author().id
+                && i.guild_id == ctx.guild_id()
+                && i.channel_id == ctx.channel_id()
+        })
+        .map(|i| {
+            let member = i.member.as_ref();
+            let permissions = member.and_then(|member| member.permissions);
+            let is_owner = ctx.guild().is_some_and(|guild| guild.owner_id == i.user.id);
+            CommandContext {
+                guild_id: i.guild_id.map(|id| id.get()),
+                channel_id: i.channel_id.get(),
+                user_id: i.user.id.get(),
+                role_ids: member
+                    .map(|member| member.roles.iter().map(|id| id.get()).collect())
+                    .unwrap_or_default(),
+                manages_guild: invocation_manages_guild(permissions, is_owner),
+            }
+        });
 
     // Acknowledge the interaction (or just edit the original message if
     // the user didn't click anything).
@@ -1526,7 +1568,7 @@ async fn confirm_destructive(ctx: Context<'_>, action: &str) -> Result<bool, Bot
             )
             .await;
     }
-    Ok(confirmed)
+    Ok(invocation)
 }
 
 /// Issue a typed rig command and reply with a status line. Used by all
@@ -1537,6 +1579,18 @@ async fn run_command(
     client: &SharedRigSource,
     label: &str,
     command: RigCommand,
+) -> Result<(), BotError> {
+    let invocation = command_context(ctx).await;
+    run_command_in_context(ctx, telescope, client, label, command, invocation).await
+}
+
+async fn run_command_in_context(
+    ctx: Context<'_>,
+    telescope: &str,
+    client: &SharedRigSource,
+    label: &str,
+    command: RigCommand,
+    invocation: CommandContext,
 ) -> Result<(), BotError> {
     if !client.capabilities().commands {
         ctx.send(
@@ -1549,8 +1603,26 @@ async fn run_command(
         .await?;
         return Ok(());
     }
-    let result = client.execute_command(command).await;
-    let reply = match result {
+    let result = execute_authorized_command(
+        ctx.data().resolver.as_ref(),
+        &invocation,
+        telescope,
+        client,
+        command,
+    )
+    .await;
+    ctx.send(command_reply(telescope, label, result)).await?;
+    Ok(())
+}
+
+/// Both local and hosted bots show the plugin's actual dispatch outcome.
+/// Queuing in a sequence is still a 202 acceptance, never hardware completion.
+fn command_reply(
+    telescope: &str,
+    label: &str,
+    result: RigSourceResult<CommandResponse>,
+) -> poise::CreateReply {
+    match result {
         Ok(resp) if resp.is_pending() => poise::CreateReply::default().content(format!(
             "⏳ [{telescope}] {label}: {} (accepted; completion not yet confirmed)",
             resp.summary()
@@ -1563,9 +1635,7 @@ async fn run_command(
         Err(e) => poise::CreateReply::default()
             .ephemeral(true)
             .content(format!("❌ [{telescope}] {label} failed: {e}")),
-    };
-    ctx.send(reply).await?;
-    Ok(())
+    }
 }
 
 // --- Non-destructive (ACL only) ---
@@ -1598,7 +1668,7 @@ async fn home(
     run_command(ctx, &name, &client, "Home mount", RigCommand::HomeMount).await
 }
 
-/// Change the optical filter by name.
+/// Request a filter change; current plugins queue it before the sequence's next light exposure.
 #[poise::command(slash_command, rename = "change-filter")]
 async fn change_filter(
     ctx: Context<'_>,
@@ -1651,7 +1721,7 @@ async fn change_filter(
         ctx,
         &name,
         &client,
-        &format!("Change filter → {} (ID {})", target.name, target.id),
+        &format!("Request filter → {} (ID {})", target.name, target.id),
         RigCommand::ChangeFilter {
             filter_id: target.id,
         },
@@ -1752,11 +1822,13 @@ async fn warm(
 
 // --- Destructive (ACL + button confirm) ---
 
-/// Trigger or cancel a NINA autofocus run.
+/// Request autofocus; current plugins queue it during an advanced sequence. Optionally cancel.
 #[poise::command(slash_command)]
 async fn autofocus(
     ctx: Context<'_>,
-    #[description = "Cancel a running autofocus"] cancel: Option<bool>,
+    #[description = "Cancel this plugin's queued or running autofocus request"] cancel: Option<
+        bool,
+    >,
     #[description = "Telescope name"] telescope: Option<String>,
 ) -> Result<(), BotError> {
     let (name, client) = match resolve_write_or_reply(ctx, telescope).await {
@@ -1764,15 +1836,23 @@ async fn autofocus(
         Err(_) => return Ok(()),
     };
     let cancel = cancel.unwrap_or(false);
-    if !cancel && !confirm_destructive(ctx, &format!("autofocus run on {name}")).await? {
-        return Ok(());
-    }
+    let invocation = if cancel {
+        ctx.defer().await?;
+        command_context(ctx).await
+    } else {
+        let Some(invocation) =
+            confirm_destructive(ctx, &format!("request autofocus on {name}")).await?
+        else {
+            return Ok(());
+        };
+        invocation
+    };
     let label = if cancel {
         "Cancel autofocus"
     } else {
-        "Start autofocus"
+        "Request autofocus"
     };
-    run_command(
+    run_command_in_context(
         ctx,
         &name,
         &client,
@@ -1782,8 +1862,76 @@ async fn autofocus(
         } else {
             RigCommand::StartAutofocus
         },
+        invocation,
     )
     .await
+}
+
+/// Slew to N.I.N.A.'s current target, now when idle or queued before the next light exposure.
+#[poise::command(slash_command, rename = "slew-target")]
+async fn slew_target(
+    ctx: Context<'_>,
+    #[description = "Telescope name"] telescope: Option<String>,
+) -> Result<(), BotError> {
+    request_target_command(
+        ctx,
+        telescope,
+        "Request target slew",
+        RigCommand::SlewToTarget,
+    )
+    .await
+}
+
+/// Center N.I.N.A.'s current target, now when idle or queued before the next light exposure.
+#[poise::command(slash_command, rename = "center-target")]
+async fn center_target(
+    ctx: Context<'_>,
+    #[description = "Telescope name"] telescope: Option<String>,
+) -> Result<(), BotError> {
+    request_target_command(
+        ctx,
+        telescope,
+        "Request target centering",
+        RigCommand::CenterTarget,
+    )
+    .await
+}
+
+/// Center and rotate to N.I.N.A.'s current target, now when idle or queued before a light exposure.
+#[poise::command(slash_command, rename = "center-rotate-target")]
+async fn center_rotate_target(
+    ctx: Context<'_>,
+    #[description = "Telescope name"] telescope: Option<String>,
+) -> Result<(), BotError> {
+    request_target_command(
+        ctx,
+        telescope,
+        "Request target centering and rotation",
+        RigCommand::CenterRotateTarget,
+    )
+    .await
+}
+
+async fn request_target_command(
+    ctx: Context<'_>,
+    telescope: Option<String>,
+    label: &str,
+    command: RigCommand,
+) -> Result<(), BotError> {
+    let (name, client) = match resolve_write_or_reply(ctx, telescope).await {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    if !client.capabilities().target_commands {
+        ctx.send(poise::CreateReply::default().ephemeral(true).content(format!(
+            "❌ [{name}] Current-target commands require an updated Chatstronomy N.I.N.A. plugin."
+        ))).await?;
+        return Ok(());
+    }
+    let Some(invocation) = confirm_destructive(ctx, &format!("{label} on {name}")).await? else {
+        return Ok(());
+    };
+    run_command_in_context(ctx, &name, &client, label, command, invocation).await
 }
 
 /// Park the mount safely (requires confirmation).
@@ -1796,10 +1944,18 @@ async fn park(
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    if !confirm_destructive(ctx, &format!("park {name}")).await? {
+    let Some(invocation) = confirm_destructive(ctx, &format!("park {name}")).await? else {
         return Ok(());
-    }
-    run_command(ctx, &name, &client, "Park mount", RigCommand::ParkMount).await
+    };
+    run_command_in_context(
+        ctx,
+        &name,
+        &client,
+        "Park mount",
+        RigCommand::ParkMount,
+        invocation,
+    )
+    .await
 }
 
 /// Abort the current camera exposure (requires confirmation).
@@ -1812,15 +1968,17 @@ async fn abort_capture(
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    if !confirm_destructive(ctx, &format!("abort capture on {name}")).await? {
+    let Some(invocation) = confirm_destructive(ctx, &format!("abort capture on {name}")).await?
+    else {
         return Ok(());
-    }
-    run_command(
+    };
+    run_command_in_context(
         ctx,
         &name,
         &client,
         "Abort capture",
         RigCommand::AbortExposure,
+        invocation,
     )
     .await
 }
@@ -1835,34 +1993,38 @@ async fn stop_sequence(
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    if !confirm_destructive(ctx, &format!("stop sequence on {name}")).await? {
+    let Some(invocation) = confirm_destructive(ctx, &format!("stop sequence on {name}")).await?
+    else {
         return Ok(());
-    }
-    run_command(
+    };
+    run_command_in_context(
         ctx,
         &name,
         &client,
         "Stop sequence",
         RigCommand::StopSequence,
+        invocation,
     )
     .await
 }
 
-/// Start the loaded imaging sequence (requires confirmation).
+/// Start the loaded imaging sequence when N.I.N.A. is idle (requires confirmation).
 #[poise::command(slash_command, rename = "start-sequence")]
 async fn start_sequence(
     ctx: Context<'_>,
-    #[description = "Skip pre-run validation"] skip_validation: Option<bool>,
+    #[description = "Skip pre-run validation only if separately permitted in N.I.N.A."]
+    skip_validation: Option<bool>,
     #[description = "Telescope name"] telescope: Option<String>,
 ) -> Result<(), BotError> {
     let (name, client) = match resolve_write_or_reply(ctx, telescope).await {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    if !confirm_destructive(ctx, &format!("start sequence on {name}")).await? {
+    let Some(invocation) = confirm_destructive(ctx, &format!("start sequence on {name}")).await?
+    else {
         return Ok(());
-    }
-    run_command(
+    };
+    run_command_in_context(
         ctx,
         &name,
         &client,
@@ -1870,6 +2032,7 @@ async fn start_sequence(
         RigCommand::StartSequence {
             skip_validation: skip_validation.unwrap_or(false),
         },
+        invocation,
     )
     .await
 }
@@ -1877,7 +2040,130 @@ async fn start_sequence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::{RigSourceError, RigSourceKind};
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn fresh_confirmation_permissions_override_stale_owner_cache() {
+        assert!(!invocation_manages_guild(
+            Some(serenity::Permissions::empty()),
+            true
+        ));
+        assert!(invocation_manages_guild(
+            Some(serenity::Permissions::MANAGE_GUILD),
+            false
+        ));
+        assert!(invocation_manages_guild(
+            Some(serenity::Permissions::ADMINISTRATOR),
+            false
+        ));
+        assert!(invocation_manages_guild(None, true));
+    }
+
+    #[test]
+    fn autofocus_and_sequence_commands_are_registered_for_the_shared_bot() {
+        let commands = phase1_commands();
+        let parent = commands
+            .iter()
+            .find(|command| command.name == "chatstronomy")
+            .unwrap();
+        assert!(
+            parent.subcommands.len() <= 25,
+            "Discord limits one group to 25 commands"
+        );
+        for name in [
+            "autofocus",
+            "change-filter",
+            "start-sequence",
+            "stop-sequence",
+            "slew-target",
+            "center-target",
+            "center-rotate-target",
+        ] {
+            let command = parent
+                .subcommands
+                .iter()
+                .find(|command| command.name == name)
+                .expect("hardware command must be registered for local and hosted bots");
+            assert!(command.slash_action.is_some());
+            assert!(command.description.as_deref().unwrap().chars().count() <= 100);
+            assert!(
+                command
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.name == "telescope")
+            );
+        }
+        let autofocus = parent
+            .subcommands
+            .iter()
+            .find(|command| command.name == "autofocus")
+            .unwrap();
+        assert!(autofocus.description.as_deref().unwrap().contains("queue"));
+        assert!(autofocus.description.as_deref().unwrap().chars().count() <= 100);
+        assert!(
+            autofocus
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == "cancel" && !parameter.required)
+        );
+    }
+
+    #[test]
+    fn queued_and_accepted_command_replies_never_claim_completion() {
+        for message in [
+            "Autofocus queued for the next exposure boundary",
+            "Autofocus requested",
+            "Sequence start requested",
+            "Sequence stop requested",
+            "Filter change queued before the next light exposure",
+            "Target slew queued before the next light exposure",
+            "Target centering queued before the next light exposure",
+            "Target centering and rotation queued before the next light exposure",
+        ] {
+            let response: CommandResponse = serde_json::from_value(serde_json::json!({
+                "Response": message,
+                "Error": "",
+                "StatusCode": 202,
+                "Success": true,
+                "Type": "API"
+            }))
+            .unwrap();
+            let reply = command_reply("Test rig", "Request", Ok(response));
+            let content = reply.content.unwrap();
+            assert!(content.starts_with("⏳"));
+            assert!(content.contains(message));
+            assert!(content.contains("completion not yet confirmed"));
+            assert!(!content.contains('✅'));
+        }
+    }
+
+    #[test]
+    fn command_replies_preserve_local_sequence_rejections() {
+        let reason =
+            "The running sequence has no Chatstronomy Filter Change trigger for this exposure.";
+        for result in [
+            Ok(CommandResponse {
+                response: serde_json::Value::Null,
+                error: reason.to_string(),
+                status_code: 409,
+                success: false,
+                response_type: "API".to_string(),
+            }),
+            Err(RigSourceError::Rejected {
+                kind: RigSourceKind::NinaDirect,
+                reason: reason.to_string(),
+            }),
+        ] {
+            let reply = command_reply("Test rig", "Change filter", result);
+            assert_eq!(reply.ephemeral, Some(true));
+            let content = reply.content.unwrap();
+            assert!(content.starts_with("❌"));
+            assert!(content.contains(reason));
+            assert!(!content.contains('✅'));
+            assert!(!content.contains("accepted"));
+        }
+    }
 
     #[test]
     fn embed_prefers_discord_field_value_and_preserves_occurred_at() {

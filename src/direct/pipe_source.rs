@@ -250,6 +250,11 @@ impl RigSource for DirectPipeRigSource {
         if !self.capabilities.commands {
             return Err(Self::unsupported("commands"));
         }
+        if command.is_target_command() && !self.capabilities.target_commands {
+            return Err(Self::unsupported(
+                "current-target commands (update the Chatstronomy N.I.N.A. plugin)",
+            ));
+        }
         self.query_as(QueryKind::Command { command }).await
     }
 }
@@ -257,6 +262,184 @@ impl RigSource for DirectPipeRigSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::direct::protocol::QueryResult;
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    #[tokio::test]
+    async fn local_commands_preserve_sequence_queueing_and_rejections() {
+        let cases = [
+            (
+                RigCommand::ChangeFilter { filter_id: 3 },
+                true,
+                "Filter change queued before the next light exposure",
+            ),
+            (
+                RigCommand::SlewToTarget,
+                true,
+                "Target slew queued before the next light exposure",
+            ),
+            (
+                RigCommand::CenterTarget,
+                true,
+                "Target centering queued before the next light exposure",
+            ),
+            (
+                RigCommand::CenterRotateTarget,
+                true,
+                "Target centering and rotation queued before the next light exposure",
+            ),
+            (
+                RigCommand::StartAutofocus,
+                true,
+                "Autofocus queued for the next exposure boundary",
+            ),
+            (
+                RigCommand::CancelAutofocus,
+                true,
+                "Autofocus cancellation requested",
+            ),
+            (
+                RigCommand::StartSequence {
+                    skip_validation: false,
+                },
+                true,
+                "Sequence start requested",
+            ),
+            (RigCommand::StopSequence, true, "Sequence stop requested"),
+            (
+                RigCommand::AbortExposure,
+                false,
+                "A sequence owns the camera. Use /stop-sequence to stop it.",
+            ),
+        ];
+        let pipe_name = format!("chatstronomy-command-test-{}", Uuid::new_v4());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(format!(r"\\.\pipe\{pipe_name}"))
+            .unwrap();
+        let expected = cases.clone();
+        let serve = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let mut server = BufReader::new(server);
+            for (command, ok, message) in expected {
+                let mut request = String::new();
+                server.read_line(&mut request).await.unwrap();
+                let DirectMessage::Query(request) = serde_json::from_str(&request).unwrap() else {
+                    panic!("expected command query");
+                };
+                assert_eq!(request.kind, QueryKind::Command { command });
+                assert!(request.expires_at.is_some());
+                let result = DirectMessage::QueryResult(QueryResult {
+                    id: request.id,
+                    ok,
+                    payload: if ok {
+                        serde_json::json!({
+                            "Response": message,
+                            "Error": "",
+                            "StatusCode": 202,
+                            "Success": true,
+                            "Type": "API"
+                        })
+                    } else {
+                        serde_json::Value::Null
+                    },
+                    error: (!ok).then(|| message.to_string()),
+                    error_code: None,
+                });
+                let mut frame = serde_json::to_vec(&result).unwrap();
+                frame.push(b'\n');
+                server.write_all(&frame).await.unwrap();
+                server.flush().await.unwrap();
+            }
+        });
+        let source = DirectPipeRigSource::connect(&pipe_name, RigCapabilities::all())
+            .await
+            .unwrap();
+        for (command, ok, message) in cases {
+            let result = source.execute_command(command).await;
+            if ok {
+                let response = result.unwrap();
+                assert!(response.is_pending());
+                assert_eq!(response.summary(), message);
+            } else {
+                assert!(
+                    matches!(result, Err(RigSourceError::Rejected { reason, .. }) if reason == message)
+                );
+            }
+        }
+        serve.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_target_commands_cannot_bypass_read_only_capabilities() {
+        let pipe_name = format!("chatstronomy-locked-command-test-{}", Uuid::new_v4());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(format!(r"\\.\pipe\{pipe_name}"))
+            .unwrap();
+        let source = DirectPipeRigSource::connect(&pipe_name, RigCapabilities::none())
+            .await
+            .unwrap();
+        server.connect().await.unwrap();
+        for command in [
+            RigCommand::SlewToTarget,
+            RigCommand::CenterTarget,
+            RigCommand::CenterRotateTarget,
+        ] {
+            assert!(matches!(
+                source.execute_command(command).await,
+                Err(RigSourceError::Unsupported {
+                    capability: "commands",
+                    ..
+                })
+            ));
+        }
+        let mut byte = [0];
+        assert_eq!(
+            server.try_read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_local_plugins_never_receive_unknown_target_command_kinds() {
+        for target_support in [None, Some(false)] {
+            let pipe_name = format!("chatstronomy-legacy-command-test-{}", Uuid::new_v4());
+            let server = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(format!(r"\\.\pipe\{pipe_name}"))
+                .unwrap();
+            let mut capabilities = serde_json::to_value(RigCapabilities::all()).unwrap();
+            capabilities
+                .as_object_mut()
+                .unwrap()
+                .remove("target_commands");
+            if let Some(supported) = target_support {
+                capabilities["target_commands"] = serde_json::json!(supported);
+            }
+            let source = DirectPipeRigSource::connect(
+                &pipe_name,
+                serde_json::from_value(capabilities).unwrap(),
+            )
+            .await
+            .unwrap();
+            server.connect().await.unwrap();
+            for command in [
+                RigCommand::SlewToTarget,
+                RigCommand::CenterTarget,
+                RigCommand::CenterRotateTarget,
+            ] {
+                assert!(
+                    matches!(source.execute_command(command).await, Err(RigSourceError::Unsupported { capability, .. }) if capability.contains("current-target commands"))
+                );
+            }
+            let mut byte = [0];
+            assert_eq!(
+                server.try_read(&mut byte).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
 
     #[test]
     fn local_hardware_commands_have_deadlines_but_legacy_reads_do_not() {

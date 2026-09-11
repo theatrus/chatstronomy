@@ -9,6 +9,28 @@ fixtures are durable cross-repository compatibility inputs. Additive optional
 fields may be introduced within v1; incompatible wire changes require a new
 protocol directory and protocol version.
 
+The additive parameterless commands `slew_to_target`, `center_target`, and
+`center_rotate_target` require a supporting N.I.N.A. plugin. Their target and
+position angle are resolved locally; these messages contain no coordinates.
+Support is advertised by the optional hello/bootstrap capability
+`target_commands: true`, shown in `fixtures/client-hello-target-commands.json`.
+Missing or false means unsupported: Hub and local runtime must reject these
+three command kinds before sending them to older plugins. The separate
+`commands` capability and per-command local permissions still govern authority.
+`fixtures/query-slew-target.json`, `query-center-target.json`, and
+`query-center-rotate-target.json` cover their wire shape. Existing command
+values, including `start_autofocus`, `cancel_autofocus`, `change_filter`,
+`start_sequence`, and `stop_sequence`, remain unchanged.
+
+The plugin chooses idle execution or a matching advanced-sequence trigger
+before a light exposure for autofocus, filter changes, and target operations.
+All queued or asynchronously accepted commands retain the existing command
+response envelope with `StatusCode: 202` and `Success: true`. This acknowledges
+acceptance, not hardware completion. A rejected request remains a failed
+command response or rejected `query_result` with its reason; clients must not
+retry it as a transient query. Sequence and capture ownership, local consent,
+and request lifetime are checked in N.I.N.A., independently of event sharing.
+
 Failed `query_result` frames may optionally carry
 `error_code: "resource_not_ready"` when an asynchronous resource exists but is
 still being produced. A peer that understands the code can retry it separately

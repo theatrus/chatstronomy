@@ -185,8 +185,13 @@ fn check_write_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::execute_authorized_command;
+    use crate::direct::protocol::{DirectMessage, QueryResult};
+    use crate::hub::direct_server::RigConnection;
     use crate::hub::store::UserRow;
     use crate::hub::tenants::AttachmentUpdate;
+    use crate::source::{RigCommand, RigSourceError};
+    use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
 
     fn setup() -> (Db, Arc<RigConnections>, HubRigResolver, i64) {
@@ -395,5 +400,127 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("disabled"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn confirmation_cannot_outlive_policy_attachment_or_member_permission() {
+        for change in ["policy", "attachment", "member"] {
+            let (db, connections, resolver, id) = setup();
+            let (connection, mut outgoing) = RigConnection::stub(id, Uuid::new_v4());
+            connections.insert(connection);
+            let mut invocation = manager_invocation(100, 42);
+            let (name, expected) = resolver.resolve_for_write(&invocation, None).unwrap();
+            let attachment = db.attachment_for(id, 100).unwrap().unwrap();
+            match change {
+                "policy" => db
+                    .update_attachment(
+                        attachment.id,
+                        &AttachmentUpdate {
+                            write_policy: Some("disabled".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                "attachment" => db.detach_telescope(attachment.id).unwrap(),
+                "member" => invocation.manages_guild = false,
+                _ => unreachable!(),
+            }
+            let result = execute_authorized_command(
+                &resolver,
+                &invocation,
+                &name,
+                &expected,
+                RigCommand::ParkMount,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(RigSourceError::Rejected { .. })),
+                "{change} did not revoke dispatch"
+            );
+            assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmation_cannot_redirect_to_another_rig_with_the_same_name() {
+        let (db, connections, resolver, id) = setup();
+        let (connection, mut outgoing) = RigConnection::stub(id, Uuid::new_v4());
+        connections.insert(connection);
+        let invocation = manager_invocation(100, 42);
+        let (name, expected) = resolver.resolve_for_write(&invocation, None).unwrap();
+        db.delete_telescope(id).unwrap();
+        let replacement = db.create_telescope(1, &name).unwrap();
+        db.attach_telescope(replacement.id, 100, true, 1).unwrap();
+        let (replacement, mut replacement_outgoing) =
+            RigConnection::stub(replacement.id, Uuid::new_v4());
+        connections.insert(replacement);
+        let result = execute_authorized_command(
+            &resolver,
+            &invocation,
+            &name,
+            &expected,
+            RigCommand::CenterTarget,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(RigSourceError::Rejected { reason, .. }) if reason.contains("connection changed"))
+        );
+        assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(
+            replacement_outgoing.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirmation_cannot_cross_a_transport_reconnection() {
+        let (_db, connections, resolver, id) = setup();
+        let (connection, mut outgoing) = RigConnection::stub(id, Uuid::new_v4());
+        let session_id = connection.session_id;
+        let profile_id = connection.profile_id;
+        connections.insert(connection);
+        let invocation = manager_invocation(100, 42);
+        let (name, expected) = resolver.resolve_for_write(&invocation, None).unwrap();
+        let (replacement, mut replacement_outgoing) =
+            RigConnection::stub_with_identity(id, Uuid::new_v4(), session_id, profile_id);
+        connections.insert(replacement);
+        assert!(
+            matches!(execute_authorized_command(&resolver, &invocation, &name, &expected, RigCommand::StartAutofocus).await, Err(RigSourceError::Rejected { reason, .. }) if reason.contains("connection changed"))
+        );
+        assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(
+            replacement_outgoing.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_revalidation_accepts_the_same_authorized_connection() {
+        let (_db, connections, resolver, id) = setup();
+        let (connection, mut outgoing) = RigConnection::stub(id, Uuid::new_v4());
+        connections.insert(connection.clone());
+        let invocation = manager_invocation(100, 42);
+        let (name, expected) = resolver.resolve_for_write(&invocation, None).unwrap();
+        let dispatch = tokio::spawn(async move {
+            execute_authorized_command(
+                &resolver,
+                &invocation,
+                &name,
+                &expected,
+                RigCommand::CenterTarget,
+            )
+            .await
+        });
+        let DirectMessage::Query(query) = outgoing.recv().await.unwrap() else {
+            panic!("expected command");
+        };
+        connection.resolve(QueryResult {
+            id: query.id,
+            ok: true,
+            payload: serde_json::json!({ "Response": "Centering queued", "Error": "", "StatusCode": 202, "Success": true, "Type": "API" }),
+            error: None,
+            error_code: None,
+        });
+        assert!(dispatch.await.unwrap().unwrap().is_pending());
     }
 }

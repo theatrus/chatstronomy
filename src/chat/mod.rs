@@ -7,6 +7,7 @@ mod status_state;
 pub use discord_bot::{DiscordBotService, run_bot};
 pub use discord_service::DiscordChatService;
 pub use matrix_service::MatrixChatService;
+pub(crate) use rig_resolver::execute_authorized_command;
 pub use rig_resolver::{CommandContext, RigResolver, StaticRigResolver};
 pub use status_state::{StatusMessage, StatusState};
 

@@ -63,6 +63,28 @@ rather than completed. Hardware-command failures become
 command, its terminal failure is always delivered as part of that command
 exchange rather than optional event chatter.
 
+Existing semantic command names remain unchanged: `start_autofocus` selects
+idle execution or an advanced-sequence queue inside the plugin;
+`cancel_autofocus` only targets that plugin's request. `change_filter` keeps
+its existing `filter_id` argument. The additive parameterless commands
+`slew_to_target`, `center_target`, and `center_rotate_target` resolve their
+target and position angle locally in N.I.N.A.; no coordinates arrive from
+chat. Each operation has a separate local permission and a matching
+Chatstronomy trigger for execution before an eligible light exposure. Queued
+operations, sequence start/stop, and other asynchronous commands use the same
+status-202 response. The Hub and local runtime forward this acknowledgement
+without claiming hardware completion or retrying a rejected command.
+Local sequence-state, camera-ownership, profile, expiry, and per-command consent
+checks are enforced again before execution; no safety decision relies on a
+Hub snapshot. Cooling and warming remain permitted during a sequence.
+
+The optional `target_commands` capability advertises parser support for the
+three new parameterless commands; missing/false blocks dispatch before any
+frame reaches an older plugin. It is independent of the existing `commands`
+consent gate. Bot dispatch revalidates current routing policy against the exact
+resolved command connection, so a confirmation cannot be redirected by a
+same-name telescope replacement or reused after reconnecting.
+
 ## Event delivery and state
 
 Event-delivery settings are enforced before events leave N.I.N.A. Events from

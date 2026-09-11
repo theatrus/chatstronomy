@@ -637,10 +637,14 @@ mod tests {
     fn published_v1_fixtures_are_accepted_by_the_normative_implementation() {
         let fixtures = [
             include_str!("../../contracts/direct/v1/fixtures/client-hello.json"),
+            include_str!("../../contracts/direct/v1/fixtures/client-hello-target-commands.json"),
             include_str!("../../contracts/direct/v1/fixtures/client-hello-legacy.json"),
             include_str!("../../contracts/direct/v1/fixtures/pair.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-guider-graph.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-command.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-slew-target.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-center-target.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-center-rotate-target.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-autofocus-hocus.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-motion.json"),
@@ -674,6 +678,31 @@ mod tests {
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../contracts/direct/v1/schema.json")).unwrap();
         assert_eq!(schema["title"], "Chatstronomy Direct protocol v1");
+    }
+
+    #[test]
+    fn published_hello_fixtures_negotiate_target_support_additively() {
+        for (fixture, expected) in [
+            (
+                include_str!("../../contracts/direct/v1/fixtures/client-hello.json"),
+                false,
+            ),
+            (
+                include_str!("../../contracts/direct/v1/fixtures/client-hello-legacy.json"),
+                false,
+            ),
+            (
+                include_str!(
+                    "../../contracts/direct/v1/fixtures/client-hello-target-commands.json"
+                ),
+                true,
+            ),
+        ] {
+            let DirectMessage::ClientHello(hello) = serde_json::from_str(fixture).unwrap() else {
+                panic!("expected hello");
+            };
+            assert_eq!(hello.capabilities.target_commands, expected);
+        }
     }
 
     #[test]

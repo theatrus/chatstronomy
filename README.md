@@ -137,6 +137,32 @@ request approved operations unless an explicit user allowlist is configured;
 requests must come from the telescope's configured channel, and direct messages
 never gain control authority.
 
+The Hub and local Discord bot expose the same `/chatstronomy` slash commands.
+The sequence guards and trigger queues below require plugin **0.1.0.28 or newer**;
+updating the Hub alone does not change an older plugin's hardware behavior.
+Autofocus, filter changes, and current-target slew/center/rotate requests run
+when N.I.N.A. is idle and the camera is available. During an advanced sequence
+they queue for the matching **Chatstronomy** trigger before the next eligible
+light exposure. Add each required trigger to the target's enclosing instruction
+set (or an ancestor containing its exposures). A sequence without the matching
+trigger, including the simple sequencer, cannot queue that operation. Requests
+expire and are cleared when their sequence, profile, or permissions change.
+
+`/chatstronomy slew-target`, `center-target`, and `center-rotate-target` use
+the target and, for rotation, position angle resolved inside N.I.N.A.; chat
+cannot supply coordinates. Each needs its own local command permission.
+`/chatstronomy autofocus cancel:true` cancels only Chatstronomy's queued or
+running autofocus request. `start-sequence` starts the loaded sequence only
+while idle; `stop-sequence` asks N.I.N.A. to stop the active sequence.
+Cooling and warming remain available during a sequence when locally permitted.
+Other hardware commands are rejected while sequencing, including
+`abort-capture`; use `stop-sequence` for a coordinated stop. The plugin checks
+live sequence state and camera ownership when applying commands, independently
+of the Hub and local bot. Chat keeps queued and accepted requests marked as
+pending and preserves N.I.N.A.'s rejection reason. See the
+[command and trigger guide](docs/HOSTED_SERVICE.md#autofocus-and-sequence-commands)
+for setup. Matrix and Discord webhooks provide notifications, not slash commands.
+
 The plugin does not share the observatory's geographic location, derived local
 sky coordinates, or stable equipment identifiers by default. An owner can
 explicitly opt in to sharing the observatory location for that N.I.N.A. profile;
