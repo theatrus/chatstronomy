@@ -268,6 +268,35 @@ const MIGRATIONS: &[&str] = &[
         delivered_at INTEGER NOT NULL,
         PRIMARY KEY (telescope_id, profile_id, channel_id, report_identity)
     ) STRICT;",
+    // V11: feed-only observatory devices are not telescopes and never enter
+    // slash-command routing or inherit hardware-control permissions.
+    "CREATE TABLE devices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER NOT NULL REFERENCES users(discord_user_id),
+        name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 64),
+        kind TEXT NOT NULL CHECK(kind IN ('pier_camera')),
+        created_at INTEGER NOT NULL,
+        UNIQUE(owner_id, name)
+    ) STRICT;
+    CREATE TABLE device_pairing_tokens (
+        device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL UNIQUE,
+        expires_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE device_credentials (
+        device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        credential_hash TEXT NOT NULL UNIQUE,
+        installation_id TEXT NOT NULL,
+        paired_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE device_channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+        channel_id INTEGER NOT NULL,
+        channel_name TEXT NOT NULL,
+        UNIQUE(device_id, channel_id)
+    ) STRICT;",
 ];
 
 #[derive(Debug, thiserror::Error)]

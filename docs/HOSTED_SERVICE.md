@@ -41,6 +41,10 @@ consumed once.
 
 ## Local hardware-control consent
 
+Feed-only observatory devices such as AutoPierCam can be paired separately from
+telescopes. See [device pairing and protocol](DEVICE_PROTOCOL.md). These devices
+never enter telescope command routing or inherit N.I.N.A. control permissions.
+
 Hardware control is disabled by default in each N.I.N.A. profile. The telescope
 owner must enable the plugin's local master switch and separately approve every
 kind of hardware command they want to expose. Starting a sequence without
