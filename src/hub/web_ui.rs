@@ -388,8 +388,8 @@ async function renderAll(tab = ACTIVE_TAB, focusAttachmentId = null) {
   app.innerHTML =
     '<div class="tabs" role="tablist" aria-label="Hub settings">' +
     '<button type="button" class="tab" role="tab" id="tab-telescopes" ' +
-    'aria-controls="panel-telescopes" data-tab="telescopes">Telescopes ' +
-    '<span class="tab-count">' + mine.telescopes.length + "</span></button>" +
+    'aria-controls="panel-telescopes" data-tab="telescopes">Observatory devices ' +
+    '<span class="tab-count">' + (mine.telescopes.length + devices.devices.length) + "</span></button>" +
     '<button type="button" class="tab" role="tab" id="tab-delivery" ' +
     'aria-controls="panel-delivery" data-tab="delivery">Discord delivery ' +
     '<span class="tab-count">' + GUILDS.length + "</span></button></div>" +
@@ -440,7 +440,7 @@ async function renderAll(tab = ACTIVE_TAB, focusAttachmentId = null) {
 function renderDevices(devices, panel) {
   const section = document.createElement("div");
   section.className = "card";
-  section.innerHTML = '<h2>Pier cameras &amp; devices</h2>' +
+  section.innerHTML = '<h2>Pier cameras &amp; devices</h2><button class="refresh-devices">Refresh camera status</button>' +
     '<p class="hint">Pair AutoPierCam separately from N.I.N.A. Camera feeds can share telescope channels, ' +
     'but cannot control telescope hardware. Only enable images you want to share with those channels.</p>' +
     '<form class="controls"><label>Camera name <input name="name" maxlength="64" required placeholder="Pier camera"></label>' +
@@ -452,12 +452,14 @@ function renderDevices(devices, panel) {
       await renderAll();
     } catch(e) { toast(e.message); }
   };
+  section.querySelector('.refresh-devices').onclick = () => renderAll();
   for (const d of devices) {
     const row = document.createElement("div");
     row.className = "card";
     row.innerHTML = '<h3>' + esc(d.name) + '</h3><p class="hint">Pier camera · ' +
-      (d.paired ? 'Paired' : 'Not paired') + ' · No telescope control</p>' +
+      (d.connected ? 'Online' : (d.paired ? 'Paired · Offline' : 'Not paired')) + ' · No telescope control</p>' +
       '<div class="controls"><button class="pair">Get pairing code</button>' +
+      '<button class="snapshot"' + (d.connected ? '' : ' disabled') + '>Snapshot now</button>' +
       '<button class="revoke">Revoke access</button><button class="remove">Delete device</button></div>' +
       '<p class="device-token hint"></p><ul>' + d.channels.map(c => '<li>' + esc(c.channel_name) +
       ' <button class="remove-route" data-route="' + c.id + '">Remove channel</button></li>').join("") + '</ul>' +
@@ -479,6 +481,13 @@ function renderDevices(devices, panel) {
     };
     row.querySelector('.revoke').onclick = () => {
       if (confirm('Revoke this camera and all unused pairing codes? Pair again to resume sharing.')) act(base+'/credentials','DELETE');
+    };
+    row.querySelector('.snapshot').onclick = async () => {
+      const button = row.querySelector('.snapshot');
+      button.disabled = true; button.textContent = 'Waiting for camera…';
+      try {await api(base+'/snapshot',{method:'POST'}); toast('Snapshot posted to the selected channels');}
+      catch(e) {toast(e.message);}
+      finally {button.disabled = false; button.textContent = 'Snapshot now';}
     };
     row.querySelector('.remove').onclick = () => {
       if (confirm('Delete this device, its credentials and all channel links?')) act(base,'DELETE');
@@ -1187,6 +1196,8 @@ mod tests {
 
     #[test]
     fn device_pairing_is_separate_and_server_managers_can_remove_feeds() {
+        assert!(INDEX_HTML.contains("Observatory devices"));
+        assert!(INDEX_HTML.contains("mine.telescopes.length + devices.devices.length"));
         for text in [
             "Pier cameras &amp; devices",
             "No telescope control",

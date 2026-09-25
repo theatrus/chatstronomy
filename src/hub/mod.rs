@@ -13,6 +13,7 @@ pub mod autofocus_delivery;
 pub mod config;
 pub mod db;
 pub mod device_api;
+pub mod device_transport;
 pub mod devices;
 pub mod direct_server;
 pub mod direct_source;

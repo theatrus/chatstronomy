@@ -26,6 +26,8 @@ pub fn routes() -> Router<HubState> {
         .route("/api/devices/{id}/channels/{route}", delete(remove_channel))
         .route("/api/guilds/{guild}/devices", get(guild_devices))
         .route("/v1/devices/pair", post(pair))
+        .route("/v1/devices", get(super::device_transport::upgrade))
+        .route("/api/devices/{id}/snapshot", post(snapshot))
         .layer(DefaultBodyLimit::max(4096))
 }
 
@@ -54,6 +56,7 @@ async fn list(State(state): State<HubState>, headers: HeaderMap) -> Response {
             let channels = state.db.device_channels(device.id)?;
             let mut value = json!(device);
             value["channels"] = json!(channels);
+            value["connected"] = json!(state.device_connections.connected(device.id));
             devices.push(value);
         }
         Ok::<_, super::db::DbError>(devices)
@@ -109,6 +112,7 @@ async fn remove(
     if let Err(r) = owner(&state, &headers, id) {
         return r;
     }
+    state.device_connections.disconnect(id);
     match state.db.delete_device(id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(e),
@@ -141,6 +145,7 @@ async fn revoke(
     if let Err(r) = owner(&state, &headers, id) {
         return r;
     }
+    state.device_connections.disconnect(id);
     match state.db.revoke_device(id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => internal_error(e),
@@ -164,6 +169,17 @@ async fn add_channel(
         Ok(d) => d,
         Err(r) => return r,
     };
+    match state.db.device_channels(id) {
+        Ok(channels) if channels.len() >= 8 => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "at most eight destinations per device",
+            )
+                .into_response();
+        }
+        Err(e) => return internal_error(e),
+        _ => {}
+    }
     let (Ok(guild), Ok(channel)) = (
         super::discord_api::parse_snowflake(&body.guild_id),
         super::discord_api::parse_snowflake(&body.channel_id),
@@ -235,6 +251,7 @@ async fn remove_channel(
     {
         return r;
     }
+    state.device_connections.disconnect(id);
     match state.db.delete_device_channel(id, route) {
         Ok(()) => {
             state.db.audit(
@@ -298,14 +315,38 @@ async fn pair(
         .db
         .pair_device(&body.pairing_token, body.installation_id)
     {
-        Ok(Some((id, credential))) => (
+        Ok(Some((id, credential))) => {
+            state.device_connections.disconnect(id);
+            (
             [("cache-control", "no-store")],
             Json(
                 json!({"protocol_version":PROTOCOL_VERSION,"device_id":id,"credential":credential}),
             ),
         )
-            .into_response(),
+            .into_response()
+        }
         Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
         Err(e) => internal_error(e),
+    }
+}
+
+async fn snapshot(
+    State(state): State<HubState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = owner(&state, &headers, id) {
+        return r;
+    }
+    match state.db.device_channels(id) {
+        Ok(channels) if channels.is_empty() => {
+            return (StatusCode::CONFLICT, "choose a destination channel first").into_response();
+        }
+        Err(e) => return internal_error(e),
+        _ => {}
+    }
+    match state.device_connections.snapshot(id).await {
+        Ok(()) => Json(json!({"status":"delivered"})).into_response(),
+        Err(reason) => (StatusCode::CONFLICT, reason).into_response(),
     }
 }
