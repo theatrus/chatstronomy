@@ -290,6 +290,91 @@ impl ChatService for MatrixChatService {
 mod tests {
     use super::*;
 
+    // Exercise the real SDK after dependency upgrades without a homeserver,
+    // credentials, or chat messages leaving the local test process.
+    #[cfg(feature = "hub")]
+    #[tokio::test]
+    async fn matrix_sdk_login_sync_and_notice_round_trip() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{Method, StatusCode, Uri},
+            response::IntoResponse,
+        };
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        let sent = Arc::new(Mutex::new(Vec::<Value>::new()));
+        async fn mock(
+            State(sent): State<Arc<Mutex<Vec<Value>>>>,
+            method: Method,
+            uri: Uri,
+            body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            let path = uri.path();
+            let response = if path == "/_matrix/client/versions" {
+                json!({"versions":["v1.1","v1.11"],"unstable_features":{}})
+            } else if method == Method::POST && path.ends_with("/login") {
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["type"], "m.login.password");
+                assert_eq!(body["password"], "local-test-password");
+                json!({"user_id":"@bot:localhost","access_token":"local-test-token","device_id":"TESTDEVICE"})
+            } else if path.ends_with("/sync") {
+                // The service starts a background sync loop; keep this mock
+                // from becoming a tight loop while a message is being sent.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                json!({"next_batch":"batch1","rooms":{"join":{"!pier:localhost":{
+                    "state":{"events":[{"type":"m.room.member","state_key":"@bot:localhost","sender":"@bot:localhost","event_id":"$join","origin_server_ts":1,"content":{"membership":"join"}}]},
+                    "timeline":{"events":[],"limited":false,"prev_batch":"batch0"},"ephemeral":{"events":[]},"account_data":{"events":[]}
+                }}},"device_lists":{"changed":[],"left":[]},"device_one_time_keys_count":{"signed_curve25519":50}})
+            } else if path.ends_with("/keys/upload") {
+                json!({"one_time_key_counts":{"signed_curve25519":50}})
+            } else if path.ends_with("/keys/query") {
+                json!({"device_keys":{},"failures":{}})
+            } else if method == Method::PUT && path.contains("/send/m.room.message/") {
+                sent.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap());
+                json!({"event_id":"$posted"})
+            } else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"errcode":"M_NOT_FOUND","error":"not found"})),
+                )
+                    .into_response();
+            };
+            Json(response).into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().fallback(mock).with_state(sent.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let service =
+                MatrixChatService::new(&url, "bot", "local-test-password", Some("!pier:localhost"))
+                    .await
+                    .unwrap();
+            let target = ChatTarget::default();
+            assert!(service.can_route(&target));
+            service
+                .send_message(&ChatMessage::new("Pier camera ready"), &target)
+                .await
+                .unwrap();
+            let messages = sent.lock().unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["msgtype"], "m.notice");
+            assert!(
+                messages[0]["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Pier camera ready")
+            );
+        })
+        .await;
+        server.abort();
+        result.expect("local Matrix login/sync/send must complete promptly");
+    }
+
     #[test]
     fn matrix_uses_portable_values_and_renders_labeled_occurrence_in_utc() {
         let occurred_at = chrono::DateTime::parse_from_rfc3339("2026-08-17T04:00:00-07:00")

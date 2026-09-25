@@ -194,6 +194,7 @@ pub fn client_ip(
 
 pub fn router(state: HubState) -> Router {
     Router::new()
+        .merge(super::device_api::routes())
         .route("/", get(index))
         .route("/favicon.ico", get(favicon))
         .route("/healthz", get(healthz))
@@ -474,7 +475,7 @@ pub fn require_session_with_csrf(state: &HubState, headers: &HeaderMap) -> Optio
 // ---------------------------------------------------------------------------
 
 /// Authorization outcome for managing a guild.
-enum ManageAuth {
+pub(super) enum ManageAuth {
     Ok(SessionRow),
     Denied(Response),
 }
@@ -483,7 +484,7 @@ enum ManageAuth {
 /// mutations), MANAGE_GUILD/owner in the OAuth snapshot, and — when a bot
 /// token is configured — a live membership check so a user who left the
 /// guild loses access before their snapshot refreshes.
-async fn authorize_manage(
+pub(super) async fn authorize_manage(
     state: &HubState,
     headers: &HeaderMap,
     guild_id: i64,
@@ -1545,7 +1546,7 @@ fn service_unavailable(message: &str) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, message.to_string()).into_response()
 }
 
-fn internal_error(e: impl std::fmt::Display) -> Response {
+pub(super) fn internal_error(e: impl std::fmt::Display) -> Response {
     eprintln!("Hub internal error: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2116,6 +2117,229 @@ mod tests {
             .await
             .unwrap();
         (id, attachment["attachment_id"].as_i64().unwrap())
+    }
+
+    #[tokio::test]
+    async fn device_pairing_and_routes_do_not_change_telescope_routing() {
+        let (base, db, client, csrf) = managed_hub(Some(Arc::new(StubChecker {
+            bot: true,
+            member: true,
+            channel: true,
+        })))
+        .await;
+        let (telescope, attachment) = create_and_attach(&client, &base, &csrf).await;
+        let response = client
+            .post(format!("{base}/api/attachments/{attachment}/channels"))
+            .header("x-csrf-token", &csrf)
+            .json(&serde_json::json!({"channel_id":"555"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let create = serde_json::json!({"name":"Pier cam","kind":"pier_camera"});
+        assert_eq!(
+            client
+                .post(format!("{base}/api/devices"))
+                .json(&create)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        let d: serde_json::Value = client
+            .post(format!("{base}/api/devices"))
+            .header("x-csrf-token", &csrf)
+            .json(&create)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = d["id"].as_i64().unwrap();
+        assert_eq!(
+            client
+                .post(format!("{base}/api/devices/{id}/channels"))
+                .header("x-csrf-token", &csrf)
+                .json(&serde_json::json!({"guild_id":OWNED_GUILD,"channel_id":"555"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        assert_eq!(db.telescope_by_channel(555).unwrap().unwrap().id, telescope);
+        let token: serde_json::Value = client
+            .post(format!("{base}/api/devices/{id}/pairing-token"))
+            .header("x-csrf-token", &csrf)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let installation = uuid::Uuid::new_v4();
+        let body = serde_json::json!({"protocol_version":1,"kind":"pier_camera","installation_id":installation,"pairing_token":token["pairing_token"]});
+        let paired = client
+            .post(format!("{base}/v1/devices/pair"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paired.status(), 200);
+        assert_eq!(paired.headers()["cache-control"], "no-store");
+        let paired: serde_json::Value = paired.json().await.unwrap();
+        let credential = paired["credential"].as_str().unwrap();
+        assert_eq!(
+            db.authenticate_device(credential, installation).unwrap(),
+            Some(id)
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/v1/devices/pair"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        let routes: serde_json::Value = client
+            .get(format!("{base}/api/guilds/{OWNED_GUILD}/devices"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(routes["routes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            client
+                .delete(format!("{base}/api/devices/{id}/credentials"))
+                .header("x-csrf-token", &csrf)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        assert!(
+            db.authenticate_device(credential, installation)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn device_destination_checks_fail_closed() {
+        for checker in [
+            None,
+            Some(StubChecker {
+                bot: false,
+                member: true,
+                channel: true,
+            }),
+            Some(StubChecker {
+                bot: true,
+                member: false,
+                channel: true,
+            }),
+            Some(StubChecker {
+                bot: true,
+                member: true,
+                channel: false,
+            }),
+        ] {
+            let (base, db, client, csrf) =
+                managed_hub(checker.map(|c| Arc::new(c) as Arc<dyn GuildChecker>)).await;
+            let d: serde_json::Value = client
+                .post(format!("{base}/api/devices"))
+                .header("x-csrf-token", &csrf)
+                .json(&serde_json::json!({"name":"Pier","kind":"pier_camera"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let id = d["id"].as_i64().unwrap();
+            let response = client
+                .post(format!("{base}/api/devices/{id}/channels"))
+                .header("x-csrf-token", &csrf)
+                .json(&serde_json::json!({"guild_id":OWNED_GUILD,"channel_id":"555"}))
+                .send()
+                .await
+                .unwrap();
+            assert!(matches!(response.status().as_u16(), 403 | 503));
+            assert!(db.device_channels(id).unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn device_ownership_is_not_inherited_from_guild_management() {
+        let (base, db, client, csrf) = managed_hub(Some(Arc::new(StubChecker {
+            bot: true,
+            member: true,
+            channel: true,
+        })))
+        .await;
+        create_and_attach(&client, &base, &csrf).await;
+        db.upsert_user(&UserRow {
+            discord_user_id: 2,
+            username: "another owner".into(),
+            email: None,
+            email_verified: false,
+            avatar_url: None,
+        })
+        .unwrap();
+        let d = db
+            .create_device(
+                2,
+                "Other camera",
+                super::super::devices::DeviceKind::PierCamera,
+            )
+            .unwrap();
+        db.add_device_channel(d.id, OWNED_GUILD.parse().unwrap(), 555, "observatory")
+            .unwrap();
+        let id = d.id;
+        for path in [
+            format!("{base}/api/devices/{id}"),
+            format!("{base}/api/devices/{id}/credentials"),
+        ] {
+            assert_eq!(
+                client
+                    .delete(path)
+                    .header("x-csrf-token", &csrf)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                403
+            );
+        }
+        assert_eq!(
+            client
+                .post(format!("{base}/api/devices/{id}/pairing-token"))
+                .header("x-csrf-token", &csrf)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        let route = db.device_channels(id).unwrap()[0].id;
+        assert_eq!(
+            client
+                .delete(format!("{base}/api/devices/{id}/channels/{route}"))
+                .header("x-csrf-token", &csrf)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        assert!(db.get_device(id).unwrap().is_some());
     }
 
     #[tokio::test]
