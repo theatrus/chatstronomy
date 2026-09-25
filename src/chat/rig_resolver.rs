@@ -25,7 +25,17 @@ pub struct CommandContext {
     pub manages_guild: bool,
 }
 
+#[async_trait::async_trait]
 pub trait RigResolver: Send + Sync {
+    /// Owner-authorized image sharing, independent of telescope control ACLs.
+    async fn camera_command(
+        &self,
+        _invocation: &CommandContext,
+        _camera: &str,
+        _rules: Option<super::CameraTriggerRules>,
+    ) -> Result<(), String> {
+        Err("Pier-camera commands require the Chatstronomy Hub.".into())
+    }
     /// Resolve a telescope from an explicit override or the invocation's
     /// channel. The error is a user-facing message.
     fn resolve(

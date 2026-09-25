@@ -439,7 +439,91 @@ async fn chatstronomy(_ctx: Context<'_>) -> Result<(), BotError> {
 }
 
 fn phase1_commands() -> Vec<poise::Command<BotData, BotError>> {
-    vec![chatstronomy()]
+    vec![chatstronomy(), piercam()]
+}
+
+/// Owner-only pier-camera image sharing (never camera hardware control).
+#[poise::command(slash_command, subcommands("camera_snapshot", "camera_triggers"))]
+async fn piercam(_ctx: Context<'_>) -> Result<(), BotError> {
+    Ok(())
+}
+
+/// Send the latest completed image to the camera's configured destinations.
+#[poise::command(slash_command, rename = "snapshot")]
+async fn camera_snapshot(
+    ctx: Context<'_>,
+    #[description = "Your camera's exact Hub name"] camera: String,
+) -> Result<(), BotError> {
+    camera_command(ctx, camera, None).await
+}
+
+/// Set all trigger rules within the camera's locally enabled permissions.
+#[poise::command(slash_command, rename = "triggers")]
+#[allow(clippy::too_many_arguments)] // Poise requires one parameter per typed slash option.
+async fn camera_triggers(
+    ctx: Context<'_>,
+    #[description = "Your camera's exact Hub name"] camera: String,
+    #[description = "Periodic interval in minutes; 0 disables"]
+    #[min = 0]
+    #[max = 1440]
+    interval_minutes: u16,
+    #[description = "Send persistent scene changes (not person classification)"]
+    scene_changes: bool,
+    #[description = "Send stable day/night transitions"] day_night: bool,
+    #[description = "Send around same-owner, same-channel slews and sequence events"]
+    telescope_events: bool,
+    #[description = "Images per scene/telescope event (1–3)"]
+    #[min = 1]
+    #[max = 3]
+    burst_count: u8,
+    #[description = "Minimum seconds between images (60–600)"]
+    #[min = 60]
+    #[max = 600]
+    spacing_seconds: u16,
+) -> Result<(), BotError> {
+    camera_command(
+        ctx,
+        camera,
+        Some(super::CameraTriggerRules {
+            interval_minutes,
+            scene_changes,
+            day_night,
+            telescope_events,
+            burst_count,
+            spacing_seconds,
+        }),
+    )
+    .await
+}
+
+async fn camera_command(
+    ctx: Context<'_>,
+    camera: String,
+    rules: Option<super::CameraTriggerRules>,
+) -> Result<(), BotError> {
+    ctx.defer_ephemeral().await?;
+    let invocation = command_context(ctx).await;
+    let configuring = rules.is_some();
+    let response = match ctx
+        .data()
+        .resolver
+        .camera_command(&invocation, &camera, rules)
+        .await
+    {
+        Ok(()) if configuring => {
+            "Trigger rules saved by AutoPierCam. Local Save permissions resets chat overrides."
+                .to_owned()
+        }
+        Ok(()) => "Image delivered to the camera's configured destinations.".to_owned(),
+        Err(error) => error,
+    };
+    ctx.send(
+        poise::CreateReply::default()
+            .content(response)
+            .ephemeral(true),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Facts about this invocation for the resolver: where it happened and who
@@ -2063,6 +2147,17 @@ mod tests {
     #[test]
     fn autofocus_and_sequence_commands_are_registered_for_the_shared_bot() {
         let commands = phase1_commands();
+        let cameras = commands.iter().find(|c| c.name == "piercam").unwrap();
+        for name in ["snapshot", "triggers"] {
+            let command = cameras.subcommands.iter().find(|c| c.name == name).unwrap();
+            assert!(command.description.as_ref().unwrap().chars().count() <= 100);
+            assert!(
+                command
+                    .parameters
+                    .iter()
+                    .all(|p| p.description.as_ref().unwrap().chars().count() <= 100)
+            );
+        }
         let parent = commands
             .iter()
             .find(|command| command.name == "chatstronomy")

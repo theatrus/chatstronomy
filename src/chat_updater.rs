@@ -1088,6 +1088,12 @@ impl UpdaterState {
 /// service manager and a `ChatTarget` describing where this telescope's posts
 /// should be routed (Discord webhook override, Matrix room override).
 pub struct ChatUpdater {
+    #[cfg(feature = "hub")]
+    camera_triggers: Option<(
+        crate::hub::db::Db,
+        i64,
+        Arc<crate::hub::device_transport::DeviceConnections>,
+    )>,
     source: SharedRigSource,
     state: UpdaterState,
     event_rate_limiter: EventRateLimiter,
@@ -1159,6 +1165,8 @@ impl ChatUpdater {
     ) -> Self {
         Self {
             source,
+            #[cfg(feature = "hub")]
+            camera_triggers: None,
             state: UpdaterState::new(),
             event_rate_limiter: EventRateLimiter::new(),
             event_elisions: EventElisionReporter::default(),
@@ -1175,6 +1183,18 @@ impl ChatUpdater {
             autofocus_delivery_store: None,
             event_baseline_complete: false,
         }
+    }
+
+    /// Telescope identifier this updater is wired to.
+    #[cfg(feature = "hub")]
+    pub fn with_camera_triggers(
+        mut self,
+        db: crate::hub::db::Db,
+        telescope_id: i64,
+        devices: Arc<crate::hub::device_transport::DeviceConnections>,
+    ) -> Self {
+        self.camera_triggers = Some((db, telescope_id, devices));
+        self
     }
 
     /// Telescope identifier this updater is wired to.
@@ -2645,6 +2665,10 @@ impl ChatUpdater {
                     continue;
                 }
                 self.print_new_event(&event);
+                #[cfg(feature = "hub")]
+                if let Some((db, id, devices)) = &self.camera_triggers {
+                    devices.telescope_event(db, *id, &event);
+                }
                 self.handle_event(&event).await;
             }
         }
