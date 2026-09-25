@@ -67,6 +67,7 @@ pub struct HubState {
     pub guild_checker: Option<Arc<dyn GuildChecker>>,
     /// Live rig connections from `/v1/direct`.
     pub rig_connections: Arc<super::direct_server::RigConnections>,
+    pub device_connections: Arc<super::device_transport::DeviceConnections>,
     /// Registered when the central chat service is running. Route and trust
     /// removals use the weak handle to cancel stale pending deliveries before
     /// their HTTP mutation returns.
@@ -100,6 +101,7 @@ impl HubState {
             oauth,
             guild_checker,
             rig_connections: Arc::new(super::direct_server::RigConnections::default()),
+            device_connections: Arc::new(super::device_transport::DeviceConnections::default()),
             updater_manager: Arc::new(Mutex::new(None)),
             limits: Arc::new(HubLimits::default()),
         })
@@ -153,6 +155,7 @@ impl HubState {
 
 /// Rate limits for the endpoints an unauthenticated client can hammer.
 pub struct HubLimits {
+    pub device_events: super::rate_limit::RateLimiter,
     /// OAuth state minting (`/login`): each row is a DB insert.
     pub login: super::rate_limit::RateLimiter,
     /// Failed `/v1/direct` authentication attempts: token guessing.
@@ -162,6 +165,10 @@ pub struct HubLimits {
 impl Default for HubLimits {
     fn default() -> Self {
         Self {
+            device_events: super::rate_limit::RateLimiter::new(
+                12,
+                std::time::Duration::from_secs(60),
+            ),
             login: super::rate_limit::RateLimiter::new(30, std::time::Duration::from_secs(60)),
             direct_auth: super::rate_limit::RateLimiter::new(
                 10,

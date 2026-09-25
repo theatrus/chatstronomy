@@ -297,6 +297,26 @@ const MIGRATIONS: &[&str] = &[
         channel_name TEXT NOT NULL,
         UNIQUE(device_id, channel_id)
     ) STRICT;",
+    // V12: identities/receipts only; image bytes are never stored in SQLite.
+    "CREATE TRIGGER device_channel_limit BEFORE INSERT ON device_channels
+    WHEN (SELECT count(*) FROM device_channels WHERE device_id=NEW.device_id)>=8
+    BEGIN SELECT RAISE(ABORT,'too many device channels'); END;
+    CREATE TABLE device_events (
+        device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        event_id TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        received_at INTEGER NOT NULL,
+        PRIMARY KEY(device_id,event_id)
+    ) STRICT;
+    CREATE TABLE device_event_targets (
+        device_id INTEGER NOT NULL,
+        event_id TEXT NOT NULL,
+        route_id INTEGER NOT NULL REFERENCES device_channels(id) ON DELETE CASCADE,
+        delivered_at INTEGER,
+        PRIMARY KEY(device_id,event_id,route_id),
+        FOREIGN KEY(device_id,event_id) REFERENCES device_events(device_id,event_id) ON DELETE CASCADE
+    ) STRICT;
+    CREATE INDEX idx_device_events_received ON device_events(received_at);",
 ];
 
 #[derive(Debug, thiserror::Error)]
