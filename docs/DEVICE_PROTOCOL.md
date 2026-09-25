@@ -62,6 +62,9 @@ Only one connection per device is permitted; a duplicate gets an
 are disconnected after 120 seconds. Reconnect with exponential backoff and
 jitter, capped at 60 seconds; never automatically retry pairing. Revocation,
 credential rotation, deletion, or route removal closes the current connection.
+Handshake errors use `{"type":"error","code":"..."}` before closing. Stop
+and show operator action for `authentication_failed`, `unsupported_version`, or
+`invalid_message`; back off on `rate_limited` and `already_connected`.
 Use the camera card's **Refresh camera status** button to update its online state.
 
 `snapshots` advertises the client's current, explicit local consent. A client
@@ -103,7 +106,12 @@ added later. Removing/re-adding a route does not authorize replay of old images.
 
 New events have a device-wide 60-second cooldown, including requested snapshots;
 retries have a separate 12-attempts/minute ceiling. There are at most eight
-destinations per device. Successful per-route receipts survive restarts and
+destinations per device. Camera delivery observes Discord's `Retry-After`, global
+scope, and exhausted-bucket reset headers across all device connections; a retry
+acknowledgment never bypasses that backoff. See [Discord rate limits](https://docs.discord.com/developers/topics/rate-limits).
+Requests failing with 401/403/404 are also backed off. Each delivery attempt has
+a 30-second overall deadline, and snapshot deadlines use a monotonic clock.
+Successful per-route receipts survive restarts and
 allow partial failures to retry without re-sending successful channels. Only
 hashes, event IDs, route IDs and receipt times enter SQLite; JPEGs are transient.
 Receipts are pruned after seven days when accepting new events. Device deletion

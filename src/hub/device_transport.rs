@@ -31,7 +31,55 @@ const MAX_WIRE: usize = 720 * 1024;
 const COOLDOWN: i64 = 60;
 
 #[derive(Default)]
-pub struct DeviceConnections(Mutex<HashMap<i64, Connection>>);
+pub struct DeviceConnections(Mutex<HashMap<i64, Connection>>, Mutex<DiscordBackoff>);
+
+#[derive(Default)]
+struct DiscordBackoff {
+    global: Option<tokio::time::Instant>,
+    channels: HashMap<i64, tokio::time::Instant>,
+}
+
+impl DiscordBackoff {
+    fn allows(&mut self, channel: i64) -> bool {
+        let now = tokio::time::Instant::now();
+        self.channels.retain(|_, until| *until > now);
+        !self.global.is_some_and(|until| until > now) && !self.channels.contains_key(&channel)
+    }
+
+    fn observe(&mut self, channel: i64, status: reqwest::StatusCode, headers: &HeaderMap) {
+        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        let limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let denied = matches!(status.as_u16(), 401 | 403 | 404);
+        if !limited && !denied && header("x-ratelimit-remaining") != Some("0") {
+            return;
+        }
+        let seconds = if denied {
+            300.0
+        } else {
+            header(if limited {
+                "retry-after"
+            } else {
+                "x-ratelimit-reset-after"
+            })
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(60.0)
+            .clamp(1.0, 86400.0)
+        };
+        let until = tokio::time::Instant::now() + Duration::from_secs_f64(seconds);
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || header("x-ratelimit-global") == Some("true")
+            || header("x-ratelimit-scope") == Some("global")
+        {
+            self.global = Some(self.global.map_or(until, |old| old.max(until)));
+        } else {
+            self.channels
+                .entry(channel)
+                .and_modify(|old| *old = (*old).max(until))
+                .or_insert(until);
+        }
+    }
+}
 
 struct Connection {
     generation: Uuid,
@@ -44,6 +92,7 @@ struct SnapshotRequest {
     id: Uuid,
     reply: oneshot::Sender<Result<(), &'static str>>,
     expires_at: i64,
+    deadline: tokio::time::Instant,
 }
 
 impl DeviceConnections {
@@ -72,6 +121,7 @@ impl DeviceConnections {
                     id: Uuid::new_v4(),
                     reply,
                     expires_at: unix_now() + 90,
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(90),
                 })
                 .map_err(|_| "camera is busy")?;
         }
@@ -188,6 +238,7 @@ async fn send(socket: &mut WebSocket, value: serde_json::Value) -> bool {
 
 async fn session(state: HubState, mut socket: WebSocket, ip: String) {
     if state.limits.direct_auth.blocked(&ip) {
+        let _ = send(&mut socket, json!({"type":"error","code":"rate_limited"})).await;
         return;
     }
     let Ok(Some(Ok(Message::Text(text)))) =
@@ -196,6 +247,12 @@ async fn session(state: HubState, mut socket: WebSocket, ip: String) {
         return;
     };
     if text.len() > 4096 {
+        state.limits.direct_auth.check(&ip);
+        let _ = send(
+            &mut socket,
+            json!({"type":"error","code":"invalid_message"}),
+        )
+        .await;
         return;
     }
     let Ok(ClientMessage::Authenticate {
@@ -206,13 +263,37 @@ async fn session(state: HubState, mut socket: WebSocket, ip: String) {
     }) = serde_json::from_str(&text)
     else {
         state.limits.direct_auth.check(&ip);
+        let _ = send(
+            &mut socket,
+            json!({"type":"error","code":"invalid_message"}),
+        )
+        .await;
         return;
     };
-    if protocol_version != PROTOCOL_VERSION || credential.len() > 256 {
+    if protocol_version != PROTOCOL_VERSION {
+        let _ = send(
+            &mut socket,
+            json!({"type":"error","code":"unsupported_version"}),
+        )
+        .await;
+        return;
+    }
+    if credential.len() > 256 {
+        state.limits.direct_auth.check(&ip);
+        let _ = send(
+            &mut socket,
+            json!({"type":"error","code":"authentication_failed"}),
+        )
+        .await;
         return;
     }
     let Ok(Some(id)) = state.db.authenticate_device(&credential, installation_id) else {
         state.limits.direct_auth.check(&ip);
+        let _ = send(
+            &mut socket,
+            json!({"type":"error","code":"authentication_failed"}),
+        )
+        .await;
         return;
     };
     let generation = Uuid::new_v4();
@@ -295,7 +376,7 @@ async fn run(
         tokio::select! {
             _=heartbeat.tick()=>{
                 if last_received.elapsed()>Duration::from_secs(120) {return;}
-                if pending.as_ref().is_some_and(|p|p.expires_at<=unix_now()) {
+                if pending.as_ref().is_some_and(|p|p.deadline<=tokio::time::Instant::now() || p.reply.is_closed()) {
                     let p=pending.take().expect("checked pending");let _=p.reply.send(Err("snapshot timed out"));
                 }
                 if !matches!(tokio::time::timeout(Duration::from_secs(10),socket.send(Message::Ping(Vec::new().into()))).await,Ok(Ok(()))) {return;}
@@ -303,7 +384,7 @@ async fn run(
             request=requests.recv()=>{
                 let Some(request)=request else {return;};
                 if pending.is_some() {let _=request.reply.send(Err("snapshot already in progress"));continue;}
-                if request.reply.is_closed() || request.expires_at<=unix_now() {continue;}
+                if request.reply.is_closed() || request.deadline<=tokio::time::Instant::now() {continue;}
                 if !send(socket,json!({"type":"snapshot_request","request_id":request.id,"expires_at":request.expires_at,"max_jpeg_bytes":MAX_JPEG,"max_frame_age_seconds":120})).await {return;}
                 pending=Some(request);
             },
@@ -327,10 +408,10 @@ async fn run(
                     ClientMessage::Event{event}=>{
                         let snapshot=event.kind==EventKind::Snapshot;
                         let authorized=if snapshot {
-                            pending.as_ref().is_some_and(|p|Some(p.id)==event.request_id && p.expires_at>unix_now() && !p.reply.is_closed())
+                            pending.as_ref().is_some_and(|p|Some(p.id)==event.request_id && p.deadline>tokio::time::Instant::now() && !p.reply.is_closed())
                         } else {event.request_id.is_none()};
                         let result=if !state.limits.device_events.check(&id.to_string()) {"rate_limited"}
-                            else if authorized {deliver(state,&http,id,&event).await} else {"invalid_request"};
+                            else if authorized {tokio::time::timeout(Duration::from_secs(30),deliver(state,&http,id,&event)).await.unwrap_or("retry")} else {"invalid_request"};
                         if !send(socket,json!({"type":"event_ack","event_id":event.event_id,"status":result,"retry_after_seconds":if result=="retry" || result=="rate_limited" {60}else{0}})).await {return;}
                         if snapshot && authorized && result!="retry" {
                             let _=pending.take().expect("authorized snapshot").reply.send(if result=="delivered" {Ok(())} else {Err("snapshot was not delivered; check routes or cooldown")});
@@ -424,6 +505,7 @@ async fn deliver(
         let jpeg=&jpeg;
         let name=&device.name;
         async move {
+            if !state.device_connections.1.lock().is_ok_and(|mut limits|limits.allows(channel)) {return false;}
             if !checker.bot_in_guild(guild as u64).await || !checker.channel_in_guild(channel as u64,guild as u64).await {return false;}
             let label=match event.kind {EventKind::SceneChange=>"Scene change",EventKind::DayNightTransition=>"Day/night transition",EventKind::Snapshot=>"Requested snapshot"};
             let payload=json!({"allowed_mentions":{"parse":[]},"embeds":[{"title":format!("{name} · {label}"),"description":event.summary,"timestamp":event.captured_at.to_rfc3339(),"image":{"url":"attachment://piercam.jpg"},"footer":{"text":"AutoPierCam · automated camera observation"}}],"attachments":[{"id":0,"filename":"piercam.jpg"}]});
@@ -431,7 +513,9 @@ async fn deliver(
             let form=reqwest::multipart::Form::new().text("payload_json",payload.to_string()).part("files[0]",part);
             let result=http.post(format!("{}/api/v10/channels/{}/messages",state.config.discord.base_url.trim_end_matches('/'),channel as u64))
                 .header("authorization",format!("Bot {}",state.config.discord.bot_token)).multipart(form).send().await;
-            if !result.is_ok_and(|r|r.status().is_success()) {return false;}
+            let Ok(response)=result else {return false;};
+            if let Ok(mut limits)=state.device_connections.1.lock() {limits.observe(channel,response.status(),response.headers());}
+            if !response.status().is_success() {return false;}
             state.db.device_delivered(id,event.event_id,route).is_ok()
         }
     })).await;
@@ -814,10 +898,7 @@ mod tests {
         assert_eq!(next(&mut duplicate).await["code"], "already_connected");
         let (mut wrong, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         wrong.send(ClientFrame::Text(json!({"type":"authenticate","protocol_version":1,"installation_id":Uuid::new_v4(),"credential":h.credential,"snapshots":true}).to_string().into())).await.unwrap();
-        let closed = tokio::time::timeout(Duration::from_secs(3), wrong.next())
-            .await
-            .unwrap();
-        assert!(!matches!(closed, Some(Ok(ClientFrame::Text(_)))));
+        assert_eq!(next(&mut wrong).await["code"], "authentication_failed");
         assert_eq!(publish(&mut active, &event()).await["status"], "delivered");
     }
 
@@ -836,5 +917,36 @@ mod tests {
             },
         );
         assert_eq!(registry.snapshot(1).await, Err("snapshot timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discord_backoff_honors_retry_after_and_global_scope() {
+        let mut limits = DiscordBackoff::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "65.5".parse().unwrap());
+        limits.observe(100, reqwest::StatusCode::TOO_MANY_REQUESTS, &headers);
+        assert!(!limits.allows(100));
+        assert!(limits.allows(200));
+        tokio::time::advance(Duration::from_secs(65)).await;
+        assert!(!limits.allows(100));
+        tokio::time::advance(Duration::from_millis(501)).await;
+        assert!(limits.allows(100));
+        headers.insert("x-ratelimit-global", "true".parse().unwrap());
+        limits.observe(100, reqwest::StatusCode::TOO_MANY_REQUESTS, &headers);
+        assert!(!limits.allows(200));
+        tokio::time::advance(Duration::from_secs(66)).await;
+        assert!(limits.allows(200));
+        headers.clear();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset-after", "2.5".parse().unwrap());
+        limits.observe(100, reqwest::StatusCode::OK, &headers);
+        assert!(!limits.allows(100));
+        assert!(limits.allows(200));
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(limits.allows(100));
+        headers.clear();
+        headers.insert("retry-after", "NaN".parse().unwrap());
+        limits.observe(100, reqwest::StatusCode::TOO_MANY_REQUESTS, &headers);
+        assert!(!limits.allows(100));
     }
 }
