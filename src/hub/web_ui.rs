@@ -388,8 +388,8 @@ async function renderAll(tab = ACTIVE_TAB, focusAttachmentId = null) {
   app.innerHTML =
     '<div class="tabs" role="tablist" aria-label="Hub settings">' +
     '<button type="button" class="tab" role="tab" id="tab-telescopes" ' +
-    'aria-controls="panel-telescopes" data-tab="telescopes">Telescopes ' +
-    '<span class="tab-count">' + mine.telescopes.length + "</span></button>" +
+    'aria-controls="panel-telescopes" data-tab="telescopes">Observatory devices ' +
+    '<span class="tab-count">' + (mine.telescopes.length + devices.devices.length) + "</span></button>" +
     '<button type="button" class="tab" role="tab" id="tab-delivery" ' +
     'aria-controls="panel-delivery" data-tab="delivery">Discord delivery ' +
     '<span class="tab-count">' + GUILDS.length + "</span></button></div>" +
@@ -1196,6 +1196,8 @@ mod tests {
 
     #[test]
     fn device_pairing_is_separate_and_server_managers_can_remove_feeds() {
+        assert!(INDEX_HTML.contains("Observatory devices"));
+        assert!(INDEX_HTML.contains("mine.telescopes.length + devices.devices.length"));
         for text in [
             "Pier cameras &amp; devices",
             "No telescope control",

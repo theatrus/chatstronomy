@@ -1,7 +1,7 @@
 # Observatory device protocol v1
 
 AutoPierCam is a user-owned `pier_camera`, not a N.I.N.A. telescope/profile.
-The Hub's **Telescopes** tab includes a separate **Pier cameras & devices**
+The Hub's **Observatory devices** tab includes a separate **Pier cameras & devices**
 section. Create a camera, generate a code, and explicitly choose its channels.
 Register the server under **Discord delivery** first. The owner must also manage
 that server; a live bot membership and text-channel check is required.
