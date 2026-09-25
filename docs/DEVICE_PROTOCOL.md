@@ -1,4 +1,4 @@
-# Observatory device protocol v1
+# Observatory device protocol (pairing v1, transport v1/v2)
 
 AutoPierCam is a user-owned `pier_camera`, not a N.I.N.A. telescope/profile.
 The Hub's **Observatory devices** tab includes a separate **Pier cameras & devices**
@@ -142,6 +142,86 @@ Snapshot retries are limited to the originating live request and connection.
 with its real capture time. A camera may wait for its next long exposure but
 must not interrupt capture, reset exposure, or return a frame from an old session.
 This supports 30–60+ second night exposures without acquiring a second SDK handle.
-Hardware control, a Discord snapshot slash command, and arbitrary image analysis
-are intentionally outside this protocol. AutoPierCam's production client and
-local consent/configuration UI are a separate implementation step.
+Hardware control and arbitrary image analysis remain outside this protocol.
+AutoPierCam implements the production client and local consent/configuration UI.
+
+## Trigger extension (transport v2)
+
+Pairing remains v1. An updated camera authenticates with `protocol_version:2`
+when periodic sends, chat configuration or telescope triggers are enabled; the
+Hub echoes version 2 in `ready`. Existing v1 cameras keep their unchanged
+handshake and receive no new command types. Old Hubs reject version 2, which
+must be shown as an operator-action error rather than retried indefinitely.
+
+After v2 `ready`, the client advertises explicit local permission:
+
+```json
+{"type":"trigger_capabilities","chat_configuration":true,"telescope_events":true}
+```
+
+Both capabilities default false on every connection. The Hub exposes separate
+Discord commands (not telescope hardware commands):
+
+- `/piercam snapshot camera:<exact name>` uses the existing snapshot consent.
+- `/piercam triggers camera:<exact name> interval_minutes:10 scene_changes:true day_night:false telescope_events:true burst_count:3 spacing_seconds:60`
+  sets the complete active rule set, not a partial patch.
+
+The invoking Discord user must own the camera AND invoke in one of its exact
+guild/channel routes. DMs, unrelated routes, and non-owner server managers are
+denied. Replies are ephemeral; images go to all configured camera destinations.
+Local/self-hosted bots without a Hub return an unsupported-operation explanation.
+
+The Hub validates minutes 0–1440 (0 off), burst count 1–3 and spacing 60–600
+seconds, checks the advertised chat gate, then sends:
+
+```json
+{"type":"configure_triggers","request_id":"5fe70313-0a01-43b2-97a8-bab512a45ba7","rules":{"interval_minutes":10,"scene_changes":true,"day_night":false,"telescope_events":true,"burst_count":3,"spacing_seconds":60}}
+```
+
+The camera must recheck local consent and rate/size ceilings, persist atomically,
+clear pending images/bursts when accepted, and reply:
+
+```json
+{"type":"trigger_configuration_result","request_id":"5fe70313-0a01-43b2-97a8-bab512a45ba7","accepted":true}
+```
+
+Only a matching live pending request can complete a configuration command.
+One configuration may be in flight per device; it expires after 15 seconds and
+the caller waits at most 20. Lost/late replies are ambiguous: inspect the camera's
+active settings before retrying. A successful reply means saved, not that an
+image was posted. The Hub does not store or replay configuration on reconnect.
+
+AutoPierCam's local switches and interval/burst/spacing settings are ceilings.
+Chat cannot enable sharing or a locally disabled source, shorten the local
+interval or spacing, increase the burst cap, grant snapshot access, change
+destinations/credentials, or control hardware. Chat rules persist on the camera;
+a local settings save resets overrides and revision checks prevent stale saves.
+Pairing/forgetting resets every permission. Disabling/pause/session changes cancel
+pending work; accepted Discord posts cannot be recalled.
+
+The Hub forwards fresh, deduplicated, chat-enabled live telescope events only
+to opted-in cameras with the same owner and an exact shared guild/channel route.
+Startup history is not forwarded. Events older than 30 seconds or future-dated
+are ignored. The fixed initial event allowlist is slew start/end and sequence
+start/finish:
+
+```json
+{"type":"telescope_event","event":"mount_slew_started","expires_at":1790355630}
+```
+
+Other `event` values: `mount_slewed`, `sequence_started`, `sequence_finished`.
+The expiration is Unix seconds, 30 seconds from admission. This is an observation,
+never an instruction to slew or operate a camera. There is a bounded four-entry
+control queue; full/busy queues drop event notifications. The camera checks expiry
+and its local event gate, coalesces triggers while a burst is active, and waits for
+new completed frames in the same capture session. It never interrupts exposures
+or buffers pre-event images. Burst plans expire after 180 seconds plus inter-image
+spacing; reconnects discard unfinished plans. Failed delivery may reduce a burst.
+
+V2 adds event kinds `periodic` and `telescope_event`, with the same JPEG envelope,
+immutable event IDs, routing and receipt rules as other automatic observations.
+They have no `request_id`. The device-wide 60-second cooldown and Discord backoff
+still apply; bursts do not bypass either. Periodic schedules send one distinct
+recent frame, start after a full interval and reset on reconnect without backfill.
+Scene detection is not a semantic roof/person detector; no such classifier is
+provided by this extension.

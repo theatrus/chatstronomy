@@ -57,6 +57,7 @@ struct RunningUpdater {
 }
 
 pub struct UpdaterManager {
+    devices: Option<Arc<super::device_transport::DeviceConnections>>,
     db: Db,
     connections: Arc<RigConnections>,
     chat_manager: Arc<ChatServiceManager>,
@@ -77,6 +78,7 @@ impl UpdaterManager {
     ) -> Self {
         Self {
             db,
+            devices: None,
             connections,
             chat_manager,
             running: Mutex::new(HashMap::new()),
@@ -84,6 +86,15 @@ impl UpdaterManager {
             presence: Mutex::new(HashMap::new()),
             offline_grace: PRESENCE_OFFLINE_GRACE,
         }
+    }
+
+    /// Shrink the offline grace for tests.
+    pub fn with_devices(
+        mut self,
+        devices: Arc<super::device_transport::DeviceConnections>,
+    ) -> Self {
+        self.devices = Some(devices);
+        self
     }
 
     /// Shrink the offline grace for tests.
@@ -311,6 +322,10 @@ impl UpdaterManager {
             // busy-polling N.I.N.A. while it is genuinely offline.
             .with_lifecycle_announcements(false)
             .with_reconnect_backoff(5, 60);
+            if let Some(devices) = &self.devices {
+                updater =
+                    updater.with_camera_triggers(self.db.clone(), telescope_id, devices.clone());
+            }
             let handle = tokio::spawn(async move {
                 updater.start_polling(UPDATER_POLL_INTERVAL).await;
             });

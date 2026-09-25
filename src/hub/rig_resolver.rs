@@ -17,11 +17,38 @@ use std::sync::Arc;
 pub struct HubRigResolver {
     db: Db,
     connections: Arc<RigConnections>,
+    devices: Option<Arc<super::device_transport::DeviceConnections>>,
 }
 
 impl HubRigResolver {
     pub fn new(db: Db, connections: Arc<RigConnections>) -> Self {
-        Self { db, connections }
+        Self {
+            db,
+            connections,
+            devices: None,
+        }
+    }
+
+    pub fn with_devices(
+        mut self,
+        devices: Arc<super::device_transport::DeviceConnections>,
+    ) -> Self {
+        self.devices = Some(devices);
+        self
+    }
+
+    fn camera_id(&self, invocation: &CommandContext, name: &str) -> Result<i64, String> {
+        let guild = invocation
+            .guild_id
+            .ok_or("Camera commands require a server channel")?;
+        // User ownership AND exact guild/channel route. A server manager is
+        // not implicitly allowed to change another user's camera sharing.
+        self.db.with_conn(|c| {
+            use rusqlite::OptionalExtension;
+            c.query_row("SELECT d.id FROM devices d JOIN device_channels r ON r.device_id=d.id WHERE d.owner_id=?1 AND d.name=?2 AND r.guild_id=?3 AND r.channel_id=?4",
+                rusqlite::params![invocation.user_id as i64, name, guild as i64, invocation.channel_id as i64], |r| r.get(0)).optional()
+        }).map_err(|_| "Camera lookup failed".to_owned())?
+            .ok_or_else(|| "No camera with that name is owned by you and routed to this channel.".into())
     }
 
     fn guild_names(&self, guild_id: i64) -> Vec<String> {
@@ -89,7 +116,25 @@ impl HubRigResolver {
     }
 }
 
+#[async_trait::async_trait]
 impl RigResolver for HubRigResolver {
+    async fn camera_command(
+        &self,
+        invocation: &CommandContext,
+        camera: &str,
+        rules: Option<crate::chat::CameraTriggerRules>,
+    ) -> Result<(), String> {
+        let id = self.camera_id(invocation, camera)?;
+        let devices = self
+            .devices
+            .as_ref()
+            .ok_or("Camera transport is unavailable")?;
+        match rules {
+            Some(rules) => devices.configure(id, rules).await,
+            None => devices.snapshot(id).await,
+        }
+        .map_err(str::to_owned)
+    }
     fn resolve(
         &self,
         invocation: &CommandContext,
@@ -212,6 +257,44 @@ mod tests {
         let connections = Arc::new(RigConnections::default());
         let resolver = HubRigResolver::new(db.clone(), connections.clone());
         (db, connections, resolver, telescope.id)
+    }
+
+    #[test]
+    fn camera_commands_require_owner_and_exact_guild_channel_not_manager_privilege() {
+        let (db, _, resolver, _) = setup();
+        let camera = db
+            .create_device(1, "Pier", super::super::devices::DeviceKind::PierCamera)
+            .unwrap();
+        db.add_device_channel(camera.id, 100, 42, "obs").unwrap();
+        let owner = CommandContext {
+            guild_id: Some(100),
+            channel_id: 42,
+            user_id: 1,
+            ..Default::default()
+        };
+        assert_eq!(resolver.camera_id(&owner, "Pier").unwrap(), camera.id);
+        for other in [
+            CommandContext {
+                user_id: 7,
+                manages_guild: true,
+                ..owner.clone()
+            },
+            CommandContext {
+                guild_id: None,
+                ..owner.clone()
+            },
+            CommandContext {
+                guild_id: Some(999),
+                ..owner.clone()
+            },
+            CommandContext {
+                channel_id: 43,
+                ..owner.clone()
+            },
+        ] {
+            assert!(resolver.camera_id(&other, "Pier").is_err());
+        }
+        assert!(resolver.camera_id(&owner, "Unknown").is_err());
     }
 
     fn invocation(guild_id: u64, channel_id: u64, roles: Vec<u64>) -> CommandContext {

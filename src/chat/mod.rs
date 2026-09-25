@@ -1,4 +1,6 @@
+mod camera_control;
 mod discord_bot;
+pub use camera_control::CameraTriggerRules;
 mod discord_service;
 mod matrix_service;
 mod rig_resolver;

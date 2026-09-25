@@ -29,6 +29,20 @@ use uuid::Uuid;
 const MAX_JPEG: usize = 512 * 1024;
 const MAX_WIRE: usize = 720 * 1024;
 const COOLDOWN: i64 = 60;
+use crate::chat::CameraTriggerRules;
+
+enum ControlRequest {
+    Configure {
+        id: Uuid,
+        rules: CameraTriggerRules,
+        reply: oneshot::Sender<Result<(), &'static str>>,
+        deadline: tokio::time::Instant,
+    },
+    Event {
+        event: &'static str,
+        expires_at: i64,
+    },
+}
 
 #[derive(Default)]
 pub struct DeviceConnections(Mutex<HashMap<i64, Connection>>, Mutex<DiscordBackoff>);
@@ -86,6 +100,9 @@ struct Connection {
     snapshots: bool,
     requests: mpsc::Sender<SnapshotRequest>,
     close: watch::Sender<bool>,
+    controls: mpsc::Sender<ControlRequest>,
+    chat_configuration: bool,
+    telescope_events: bool,
 }
 
 struct SnapshotRequest {
@@ -96,6 +113,71 @@ struct SnapshotRequest {
 }
 
 impl DeviceConnections {
+    pub async fn configure(&self, id: i64, rules: CameraTriggerRules) -> Result<(), &'static str> {
+        if !rules.valid() {
+            return Err("Use 0–1440 minutes, 1–3 images, and 60–600 seconds spacing");
+        }
+        let (reply, received) = oneshot::channel();
+        {
+            let connections = self.0.lock().map_err(|_| "camera unavailable")?;
+            let c = connections.get(&id).ok_or("camera is offline")?;
+            if !c.chat_configuration {
+                return Err(
+                    "Chat configuration is disabled at the camera; enable it locally first",
+                );
+            }
+            c.controls
+                .try_send(ControlRequest::Configure {
+                    id: Uuid::new_v4(),
+                    rules,
+                    reply,
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(15),
+                })
+                .map_err(|_| "camera is busy")?;
+        }
+        tokio::time::timeout(Duration::from_secs(20), received)
+            .await
+            .map_err(
+                |_| "Configuration timed out; check active rules in AutoPierCam before retrying",
+            )?
+            .map_err(|_| "camera disconnected; check active rules before retrying")?
+    }
+
+    /// Only fresh, live, chat-enabled telescope events; shared owner AND route
+    /// avoid cross-tenant triggers. Admission/dedup happens in ChatUpdater.
+    pub fn telescope_event(&self, db: &Db, telescope_id: i64, event: &crate::events::Event) {
+        use crate::events::event_types;
+        if !event.chat_enabled {
+            return;
+        }
+        let Ok(time) = chrono::DateTime::parse_from_rfc3339(&event.time) else {
+            return;
+        };
+        if !(0..=30).contains(&(unix_now() - time.timestamp())) {
+            return;
+        }
+        let name = match event.event.as_str() {
+            event_types::MOUNT_SLEW_STARTED => "mount_slew_started",
+            event_types::MOUNT_SLEWED => "mount_slewed",
+            event_types::SEQUENCE_STARTING => "sequence_started",
+            event_types::SEQUENCE_FINISHED => "sequence_finished",
+            _ => return,
+        };
+        let Ok(ids) = db.trigger_devices(telescope_id) else {
+            return;
+        };
+        if let Ok(connections) = self.0.lock() {
+            for id in ids {
+                if let Some(c) = connections.get(&id).filter(|c| c.telescope_events) {
+                    let _ = c.controls.try_send(ControlRequest::Event {
+                        event: name,
+                        expires_at: unix_now() + 30,
+                    });
+                }
+            }
+        }
+    }
+
     pub fn connected(&self, id: i64) -> bool {
         self.0.lock().is_ok_and(|c| c.contains_key(&id))
     }
@@ -152,6 +234,14 @@ impl Drop for Lease {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientMessage {
+    TriggerCapabilities {
+        chat_configuration: bool,
+        telescope_events: bool,
+    },
+    TriggerConfigurationResult {
+        request_id: Uuid,
+        accepted: bool,
+    },
     Authenticate {
         protocol_version: u32,
         installation_id: Uuid,
@@ -172,6 +262,8 @@ pub enum EventKind {
     SceneChange,
     DayNightTransition,
     Snapshot,
+    Periodic,
+    TelescopeEvent,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -270,7 +362,7 @@ async fn session(state: HubState, mut socket: WebSocket, ip: String) {
         .await;
         return;
     };
-    if protocol_version != PROTOCOL_VERSION {
+    if ![PROTOCOL_VERSION, 2].contains(&protocol_version) {
         let _ = send(
             &mut socket,
             json!({"type":"error","code":"unsupported_version"}),
@@ -298,6 +390,7 @@ async fn session(state: HubState, mut socket: WebSocket, ip: String) {
     };
     let generation = Uuid::new_v4();
     let (requests, receiver) = mpsc::channel(1);
+    let (controls, control_receiver) = mpsc::channel(4);
     let (close, mut closed) = watch::channel(false);
     let registered = if let Ok(mut c) = state.device_connections.0.lock() {
         if let std::collections::hash_map::Entry::Vacant(e) = c.entry(id) {
@@ -306,6 +399,9 @@ async fn session(state: HubState, mut socket: WebSocket, ip: String) {
                 snapshots,
                 requests,
                 close,
+                controls,
+                chat_configuration: false,
+                telescope_events: false,
             });
             true
         } else {
@@ -332,7 +428,7 @@ async fn session(state: HubState, mut socket: WebSocket, ip: String) {
     tokio::select! {
         biased;
         _=closed.changed()=>{},
-        _=run(&state,&mut socket,id,installation_id,&credential,receiver)=>{},
+        _=run(&state,&mut socket,id,installation_id,&credential,receiver,(protocol_version,control_receiver))=>{},
     }
 }
 
@@ -343,10 +439,11 @@ async fn run(
     installation: Uuid,
     credential: &str,
     mut requests: mpsc::Receiver<SnapshotRequest>,
+    (protocol_version, mut controls): (u32, mpsc::Receiver<ControlRequest>),
 ) {
     if !send(
         socket,
-        json!({"type":"ready","protocol_version":PROTOCOL_VERSION,"device_id":id}),
+        json!({"type":"ready","protocol_version":protocol_version,"device_id":id}),
     )
     .await
     {
@@ -360,6 +457,7 @@ async fn run(
         return;
     };
     let mut pending: Option<SnapshotRequest> = None;
+    let mut pending_configuration: Option<ControlRequest> = None;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     let mut last_received = tokio::time::Instant::now();
     loop {
@@ -374,6 +472,24 @@ async fn run(
             return;
         }
         tokio::select! {
+            control=controls.recv()=>{
+                let Some(control)=control else {return;};
+                match control {
+                    ControlRequest::Event {event, expires_at} => {
+                        if expires_at>unix_now() && !send(socket,json!({"type":"telescope_event","event":event,"expires_at":expires_at})).await {return;}
+                    }
+                    ControlRequest::Configure {id, ref rules, ref reply, deadline} => {
+                        if pending_configuration.as_ref().is_some_and(|p| matches!(p, ControlRequest::Configure{reply,deadline,..} if reply.is_closed() || *deadline<=tokio::time::Instant::now())) {pending_configuration=None;}
+                        if pending_configuration.is_some() {
+                            if let ControlRequest::Configure {reply,..}=control {let _=reply.send(Err("camera configuration is busy"));}
+                            continue;
+                        }
+                        if reply.is_closed() || deadline<=tokio::time::Instant::now() {continue;}
+                        if !send(socket,json!({"type":"configure_triggers","request_id":id,"rules":rules})).await {return;}
+                        pending_configuration=Some(control);
+                    }
+                }
+            },
             _=heartbeat.tick()=>{
                 if last_received.elapsed()>Duration::from_secs(120) {return;}
                 if pending.as_ref().is_some_and(|p|p.deadline<=tokio::time::Instant::now() || p.reply.is_closed()) {
@@ -399,6 +515,20 @@ async fn run(
                 };
                 let Ok(message)=serde_json::from_str::<ClientMessage>(&text) else {return;};
                 match message {
+                    ClientMessage::TriggerCapabilities {chat_configuration,telescope_events} => {
+                        if protocol_version!=2 {return;}
+                        if let Ok(mut connections)=state.device_connections.0.lock() && let Some(c)=connections.get_mut(&id) {
+                            c.chat_configuration=chat_configuration; c.telescope_events=telescope_events;
+                        }
+                    }
+                    ClientMessage::TriggerConfigurationResult {request_id,accepted} => {
+                        if protocol_version!=2 {return;}
+                        if pending_configuration.as_ref().is_some_and(|p|matches!(p,ControlRequest::Configure{id,..} if *id==request_id))
+                            && let Some(ControlRequest::Configure{reply,deadline,..})=pending_configuration.take() {
+                            let _=reply.send(if deadline<=tokio::time::Instant::now() {Err("Configuration reply expired; check AutoPierCam")}
+                                else if accepted {Ok(())} else {Err("Camera declined these rules; they exceed locally enabled permissions or could not be saved")});
+                        }
+                    }
                     ClientMessage::Authenticate{..}=>return,
                     ClientMessage::SnapshotUnavailable{request_id}=>{
                         if pending.as_ref().is_some_and(|p|p.id==request_id) {
@@ -429,6 +559,12 @@ enum Reservation {
     RateLimited,
 }
 impl Db {
+    fn trigger_devices(&self, telescope_id: i64) -> Result<Vec<i64>, DbError> {
+        self.with_conn(|c| {
+            c.prepare("SELECT DISTINCT d.id FROM devices d JOIN telescopes t ON t.owner_id=d.owner_id JOIN device_channels dc ON dc.device_id=d.id JOIN telescope_channels tc ON tc.telescope_id=t.id AND tc.channel_id=dc.channel_id AND tc.guild_id=dc.guild_id WHERE t.id=?1")?
+                .query_map([telescope_id], |r|r.get(0))?.collect()
+        })
+    }
     fn reserve_device_event(&self, id: i64, event: &CameraEvent) -> Result<Reservation, DbError> {
         let hash =
             super::auth::sha256_b64url(&serde_json::to_string(event).expect("serializable event"));
@@ -507,7 +643,7 @@ async fn deliver(
         async move {
             if !state.device_connections.1.lock().is_ok_and(|mut limits|limits.allows(channel)) {return false;}
             if !checker.bot_in_guild(guild as u64).await || !checker.channel_in_guild(channel as u64,guild as u64).await {return false;}
-            let label=match event.kind {EventKind::SceneChange=>"Scene change",EventKind::DayNightTransition=>"Day/night transition",EventKind::Snapshot=>"Requested snapshot"};
+            let label=match event.kind {EventKind::SceneChange=>"Scene change",EventKind::DayNightTransition=>"Day/night transition",EventKind::Snapshot=>"Requested snapshot",EventKind::Periodic=>"Scheduled image",EventKind::TelescopeEvent=>"Telescope event"};
             let payload=json!({"allowed_mentions":{"parse":[]},"embeds":[{"title":format!("{name} · {label}"),"description":event.summary,"timestamp":event.captured_at.to_rfc3339(),"image":{"url":"attachment://piercam.jpg"},"footer":{"text":"AutoPierCam · automated camera observation"}}],"attachments":[{"id":0,"filename":"piercam.jpg"}]});
             let part=reqwest::multipart::Part::bytes(jpeg.clone()).file_name("piercam.jpg").mime_str("image/jpeg").expect("constant MIME");
             let form=reqwest::multipart::Form::new().text("payload_json",payload.to_string()).part("files[0]",part);
@@ -685,6 +821,144 @@ mod tests {
             jpeg_base64: STANDARD.encode([0xff, 0xd8, 0xff, 0xd9]),
             request_id: None,
         }
+    }
+
+    fn trigger_rules() -> CameraTriggerRules {
+        CameraTriggerRules {
+            interval_minutes: 5,
+            scene_changes: false,
+            day_night: false,
+            telescope_events: true,
+            burst_count: 2,
+            spacing_seconds: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_configuration_round_trip_requires_capability_and_matching_ack() {
+        let h = harness().await;
+        let (mut client, _) = tokio_tungstenite::connect_async(format!(
+            "{}/v1/devices",
+            h.base.replace("http:", "ws:")
+        ))
+        .await
+        .unwrap();
+        client.send(ClientFrame::Text(json!({"type":"authenticate","protocol_version":2,"installation_id":h.installation,"credential":h.credential,"snapshots":false}).to_string().into())).await.unwrap();
+        assert_eq!(next(&mut client).await["protocol_version"], 2);
+        assert!(
+            h.state
+                .device_connections
+                .configure(h.id, trigger_rules())
+                .await
+                .is_err()
+        );
+        client.send(ClientFrame::Text(json!({"type":"trigger_capabilities","chat_configuration":true,"telescope_events":true}).to_string().into())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if h.state.device_connections.0.lock().unwrap()[&h.id].chat_configuration {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let registry = h.state.device_connections.clone();
+        let id = h.id;
+        let result = tokio::spawn(async move { registry.configure(id, trigger_rules()).await });
+        let command = next(&mut client).await;
+        assert_eq!(command["type"], "configure_triggers");
+        assert_eq!(
+            command["rules"],
+            serde_json::to_value(trigger_rules()).unwrap()
+        );
+        client.send(ClientFrame::Text(json!({"type":"trigger_configuration_result","request_id":Uuid::new_v4(),"accepted":true}).to_string().into())).await.unwrap();
+        client.send(ClientFrame::Text(json!({"type":"trigger_configuration_result","request_id":command["request_id"],"accepted":false}).to_string().into())).await.unwrap();
+        assert!(result.await.unwrap().unwrap_err().contains("declined"));
+        assert!(h.posts.lock().unwrap().bodies.is_empty());
+        let mut e = event();
+        e.kind = EventKind::Periodic;
+        assert_eq!(publish(&mut client, &e).await["status"], "delivered");
+        let mut newer = event();
+        newer.kind = EventKind::TelescopeEvent;
+        assert_eq!(publish(&mut client, &newer).await["status"], "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn telescope_triggers_require_live_consent_owner_and_shared_route() {
+        let h = harness().await;
+        let db = &h.state.db;
+        let telescope = db.create_telescope(1, "Scope").unwrap();
+        db.attach_telescope(telescope.id, 10, true, 1).unwrap();
+        db.add_channel_route(telescope.id, 10, 100, "pier", "Observatory", 1)
+            .unwrap();
+        assert_eq!(db.trigger_devices(telescope.id).unwrap(), vec![h.id]);
+        db.upsert_user(&UserRow {
+            discord_user_id: 2,
+            username: "Other".into(),
+            email: None,
+            email_verified: false,
+            avatar_url: None,
+        })
+        .unwrap();
+        let other = db.create_telescope(2, "Other scope").unwrap();
+        db.attach_telescope(other.id, 10, false, 2).unwrap();
+        // Same channel is enough to read, not enough to trigger somebody else's camera.
+        db.add_device_channel(h.id, 10, 102, "shared-other")
+            .unwrap();
+        db.add_channel_route(other.id, 10, 102, "shared-other", "Observatory", 2)
+            .unwrap();
+        assert!(db.trigger_devices(other.id).unwrap().is_empty());
+        let unrelated = db.create_telescope(1, "Other channel").unwrap();
+        db.attach_telescope(unrelated.id, 10, true, 1).unwrap();
+        db.add_channel_route(unrelated.id, 10, 101, "other", "Observatory", 1)
+            .unwrap();
+        assert!(db.trigger_devices(unrelated.id).unwrap().is_empty());
+
+        let (controls, mut received) = mpsc::channel(4);
+        let registry = &h.state.device_connections;
+        registry.0.lock().unwrap().insert(
+            h.id,
+            Connection {
+                generation: Uuid::new_v4(),
+                snapshots: false,
+                requests: mpsc::channel(1).0,
+                close: watch::channel(false).0,
+                controls,
+                chat_configuration: false,
+                telescope_events: true,
+            },
+        );
+        let mut event = crate::events::Event {
+            time: chrono::Utc::now().to_rfc3339(),
+            event: crate::events::event_types::MOUNT_SLEW_STARTED.into(),
+            chat_enabled: true,
+            details: None,
+        };
+        registry.telescope_event(db, telescope.id, &event);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(ControlRequest::Event {
+                event: "mount_slew_started",
+                ..
+            })
+        ));
+        event.chat_enabled = false;
+        registry.telescope_event(db, telescope.id, &event);
+        event.chat_enabled = true;
+        event.time = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        registry.telescope_event(db, telescope.id, &event);
+        event.time = chrono::Utc::now().to_rfc3339();
+        registry
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(&h.id)
+            .unwrap()
+            .telescope_events = false;
+        registry.telescope_event(db, telescope.id, &event);
+        assert!(received.try_recv().is_err());
+        assert!(h.posts.lock().unwrap().bodies.is_empty());
     }
     async fn publish(client: &mut Client, event: &CameraEvent) -> serde_json::Value {
         client
@@ -914,6 +1188,9 @@ mod tests {
                 snapshots: true,
                 requests,
                 close,
+                controls: mpsc::channel(1).0,
+                chat_configuration: false,
+                telescope_events: false,
             },
         );
         assert_eq!(registry.snapshot(1).await, Err("snapshot timed out"));

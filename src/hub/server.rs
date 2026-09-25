@@ -1626,18 +1626,24 @@ pub async fn serve(
             state_file: "chatstronomy-hub-state.json".to_string(),
             write_acl: Vec::new(),
         };
-        let resolver = Arc::new(super::rig_resolver::HubRigResolver::new(
-            state.db.clone(),
-            state.rig_connections.clone(),
-        ));
+        let resolver = Arc::new(
+            super::rig_resolver::HubRigResolver::new(
+                state.db.clone(),
+                state.rig_connections.clone(),
+            )
+            .with_devices(state.device_connections.clone()),
+        );
         let (service, _gateway) = crate::chat::run_bot(&bot_config, resolver).await?;
         let mut manager = crate::chat::ChatServiceManager::new();
         manager.add_service(Box::new(service));
-        let updaters = Arc::new(super::updaters::UpdaterManager::new(
-            state.db.clone(),
-            state.rig_connections.clone(),
-            Arc::new(manager),
-        ));
+        let updaters = Arc::new(
+            super::updaters::UpdaterManager::new(
+                state.db.clone(),
+                state.rig_connections.clone(),
+                Arc::new(manager),
+            )
+            .with_devices(state.device_connections.clone()),
+        );
         if let Ok(mut registered) = state.updater_manager.lock() {
             *registered = Some(Arc::downgrade(&updaters));
         }
