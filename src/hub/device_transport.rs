@@ -45,7 +45,13 @@ enum ControlRequest {
 }
 
 #[derive(Default)]
-pub struct DeviceConnections(Mutex<HashMap<i64, Connection>>, Mutex<DiscordBackoff>);
+pub struct DeviceConnections(
+    Mutex<HashMap<i64, Connection>>,
+    Mutex<DiscordBackoff>,
+    /// Automatic images swallowed by the per-camera cooldown, reported once
+    /// the cooldown window ends.
+    Mutex<HashMap<i64, u64>>,
+);
 
 #[derive(Default)]
 struct DiscordBackoff {
@@ -180,6 +186,24 @@ impl DeviceConnections {
 
     pub fn connected(&self, id: i64) -> bool {
         self.0.lock().is_ok_and(|c| c.contains_key(&id))
+    }
+
+    /// Counts one swallowed image. True for the first in a window, whose
+    /// caller schedules the notice.
+    fn count_elided(&self, id: i64) -> bool {
+        self.2.lock().is_ok_and(|mut counts| {
+            let count = counts.entry(id).or_default();
+            *count += 1;
+            *count == 1
+        })
+    }
+
+    fn take_elided(&self, id: i64) -> u64 {
+        self.2
+            .lock()
+            .ok()
+            .and_then(|mut counts| counts.remove(&id))
+            .unwrap_or(0)
     }
 
     /// Whether the live connection advertised local snapshot consent.
@@ -551,7 +575,11 @@ async fn run(
                             else if authorized {tokio::time::timeout(Duration::from_secs(30),deliver(state,&http,id,&event)).await.unwrap_or("retry")} else {"invalid_request"};
                         if !send(socket,json!({"type":"event_ack","event_id":event.event_id,"status":result,"retry_after_seconds":if result=="retry" || result=="rate_limited" {60}else{0}})).await {return;}
                         if snapshot && authorized && result!="retry" {
-                            let _=pending.take().expect("authorized snapshot").reply.send(if result=="delivered" {Ok(())} else {Err("snapshot was not delivered; check routes or cooldown")});
+                            let _=pending.take().expect("authorized snapshot").reply.send(match result {
+                                "delivered"=>Ok(()),
+                                "elided"=>Err("the camera posted less than a minute ago; try again shortly"),
+                                _=>Err("snapshot was not delivered; check routes"),
+                            });
                         }
                     }
                 }
@@ -563,7 +591,8 @@ async fn run(
 enum Reservation {
     Ready,
     Conflict,
-    RateLimited,
+    /// Inside the cooldown; the window ends at this Unix time.
+    Elided(i64),
 }
 impl Db {
     fn trigger_devices(&self, telescope_id: i64) -> Result<Vec<i64>, DbError> {
@@ -581,7 +610,7 @@ impl Db {
             let old:Option<String>=tx.query_row("SELECT payload_hash FROM device_events WHERE device_id=?1 AND event_id=?2",params![id,event.event_id.to_string()],|r|r.get(0)).optional()?;
             if let Some(old)=old {return Ok(if old==hash {Reservation::Ready} else {Reservation::Conflict});}
             let latest:Option<i64>=tx.query_row("SELECT MAX(received_at) FROM device_events WHERE device_id=?1",[id],|r|r.get(0))?;
-            if latest.is_some_and(|t|unix_now()-t<COOLDOWN) {return Ok(Reservation::RateLimited);}
+            if let Some(t)=latest.filter(|t|unix_now()-t<COOLDOWN) {return Ok(Reservation::Elided(t+COOLDOWN));}
             tx.execute("INSERT INTO device_events(device_id,event_id,payload_hash,received_at) VALUES(?1,?2,?3,?4)",params![id,event.event_id.to_string(),hash,unix_now()])?;
             tx.execute("INSERT INTO device_event_targets(device_id,event_id,route_id) SELECT device_id,?2,id FROM device_channels WHERE device_id=?1",params![id,event.event_id.to_string()])?;
             tx.commit()?;
@@ -625,7 +654,21 @@ async fn deliver(
     match state.db.reserve_device_event(id, event) {
         Ok(Reservation::Ready) => {}
         Ok(Reservation::Conflict) => return "event_conflict",
-        Ok(Reservation::RateLimited) => return "rate_limited",
+        Ok(Reservation::Elided(until)) => {
+            // A requested snapshot is refused to its requester instead.
+            if event.kind != EventKind::Snapshot && state.device_connections.count_elided(id) {
+                let (state, http) = (state.clone(), http.clone());
+                tokio::spawn(async move {
+                    let wait = (until - unix_now()).clamp(0, COOLDOWN) as u64;
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                    let count = state.device_connections.take_elided(id);
+                    if count > 0 {
+                        post_elision_notice(&state, &http, id, count).await;
+                    }
+                });
+            }
+            return "elided";
+        }
         Err(_) => return "retry",
     }
     let Ok(targets) = state.db.pending_device_targets(id, event.event_id) else {
@@ -666,6 +709,63 @@ async fn deliver(
         "delivered"
     } else {
         "retry"
+    }
+}
+
+/// One text post per route saying how many images the cooldown swallowed.
+/// Best effort: a failed notice is not retried.
+async fn post_elision_notice(state: &HubState, http: &reqwest::Client, id: i64, count: u64) {
+    let (Some(checker), Ok(Some(device)), Ok(routes)) = (
+        &state.guild_checker,
+        state.db.get_device(id),
+        state.db.device_channels(id),
+    ) else {
+        return;
+    };
+    if state.config.discord.bot_token.is_empty() {
+        return;
+    }
+    let images = if count == 1 { "image" } else { "images" };
+    let payload = json!({"allowed_mentions":{"parse":[]},"embeds":[{
+        "title":format!("{} · {count} {images} skipped",device.name),
+        "description":format!("Pier cameras post at most one image per minute. {count} {images} arrived too soon after the last post and were not sent."),
+        "footer":{"text":"AutoPierCam · automated camera observation"},
+    }]});
+    for route in routes {
+        let (Ok(guild), Ok(channel)) = (
+            super::discord_api::parse_snowflake(&route.guild_id),
+            super::discord_api::parse_snowflake(&route.channel_id),
+        ) else {
+            continue;
+        };
+        if !state
+            .device_connections
+            .1
+            .lock()
+            .is_ok_and(|mut limits| limits.allows(channel))
+            || !checker.bot_in_guild(guild as u64).await
+            || !checker.channel_in_guild(channel as u64, guild as u64).await
+        {
+            continue;
+        }
+        let result = http
+            .post(format!(
+                "{}/api/v10/channels/{}/messages",
+                state.config.discord.base_url.trim_end_matches('/'),
+                channel as u64
+            ))
+            .header(
+                "authorization",
+                format!("Bot {}", state.config.discord.bot_token),
+            )
+            .json(&payload)
+            .send()
+            .await;
+        if let Ok(response) = result
+            && let Ok(mut limits) = state.device_connections.1.lock()
+        {
+            limits.observe(channel, response.status(), response.headers());
+        }
     }
 }
 
@@ -889,7 +989,7 @@ mod tests {
         assert_eq!(publish(&mut client, &e).await["status"], "delivered");
         let mut newer = event();
         newer.kind = EventKind::TelescopeEvent;
-        assert_eq!(publish(&mut client, &newer).await["status"], "rate_limited");
+        assert_eq!(publish(&mut client, &newer).await["status"], "elided");
     }
 
     #[tokio::test]
@@ -976,6 +1076,31 @@ mod tests {
             .await
             .unwrap();
         next(client).await
+    }
+
+    #[tokio::test]
+    async fn images_inside_the_cooldown_are_swallowed_and_reported_once() {
+        let h = harness().await;
+        let mut client = connect(&h, true).await;
+        assert_eq!(publish(&mut client, &event()).await["status"], "delivered");
+        for _ in 0..2 {
+            let ack = publish(&mut client, &event()).await;
+            // Terminal: the camera must not retry a swallowed image.
+            assert_eq!(
+                (ack["status"].as_str(), ack["retry_after_seconds"].as_i64()),
+                (Some("elided"), Some(0))
+            );
+        }
+        assert_eq!(h.posts.lock().unwrap().attempts[&100], 1);
+        let count = h.state.device_connections.take_elided(h.id);
+        assert_eq!(count, 2);
+        assert_eq!(h.state.device_connections.take_elided(h.id), 0);
+        post_elision_notice(&h.state, &reqwest::Client::new(), h.id, count).await;
+        let posts = h.posts.lock().unwrap();
+        assert_eq!(posts.attempts[&100], 2);
+        let notice = posts.bodies.last().unwrap();
+        assert!(notice.contains("Pier · 2 images skipped"), "{notice}");
+        assert!(!notice.contains("piercam.jpg"));
     }
 
     #[tokio::test]
@@ -1075,10 +1200,7 @@ mod tests {
         assert_eq!(publish(&mut client, &e).await["status"], "delivered");
         e.summary = "Different image identity".into();
         assert_eq!(publish(&mut client, &e).await["status"], "event_conflict");
-        assert_eq!(
-            publish(&mut client, &event()).await["status"],
-            "rate_limited"
-        );
+        assert_eq!(publish(&mut client, &event()).await["status"], "elided");
         h.state.db.revoke_device(h.id).unwrap();
         h.state.device_connections.disconnect(h.id);
         tokio::time::timeout(Duration::from_secs(3), async {
