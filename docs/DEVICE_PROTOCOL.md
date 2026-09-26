@@ -112,12 +112,19 @@ disabled. Only owner-selected channels receive an attachment and timestamp.
 Ack: `{"type":"event_ack","event_id":"...","status":"delivered","retry_after_seconds":0}`.
 `retry` or `rate_limited` asks the client to retry the **same immutable event and
 UUID** after at least 60 seconds while it is still fresh. Other statuses
-(`invalid_event`, `invalid_image`, `event_conflict`, `invalid_request`,
-`no_destinations`) are terminal. An event is never backfilled into channels
+(`elided`, `invalid_event`, `invalid_image`, `event_conflict`,
+`invalid_request`, `no_destinations`) are terminal. Clients must treat any
+unknown status as terminal. An event is never backfilled into channels
 added later. Removing/re-adding a route does not authorize replay of old images.
 
-New events have a device-wide 60-second cooldown, including requested snapshots;
-retries have a separate 12-attempts/minute ceiling. There are at most eight
+The Hub posts at most one image per camera per minute. A new event that arrives
+within 60 seconds of the last accepted one is swallowed and acknowledged as
+`elided`; the camera must drop it, not retry it. When that minute ends, the Hub
+posts one text notice to the camera's channels saying how many images it
+skipped. The count lives in memory, so a Hub restart can lose it. A requested
+snapshot inside the window is refused to the owner instead and is not counted.
+Retries of an already accepted event are not subject to the cooldown, but all
+attempts share a separate 12-per-minute ceiling that answers `rate_limited`. There are at most eight
 destinations per device. Camera delivery observes Discord's `Retry-After`, global
 scope, and exhausted-bucket reset headers across all device connections; a retry
 acknowledgment never bypasses that backoff. See [Discord rate limits](https://docs.discord.com/developers/topics/rate-limits).
