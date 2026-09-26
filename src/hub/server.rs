@@ -2389,6 +2389,21 @@ mod tests {
                 .status(),
             204
         );
+        assert!(db.device_channels(id).unwrap().is_empty());
+        // Like telescope channels, a manager of an attached server may add
+        // channels there without owning the camera.
+        assert_eq!(
+            client
+                .post(format!("{base}/api/devices/{id}/channels"))
+                .header("x-csrf-token", &csrf)
+                .json(&serde_json::json!({"guild_id":OWNED_GUILD,"channel_id":"555"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        assert_eq!(db.device_channels(id).unwrap().len(), 1);
         assert!(db.get_device(id).unwrap().is_some());
     }
 

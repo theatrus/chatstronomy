@@ -300,10 +300,16 @@ async fn add_channel(
     headers: HeaderMap,
     Json(body): Json<Channel>,
 ) -> Response {
-    let device = match owner(&state, &headers, id) {
-        Ok(d) => d,
-        Err(r) => return r,
+    // As with telescopes, managers of an attached server pick its channels;
+    // the owner consented to that server when attaching.
+    let Some(session) = require_session_with_csrf(&state, &headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
     };
+    match state.db.get_device(id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(e),
+    }
     match state.db.device_channels(id) {
         Ok(channels) if channels.len() >= 8 => {
             return (
@@ -352,7 +358,7 @@ async fn add_channel(
             .into_response(),
         Ok(true) => {
             state.db.audit(
-                device.owner_id,
+                session.discord_user_id,
                 guild,
                 "device_destination_added",
                 &format!("device {id}, channel {channel}"),
