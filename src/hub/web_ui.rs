@@ -595,7 +595,7 @@ function renderDevices(devices, target) {
 
 function renderCameraAttachments(g, devices, options) {
   // Cameras may share a telescope's channel, so only their own links count
-  // as used. Only the owner picks channels; managers may remove or detach.
+  // as used.
   return devices.map((d) => {
     const used = d.channels.map((c) => c.channel_id);
     const chips = d.channels.length
@@ -607,11 +607,9 @@ function renderCameraAttachments(g, devices, options) {
             "✕</button></span>";
         }).join("") + "</div>"
       : '<span class="hint">No channels selected. Camera images are not posted here.</span>';
-    const picker = d.owned_by_me
-      ? '<div class="controls">' + channelPicker(options, used, "f-camera-chan") +
-        '<button class="b-camera-chan"' + (d.channels.length >= 8 ? " disabled" : "") +
-        ">Add channel</button></div>"
-      : '<p class="hint">Only the camera’s owner picks its channels.</p>';
+    const picker = '<div class="controls">' + channelPicker(options, used, "f-camera-chan") +
+      '<button class="b-camera-chan"' + (d.channels.length >= 8 ? " disabled" : "") +
+      ">Add channel</button></div>";
     const owner = d.owned_by_me ? "" :
       '<span class="sub-note">shared by ' + esc(d.owner_name) + "</span>";
     return '<div class="sub camera-attachment" data-id="' + d.id + '">' +
@@ -1347,12 +1345,12 @@ mod tests {
         }
         // Pairing codes use the shared copyable token box.
         assert!(INDEX_HTML.contains("showToken(row, \"key\", \"Pairing code — single use, valid \" +\n          Math.round(out.expires_in_seconds / 60) + \" minutes\", out.pairing_token"));
-        // Server cards list cameras beside telescopes; managers can detach,
-        // only owners pick channels.
+        // Server cards list cameras beside telescopes; managers pick their
+        // channels and can detach them.
         for text in [
             "api(\"/api/guilds/\" + g.id + \"/devices\")",
             "base + \"/attachments/\" + g.id",
-            "Only the camera’s owner picks its channels.",
+            "b-camera-chan",
             "rm-camera-route",
         ] {
             assert!(INDEX_HTML.contains(text), "missing {text}");

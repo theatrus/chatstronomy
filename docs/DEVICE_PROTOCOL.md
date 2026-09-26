@@ -12,9 +12,9 @@ telescopes, in the **Pier cameras** card on the Hub's **Observatory devices** ta
 5. Choose **Pair camera…** and paste the code into AutoPierCam.
 
 Camera feeds can share a telescope's channel without changing slash-command
-routing. Only the owner picks a camera's channels, and only in a server where
-the owner attached it. A server manager can remove a camera's channel or detach
-it from that server, but cannot pair, revoke or delete another user's camera.
+routing. Only the owner can attach a camera to a server. After that, as with
+telescopes, any manager of that server can add or remove the camera's channels
+there, or detach it, but cannot pair, revoke or delete another user's camera.
 Detaching removes that server's channels and closes the camera's connection.
 Device ownership does not grant telescope or N.I.N.A. permissions. Share codes
 do not authorize devices. The Hub audit log records camera creation, pairing
@@ -107,7 +107,8 @@ than five minutes ago (30 seconds future clock tolerance). The Hub validates
 the envelope and size, not decoded pixels. Summary text is at most 300 printable
 characters. WebSocket messages are capped at 720 KiB. Arbitrary URLs, client
 channel IDs, and unknown message fields are rejected. Discord mentions are
-disabled. Only owner-selected channels receive an attachment and timestamp.
+disabled. Only channels chosen in servers the owner attached receive an attachment and
+timestamp.
 
 Ack: `{"type":"event_ack","event_id":"...","status":"delivered","retry_after_seconds":0}`.
 `retry` or `rate_limited` asks the client to retry the **same immutable event and
