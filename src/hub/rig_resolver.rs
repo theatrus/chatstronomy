@@ -37,18 +37,46 @@ impl HubRigResolver {
         self
     }
 
-    fn camera_id(&self, invocation: &CommandContext, name: &str) -> Result<i64, String> {
+    /// Without a name, picks the invoker's only camera routed to this
+    /// channel, as telescope commands default to the channel's telescope.
+    fn camera_id(&self, invocation: &CommandContext, name: Option<&str>) -> Result<i64, String> {
         let guild = invocation
             .guild_id
             .ok_or("Camera commands require a server channel")?;
         // User ownership AND exact guild/channel route. A server manager is
         // not implicitly allowed to change another user's camera sharing.
-        self.db.with_conn(|c| {
-            use rusqlite::OptionalExtension;
-            c.query_row("SELECT d.id FROM devices d JOIN device_channels r ON r.device_id=d.id WHERE d.owner_id=?1 AND d.name=?2 AND r.guild_id=?3 AND r.channel_id=?4",
-                rusqlite::params![invocation.user_id as i64, name, guild as i64, invocation.channel_id as i64], |r| r.get(0)).optional()
-        }).map_err(|_| "Camera lookup failed".to_owned())?
-            .ok_or_else(|| "No camera with that name is owned by you and routed to this channel.".into())
+        let cameras: Vec<(i64, String)> = self
+            .db
+            .with_conn(|c| {
+                c.prepare("SELECT d.id, d.name FROM devices d JOIN device_channels r ON r.device_id=d.id WHERE d.owner_id=?1 AND r.guild_id=?2 AND r.channel_id=?3 ORDER BY d.name")?
+                    .query_map(
+                        rusqlite::params![invocation.user_id as i64, guild as i64, invocation.channel_id as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?
+                    .collect()
+            })
+            .map_err(|_| "Camera lookup failed".to_owned())?;
+        match name {
+            Some(name) => cameras
+                .iter()
+                .find(|(_, n)| n == name)
+                .map(|(id, _)| *id)
+                .ok_or_else(|| {
+                    "No camera with that name is owned by you and routed to this channel.".into()
+                }),
+            None => match cameras.as_slice() {
+                [(id, _)] => Ok(*id),
+                [] => Err("No camera owned by you is routed to this channel.".into()),
+                several => Err(format!(
+                    "Several of your cameras are routed to this channel ({}). Choose one with `camera`.",
+                    several
+                        .iter()
+                        .map(|(_, n)| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            },
+        }
     }
 
     fn guild_names(&self, guild_id: i64) -> Vec<String> {
@@ -121,7 +149,7 @@ impl RigResolver for HubRigResolver {
     async fn camera_command(
         &self,
         invocation: &CommandContext,
-        camera: &str,
+        camera: Option<&str>,
         rules: Option<crate::chat::CameraTriggerRules>,
     ) -> Result<(), String> {
         let id = self.camera_id(invocation, camera)?;
@@ -265,6 +293,7 @@ mod tests {
         let camera = db
             .create_device(1, "Pier", super::super::devices::DeviceKind::PierCamera)
             .unwrap();
+        db.attach_device(camera.id, 100, 1).unwrap();
         db.add_device_channel(camera.id, 100, 42, "obs").unwrap();
         let owner = CommandContext {
             guild_id: Some(100),
@@ -272,7 +301,7 @@ mod tests {
             user_id: 1,
             ..Default::default()
         };
-        assert_eq!(resolver.camera_id(&owner, "Pier").unwrap(), camera.id);
+        assert_eq!(resolver.camera_id(&owner, Some("Pier")).unwrap(), camera.id);
         for other in [
             CommandContext {
                 user_id: 7,
@@ -292,9 +321,18 @@ mod tests {
                 ..owner.clone()
             },
         ] {
-            assert!(resolver.camera_id(&other, "Pier").is_err());
+            assert!(resolver.camera_id(&other, Some("Pier")).is_err());
         }
-        assert!(resolver.camera_id(&owner, "Unknown").is_err());
+        assert!(resolver.camera_id(&owner, Some("Unknown")).is_err());
+        assert_eq!(resolver.camera_id(&owner, None).unwrap(), camera.id);
+        let second = db
+            .create_device(1, "Roof", super::super::devices::DeviceKind::PierCamera)
+            .unwrap();
+        db.attach_device(second.id, 100, 1).unwrap();
+        db.add_device_channel(second.id, 100, 42, "obs").unwrap();
+        let ambiguous = resolver.camera_id(&owner, None).unwrap_err();
+        assert!(ambiguous.contains("Pier, Roof"), "{ambiguous}");
+        assert_eq!(resolver.camera_id(&owner, Some("Roof")).unwrap(), second.id);
     }
 
     fn invocation(guild_id: u64, channel_id: u64, roles: Vec<u64>) -> CommandContext {

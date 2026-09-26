@@ -1,15 +1,27 @@
 # Observatory device protocol (pairing v1, transport v1/v2)
 
-AutoPierCam is a user-owned `pier_camera`, not a N.I.N.A. telescope/profile.
-The Hub's **Observatory devices** tab includes a separate **Pier cameras & devices**
-section. Create a camera, generate a code, and explicitly choose its channels.
-Register the server under **Discord delivery** first. The owner must also manage
-that server; a live bot membership and text-channel check is required.
+[AutoPierCam](https://github.com/theatrus/autopiercam) is a user-owned
+`pier_camera`, not a N.I.N.A. telescope/profile. Cameras set up the same way as
+telescopes, in the **Pier cameras** card on the Hub's **Observatory devices** tab:
+
+1. Register the server under **Discord delivery**.
+2. Add a pier camera.
+3. Attach it to a server you manage (`POST /api/devices/{id}/attach`).
+4. Pick its channels in that server's card under **Discord delivery**. A live
+   bot membership and text-channel check is required.
+5. Choose **Pair camera…** and paste the code into AutoPierCam.
 
 Camera feeds can share a telescope's channel without changing slash-command
-routing. A server manager can remove a camera feed from Discord delivery but
-cannot pair, revoke or delete another user's camera. Device ownership does not
-grant telescope or N.I.N.A. permissions. Share codes do not authorize devices.
+routing. Only the owner picks a camera's channels, and only in a server where
+the owner attached it. A server manager can remove a camera's channel or detach
+it from that server, but cannot pair, revoke or delete another user's camera.
+Detaching removes that server's channels and closes the camera's connection.
+Device ownership does not grant telescope or N.I.N.A. permissions. Share codes
+do not authorize devices. The Hub audit log records camera creation, pairing
+codes, access resets, attachments and deletion.
+
+Pairing is not carried in the Direct WebSocket handshake as it is for N.I.N.A.
+rigs; cameras keep the HTTP exchange below.
 
 ## Pairing
 
@@ -65,7 +77,7 @@ credential rotation, deletion, or route removal closes the current connection.
 Handshake errors use `{"type":"error","code":"..."}` before closing. Stop
 and show operator action for `authentication_failed`, `unsupported_version`, or
 `invalid_message`; back off on `rate_limited` and `already_connected`.
-Use the camera card's **Refresh camera status** button to update its online state.
+Use the **Refresh camera status** button to update the camera's online state.
 
 `snapshots` advertises the client's current, explicit local consent. A client
 must recheck that consent when receiving every request, and disconnect on any
@@ -159,12 +171,16 @@ After v2 `ready`, the client advertises explicit local permission:
 {"type":"trigger_capabilities","chat_configuration":true,"telescope_events":true}
 ```
 
-Both capabilities default false on every connection. The Hub exposes separate
-Discord commands (not telescope hardware commands):
+Both capabilities default false on every connection. The Hub exposes a
+`piercam` group under `/chatstronomy` (not telescope hardware commands):
 
-- `/piercam snapshot camera:<exact name>` uses the existing snapshot consent.
-- `/piercam triggers camera:<exact name> interval_minutes:10 scene_changes:true day_night:false telescope_events:true burst_count:3 spacing_seconds:60`
+- `/chatstronomy piercam snapshot` uses the existing snapshot consent.
+- `/chatstronomy piercam triggers interval_minutes:10 scene_changes:true day_night:false telescope_events:true burst_count:3 spacing_seconds:60`
   sets the complete active rule set, not a partial patch.
+
+Like telescope commands, `camera` is optional. Without it, the command uses the
+invoker's camera routed to the current channel; if several are, it lists their
+names and asks for `camera:<exact name>`.
 
 The invoking Discord user must own the camera AND invoke in one of its exact
 guild/channel routes. DMs, unrelated routes, and non-owner server managers are

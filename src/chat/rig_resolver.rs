@@ -31,7 +31,7 @@ pub trait RigResolver: Send + Sync {
     async fn camera_command(
         &self,
         _invocation: &CommandContext,
-        _camera: &str,
+        _camera: Option<&str>,
         _rules: Option<super::CameraTriggerRules>,
     ) -> Result<(), String> {
         Err("Pier-camera commands require the Chatstronomy Hub.".into())

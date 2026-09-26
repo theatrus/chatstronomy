@@ -39,11 +39,13 @@ Credentials are bound to the telescope plus the plugin's node/profile identity.
 They can be revoked from the Hub. Pairing tokens are hashed, expire, and are
 consumed once.
 
-## Local hardware-control consent
-
-Feed-only observatory devices such as AutoPierCam can be paired separately from
+Feed-only observatory devices such as
+[AutoPierCam](https://github.com/theatrus/autopiercam) use the same steps:
+add, attach to a server, pick channels, then pair. They pair separately from
 telescopes. See [device pairing and protocol](DEVICE_PROTOCOL.md). These devices
 never enter telescope command routing or inherit N.I.N.A. control permissions.
+
+## Local hardware-control consent
 
 Hardware control is disabled by default in each N.I.N.A. profile. The telescope
 owner must enable the plugin's local master switch and separately approve every

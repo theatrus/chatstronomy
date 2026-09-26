@@ -21,6 +21,8 @@ pub fn routes() -> Router<HubState> {
         .route("/api/devices", get(list).post(create))
         .route("/api/devices/{id}", delete(remove))
         .route("/api/devices/{id}/pairing-token", post(issue_token))
+        .route("/api/devices/{id}/attach", post(attach))
+        .route("/api/devices/{id}/attachments/{guild}", delete(detach))
         .route("/api/devices/{id}/credentials", delete(revoke))
         .route("/api/devices/{id}/channels", post(add_channel))
         .route("/api/devices/{id}/channels/{route}", delete(remove_channel))
@@ -54,9 +56,22 @@ async fn list(State(state): State<HubState>, headers: HeaderMap) -> Response {
         let mut devices = Vec::new();
         for device in state.db.user_devices(session.discord_user_id)? {
             let channels = state.db.device_channels(device.id)?;
-            let mut value = json!(device);
-            value["channels"] = json!(channels);
-            value["connected"] = json!(state.device_connections.connected(device.id));
+            let mut value = device_json(&state, &device);
+            value["attachments"] = state
+                .db
+                .device_attachments(device.id)?
+                .into_iter()
+                .map(|a| {
+                    let mut attachment = json!(a);
+                    attachment["channels"] = json!(
+                        channels
+                            .iter()
+                            .filter(|c| c.guild_id == a.guild_id)
+                            .collect::<Vec<_>>()
+                    );
+                    attachment
+                })
+                .collect();
             devices.push(value);
         }
         Ok::<_, super::db::DbError>(devices)
@@ -65,6 +80,13 @@ async fn list(State(state): State<HubState>, headers: HeaderMap) -> Response {
         Ok(devices) => Json(json!({"devices":devices})).into_response(),
         Err(e) => internal_error(e),
     }
+}
+
+fn device_json(state: &HubState, device: &Device) -> serde_json::Value {
+    let mut value = json!(device);
+    value["connected"] = json!(state.device_connections.connected(device.id));
+    value["snapshots"] = json!(state.device_connections.snapshots_shared(device.id));
+    value
 }
 
 #[derive(Deserialize)]
@@ -94,7 +116,12 @@ async fn create(
         .db
         .create_device(session.discord_user_id, name, body.kind)
     {
-        Ok(d) => Json(d).into_response(),
+        Ok(d) => {
+            state
+                .db
+                .audit(session.discord_user_id, 0, "device_created", &d.name);
+            Json(d).into_response()
+        }
         Err(super::db::DbError::Sqlite(rusqlite::Error::SqliteFailure(e, _)))
             if e.code == rusqlite::ErrorCode::ConstraintViolation =>
         {
@@ -109,12 +136,18 @@ async fn remove(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = owner(&state, &headers, id) {
-        return r;
-    }
+    let device = match owner(&state, &headers, id) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     state.device_connections.disconnect(id);
     match state.db.delete_device(id) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state
+                .db
+                .audit(device.owner_id, 0, "device_deleted", &device.name);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -124,15 +157,24 @@ async fn issue_token(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = owner(&state, &headers, id) {
-        return r;
-    }
+    let device = match owner(&state, &headers, id) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     match state.db.issue_device_token(id) {
-        Ok(token) => (
-            [("cache-control", "no-store")],
-            Json(json!({"pairing_token":token,"expires_in_seconds":PAIRING_TTL})),
-        )
-            .into_response(),
+        Ok(token) => {
+            state.db.audit(
+                device.owner_id,
+                0,
+                "device_pairing_token_issued",
+                &device.name,
+            );
+            (
+                [("cache-control", "no-store")],
+                Json(json!({"pairing_token":token,"expires_in_seconds":PAIRING_TTL})),
+            )
+                .into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -142,12 +184,105 @@ async fn revoke(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = owner(&state, &headers, id) {
-        return r;
-    }
+    let device = match owner(&state, &headers, id) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     state.device_connections.disconnect(id);
     match state.db.revoke_device(id) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.db.audit(
+                device.owner_id,
+                0,
+                "device_credentials_revoked",
+                &device.name,
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Attach {
+    guild_id: String,
+}
+
+/// Same consent as attaching a telescope: the device owner who also
+/// manages the target server.
+async fn attach(
+    State(state): State<HubState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(body): Json<Attach>,
+) -> Response {
+    let device = match owner(&state, &headers, id) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let Ok(guild) = super::discord_api::parse_snowflake(&body.guild_id) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if let ManageAuth::Denied(r) = authorize_manage(&state, &headers, guild, true).await {
+        return r;
+    }
+    match state.db.get_guild(guild) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::BAD_REQUEST, "register the server first").into_response(),
+        Err(e) => return internal_error(e),
+    }
+    match state.db.attach_device(id, guild, device.owner_id) {
+        Ok(true) => {
+            state
+                .db
+                .audit(device.owner_id, guild, "device_attached", &device.name);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            "this camera is already attached to that server",
+        )
+            .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Either side may sever, as with telescopes: the owner, or a manager of
+/// the attached server. Removes that server's channel links too.
+async fn detach(
+    State(state): State<HubState>,
+    Path((id, guild)): Path<(i64, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(guild) = super::discord_api::parse_snowflake(&guild) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(session) = require_session_with_csrf(&state, &headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let device = match state.db.get_device(id) {
+        Ok(Some(d)) => d,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(e),
+    };
+    if device.owner_id != session.discord_user_id
+        && let ManageAuth::Denied(r) = authorize_manage(&state, &headers, guild, true).await
+    {
+        return r;
+    }
+    match state.db.detach_device(id, guild) {
+        Ok(true) => {
+            state.device_connections.disconnect(id);
+            state.db.audit(
+                session.discord_user_id,
+                guild,
+                "device_detached",
+                &device.name,
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -210,7 +345,12 @@ async fn add_channel(
         .db
         .add_device_channel(id, guild, channel, &channel_info.name)
     {
-        Ok(()) => {
+        Ok(false) => (
+            StatusCode::BAD_REQUEST,
+            "attach the camera to that server first",
+        )
+            .into_response(),
+        Ok(true) => {
             state.db.audit(
                 device.owner_id,
                 guild,
@@ -277,9 +417,30 @@ async fn guild_devices(
     if let ManageAuth::Denied(r) = authorize_manage(&state, &headers, guild, false).await {
         return r;
     }
-    let result=state.db.with_conn(|c|c.prepare("SELECT dc.id, dc.device_id, d.name, dc.channel_name FROM device_channels dc JOIN devices d ON d.id=dc.device_id WHERE dc.guild_id=?1 ORDER BY dc.id")?.query_map([guild],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"device_id":r.get::<_,i64>(1)?,"name":r.get::<_,String>(2)?,"channel_name":r.get::<_,String>(3)?})))?.collect::<Result<Vec<_>,_>>());
+    let viewer = session_from_headers(&state, &headers)
+        .map(|s| s.discord_user_id)
+        .unwrap_or(0);
+    let result = (|| {
+        let mut devices = Vec::new();
+        for (device, owner_name) in state.db.guild_devices(guild)? {
+            let mut value = device_json(&state, &device);
+            value["owner_name"] = json!(owner_name);
+            value["owned_by_me"] = json!(device.owner_id == viewer);
+            let guild_id = super::discord_api::snowflake_string(guild);
+            value["channels"] = json!(
+                state
+                    .db
+                    .device_channels(device.id)?
+                    .into_iter()
+                    .filter(|c| c.guild_id == guild_id)
+                    .collect::<Vec<_>>()
+            );
+            devices.push(value);
+        }
+        Ok::<_, super::db::DbError>(devices)
+    })();
     match result {
-        Ok(routes) => Json(json!({"routes":routes})).into_response(),
+        Ok(devices) => Json(json!({"devices":devices})).into_response(),
         Err(e) => internal_error(e),
     }
 }

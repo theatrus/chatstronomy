@@ -2171,17 +2171,25 @@ mod tests {
             .await
             .unwrap();
         let id = d["id"].as_i64().unwrap();
-        assert_eq!(
+        let add_channel = || {
             client
                 .post(format!("{base}/api/devices/{id}/channels"))
                 .header("x-csrf-token", &csrf)
                 .json(&serde_json::json!({"guild_id":OWNED_GUILD,"channel_id":"555"}))
                 .send()
-                .await
-                .unwrap()
-                .status(),
-            204
-        );
+        };
+        // Like telescopes: attach to the server before choosing channels.
+        assert_eq!(add_channel().await.unwrap().status(), 400);
+        let attach = || {
+            client
+                .post(format!("{base}/api/devices/{id}/attach"))
+                .header("x-csrf-token", &csrf)
+                .json(&serde_json::json!({"guild_id":OWNED_GUILD}))
+                .send()
+        };
+        assert_eq!(attach().await.unwrap().status(), 204);
+        assert_eq!(attach().await.unwrap().status(), 409);
+        assert_eq!(add_channel().await.unwrap().status(), 204);
         assert_eq!(db.telescope_by_channel(555).unwrap().unwrap().id, telescope);
         let token: serde_json::Value = client
             .post(format!("{base}/api/devices/{id}/pairing-token"))
@@ -2226,7 +2234,22 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(routes["routes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            routes["devices"][0]["channels"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(routes["devices"][0]["owned_by_me"], true);
+        let mine: serde_json::Value = client
+            .get(format!("{base}/api/devices"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let attachment = &mine["devices"][0]["attachments"][0];
+        assert_eq!(attachment["guild_id"], OWNED_GUILD);
+        assert_eq!(attachment["channels"].as_array().unwrap().len(), 1);
         assert_eq!(
             client
                 .delete(format!("{base}/api/devices/{id}/credentials"))
@@ -2242,6 +2265,18 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            client
+                .delete(format!("{base}/api/devices/{id}/attachments/{OWNED_GUILD}"))
+                .header("x-csrf-token", &csrf)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        assert!(db.device_channels(id).unwrap().is_empty());
+        assert_eq!(db.telescope_by_channel(555).unwrap().unwrap().id, telescope);
     }
 
     #[tokio::test]
@@ -2312,6 +2347,8 @@ mod tests {
                 "Other camera",
                 super::super::devices::DeviceKind::PierCamera,
             )
+            .unwrap();
+        db.attach_device(d.id, OWNED_GUILD.parse().unwrap(), 2)
             .unwrap();
         db.add_device_channel(d.id, OWNED_GUILD.parse().unwrap(), 555, "observatory")
             .unwrap();

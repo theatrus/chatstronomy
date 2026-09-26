@@ -419,7 +419,6 @@ async function renderAll(tab = ACTIVE_TAB, focusAttachmentId = null) {
   }
   bindTabs();
   await Promise.all(attachmentRenders);
-  await renderDeviceFeeds(deliveryPanel);
   if (generation !== RENDER_GENERATION) return;
   app.removeAttribute("aria-busy");
   if (hadShell) window.scrollTo(0, previousScrollY);
@@ -436,97 +435,227 @@ async function renderAll(tab = ACTIVE_TAB, focusAttachmentId = null) {
   }
 }
 
-// ---------- Feed-only observatory devices ----------
-function renderDevices(devices, panel) {
-  const section = document.createElement("div");
-  section.className = "card";
-  section.innerHTML = '<h2>Pier cameras &amp; devices</h2><button class="refresh-devices">Refresh camera status</button>' +
-    '<p class="hint">Pair AutoPierCam separately from N.I.N.A. Camera feeds can share telescope channels, ' +
-    'but cannot control telescope hardware. Only enable images you want to share with those channels.</p>' +
-    '<form class="controls"><label>Camera name <input name="name" maxlength="64" required placeholder="Pier camera"></label>' +
-    '<button class="primary">Add pier camera</button></form><div class="device-list"></div>';
-  section.querySelector("form").onsubmit = async (ev) => {
-    ev.preventDefault();
-    try {
-      await api("/api/devices", {method:"POST", body:JSON.stringify({name:section.querySelector("input").value,kind:"pier_camera"})});
-      await renderAll();
-    } catch(e) { toast(e.message); }
-  };
-  section.querySelector('.refresh-devices').onclick = () => renderAll();
-  for (const d of devices) {
-    const row = document.createElement("div");
-    row.className = "card";
-    row.innerHTML = '<h3>' + esc(d.name) + '</h3><p class="hint">Pier camera · ' +
-      (d.connected ? 'Online' : (d.paired ? 'Paired · Offline' : 'Not paired')) + ' · No telescope control</p>' +
-      '<div class="controls"><button class="pair">Get pairing code</button>' +
-      '<button class="snapshot"' + (d.connected ? '' : ' disabled') + '>Snapshot now</button>' +
-      '<button class="revoke">Revoke access</button><button class="remove">Delete device</button></div>' +
-      '<p class="device-token hint"></p><ul>' + d.channels.map(c => '<li>' + esc(c.channel_name) +
-      ' <button class="remove-route" data-route="' + c.id + '">Remove channel</button></li>').join("") + '</ul>' +
-      '<div class="controls"><label>Server <select class="guild"><option value="">Choose server</option>' +
-      GUILDS.filter(g=>g.registered).map(g=>'<option value="'+esc(g.id)+'">'+esc(g.name)+'</option>').join("") +
-      '</select></label><label>Channel <select class="channel" disabled></select></label><button class="add" disabled>Add channel</button></div>' +
-      '<p class="hint">Register servers in Discord delivery first. Changes apply immediately.</p>';
-    const base = '/api/devices/' + d.id;
-    const act = async (path,method,body) => {
-      try { await api(path,{method,body:body && JSON.stringify(body)}); await renderAll(); }
-      catch(e) {toast(e.message);}
-    };
-    row.querySelector('.pair').onclick = async () => {
-      try {
-        const result = await api(base+'/pairing-token',{method:'POST'});
-        row.querySelector('.device-token').textContent = 'Single-use pairing code (1 hour): '+result.pairing_token+
-          '. Shown only here; a new code replaces it. Enter in AutoPierCam, not N.I.N.A.';
-      } catch(e) {toast(e.message);}
-    };
-    row.querySelector('.revoke').onclick = () => {
-      if (confirm('Revoke this camera and all unused pairing codes? Pair again to resume sharing.')) act(base+'/credentials','DELETE');
-    };
-    row.querySelector('.snapshot').onclick = async () => {
-      const button = row.querySelector('.snapshot');
-      button.disabled = true; button.textContent = 'Waiting for camera…';
-      try {await api(base+'/snapshot',{method:'POST'}); toast('Snapshot posted to the selected channels');}
-      catch(e) {toast(e.message);}
-      finally {button.disabled = false; button.textContent = 'Snapshot now';}
-    };
-    row.querySelector('.remove').onclick = () => {
-      if (confirm('Delete this device, its credentials and all channel links?')) act(base,'DELETE');
-    };
-    row.querySelectorAll('.remove-route').forEach(b => b.onclick = () => act(base+'/channels/'+b.dataset.route,'DELETE'));
-    const guild = row.querySelector('.guild'), channel = row.querySelector('.channel'), add = row.querySelector('.add');
-    guild.onchange = async () => {
-      const selected = guild.value;
-      channel.innerHTML = ''; channel.disabled = true; add.disabled = true;
-      if (!selected) return;
-      try {
-        const options = await api('/api/guilds/'+selected+'/options');
-        if (guild.value !== selected) return;
-        channel.innerHTML = options.channels.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>').join('');
-        channel.disabled = !options.channels.length; add.disabled = channel.disabled;
-      } catch(e) {toast(e.message);}
-    };
-    add.onclick = () => act(base+'/channels','POST',{guild_id:guild.value,channel_id:channel.value});
-    section.querySelector('.device-list').appendChild(row);
-  }
-  panel.appendChild(section);
+// ---------- Pier cameras (feed-only observatory devices) ----------
+
+function cameraBadge(d) {
+  if (d.connected) return '<span class="badge good">camera online</span>';
+  return d.paired ? '<span class="badge warn">camera offline</span>'
+                  : '<span class="badge warn">not paired</span>';
 }
 
-async function renderDeviceFeeds(panel) {
-  await Promise.all(GUILDS.filter(g=>g.registered).map(async g => {
+function snapshotBadge(d) {
+  if (!d.connected) return "";
+  return d.snapshots
+    ? '<span class="badge good">snapshots shared</span>'
+    : '<span class="badge warn">snapshots off in AutoPierCam</span>';
+}
+
+function cameraNextStep(d, targets) {
+  // Same order as telescopes: server, channels, then the device itself.
+  const hasChannels = d.attachments.some((a) => a.channels.length > 0);
+  if (!d.attachments.length) {
+    if (!targets.length) {
+      return '<div class="next"><span class="step">Next</span>' +
+        '<span class="next-copy">Set up a Discord server first.</span>' +
+        '<button type="button" class="b-open-delivery">' +
+        "Open Discord delivery</button></div>";
+    }
+    return '<div class="next"><span class="step">Next</span>' +
+      '<span class="next-copy">Attach to a server, then pick channels in ' +
+      "Discord delivery.</span></div>";
+  }
+  if (!hasChannels) {
+    return '<div class="next"><span class="step">Next</span>' +
+      '<span class="next-copy">Pick a channel for camera images.</span>' +
+      '<button type="button" class="b-open-delivery">' +
+      "Open Discord delivery</button></div>";
+  }
+  if (!d.paired) {
+    return '<div class="next"><span class="step">Next</span>' +
+      '<span class="next-copy">Get a pairing code and paste it into ' +
+      "AutoPierCam.</span></div>";
+  }
+  return "";
+}
+
+function renderDevices(devices, target) {
+  const card = document.createElement("div");
+  card.className = "card";
+  let html = '<div class="head"><h2>' + ico("camera") + "Pier cameras</h2>" +
+    '<div class="badges"><button class="subtle b-refresh-cameras">Refresh camera status</button></div></div>' +
+    '<p class="hint">Pair <a href="https://github.com/theatrus/autopiercam" target="_blank" rel="noopener">' +
+    "AutoPierCam</a> separately from N.I.N.A. Camera feeds can share telescope channels, " +
+    "but never control telescope hardware. Only enable images you want to share with those channels.</p>";
+  if (!devices.length) {
+    html += '<div class="steps"><span><b>1</b> Add a pier camera</span>' +
+      "<span><b>2</b> Attach it to a server</span>" +
+      "<span><b>3</b> Pick its channels</span>" +
+      "<span><b>4</b> Pair AutoPierCam</span></div>";
+  }
+  for (const d of devices) {
+    const attached = new Set(d.attachments.map((a) => a.guild_id));
+    const targets = GUILDS.filter((g) => g.registered && !attached.has(g.id));
+    const servers = d.attachments.length
+      ? '<div class="chips">' + d.attachments.map((a) =>
+          '<span class="chip on">' + esc(a.guild_name || a.guild_id) + "</span>").join("") + "</div>"
+      : '<span class="hint">No servers attached.</span>';
+    const attachControls = targets.length
+      ? '<div class="controls"><select class="pick f-attach">' + targets.map((g) =>
+          '<option value="' + esc(g.id) + '">' + esc(g.name) + "</option>").join("") +
+        '</select><button class="b-attach">Attach to server</button></div>'
+      : "";
+    html +=
+      '<div class="sub camera" data-id="' + d.id + '">' +
+      '<div class="head"><b>' + ico("camera") + esc(d.name) + "</b>" +
+      '<div class="badges">' + cameraBadge(d) + snapshotBadge(d) +
+      '<button class="' + (d.paired ? "subtle " : "") + 'b-token">' + ico("key") + "Pair camera…</button>" +
+      (d.connected ? '<button class="subtle b-snapshot">Snapshot now</button>' : "") +
+      "</div></div>" +
+      cameraNextStep(d, targets) +
+      '<div class="token-out"></div>' +
+      '<div class="section"><label>' + ico("globe") + "Servers</label>" + servers + attachControls + "</div>" +
+      '<div class="footer-links">' +
+      '<a href="javascript:;" class="b-revoke">Reset camera access</a>' +
+      '<a href="javascript:;" class="b-delete">Delete camera</a></div></div>';
+  }
+  html +=
+    '<div class="controls" style="margin-top:.9rem">' +
+    '<input class="name new-camera-name" maxlength="64" placeholder="camera name (e.g. pier)">' +
+    '<button class="primary b-create-camera">Add pier camera</button></div>';
+  card.innerHTML = html;
+  target.appendChild(card);
+
+  card.querySelector(".b-refresh-cameras").onclick = () => renderAll("telescopes");
+  card.querySelector(".b-create-camera").onclick = async () => {
+    const name = card.querySelector(".new-camera-name").value.trim();
+    if (!name) return;
     try {
-      const result = await api('/api/guilds/'+g.id+'/devices');
-      if (!result.routes.length) return;
-      const card = document.createElement('div');
-      card.className = 'card';
-      card.innerHTML = '<h3>'+esc(g.name)+' · Camera feeds</h3><p class="hint">Server managers can remove feeds here. Device pairing belongs to its owner.</p>' +
-        result.routes.map(r=>'<p>'+esc(r.name)+' → '+esc(r.channel_name)+' <button data-device="'+r.device_id+'" data-route="'+r.id+'">Remove feed</button></p>').join('');
-      card.querySelectorAll('button').forEach(b=>b.onclick=async()=>{
-        try {await api('/api/devices/'+b.dataset.device+'/channels/'+b.dataset.route,{method:'DELETE'}); await renderAll();}
-        catch(e) {toast(e.message);}
-      });
-      panel.appendChild(card);
-    } catch(e) {toast('Camera feeds: '+e.message);}
-  }));
+      await api("/api/devices", { method: "POST", body: JSON.stringify({ name, kind: "pier_camera" }) });
+      toast("Camera added");
+      renderAll("telescopes");
+    } catch (e) { toast(e.message); }
+  };
+
+  card.querySelectorAll(".camera").forEach((row) => {
+    const base = "/api/devices/" + row.dataset.id;
+    const openDelivery = row.querySelector(".b-open-delivery");
+    if (openDelivery) openDelivery.onclick = () => setActiveTab("delivery", true);
+    const attach = row.querySelector(".b-attach");
+    if (attach) {
+      attach.onclick = async () => {
+        const guild = row.querySelector(".f-attach").value;
+        try {
+          await api(base + "/attach", { method: "POST", body: JSON.stringify({ guild_id: guild }) });
+          toast("Attached — choose a channel in Discord delivery");
+          renderAll("delivery");
+        } catch (e) { toast(e.message); }
+      };
+    }
+    row.querySelector(".b-token").onclick = async () => {
+      try {
+        const out = await api(base + "/pairing-token", { method: "POST" });
+        showToken(row, "key", "Pairing code — single use, valid " +
+          Math.round(out.expires_in_seconds / 60) + " minutes", out.pairing_token,
+          "Shown only once. Paste into AutoPierCam, not N.I.N.A. " +
+          "A new code replaces this one. Read the " +
+          hostedPolicyLinks() + " before pairing.");
+      } catch (e) { toast(e.message); }
+    };
+    const snapshot = row.querySelector(".b-snapshot");
+    if (snapshot) {
+      snapshot.onclick = async () => {
+        snapshot.disabled = true; snapshot.textContent = "Waiting for camera…";
+        try {
+          await api(base + "/snapshot", { method: "POST" });
+          toast("Snapshot posted to the selected channels");
+        } catch (e) { toast(e.message); }
+        finally { snapshot.disabled = false; snapshot.textContent = "Snapshot now"; }
+      };
+    }
+    row.querySelector(".b-revoke").onclick = async () => {
+      if (!confirm("Reset camera access? This disconnects AutoPierCam and requires " +
+        "a new pairing code.")) return;
+      try {
+        await api(base + "/credentials", { method: "DELETE" });
+        toast("Camera access reset");
+        renderAll("telescopes");
+      } catch (e) { toast(e.message); }
+    };
+    row.querySelector(".b-delete").onclick = async () => {
+      if (!confirm("Delete this camera everywhere? This removes its server " +
+        "links, channels, and credentials.")) return;
+      try {
+        await api(base, { method: "DELETE" });
+        toast("Camera deleted");
+        renderAll("telescopes");
+      } catch (e) { toast(e.message); }
+    };
+  });
+}
+
+function renderCameraAttachments(g, devices, options) {
+  // Cameras may share a telescope's channel, so only their own links count
+  // as used. Only the owner picks channels; managers may remove or detach.
+  return devices.map((d) => {
+    const used = d.channels.map((c) => c.channel_id);
+    const chips = d.channels.length
+      ? '<div class="chips">' + d.channels.map((c) => {
+          const name = '#' + c.channel_name;
+          return '<span class="chip on">' + esc(name) +
+            ' <button type="button" class="rm rm-camera-route" data-route="' + c.id +
+            '" aria-label="Remove ' + esc(name) + ' from camera delivery" title="Remove channel">' +
+            "✕</button></span>";
+        }).join("") + "</div>"
+      : '<span class="hint">No channels selected. Camera images are not posted here.</span>';
+    const picker = d.owned_by_me
+      ? '<div class="controls">' + channelPicker(options, used, "f-camera-chan") +
+        '<button class="b-camera-chan"' + (d.channels.length >= 8 ? " disabled" : "") +
+        ">Add channel</button></div>"
+      : '<p class="hint">Only the camera’s owner picks its channels.</p>';
+    const owner = d.owned_by_me ? "" :
+      '<span class="sub-note">shared by ' + esc(d.owner_name) + "</span>";
+    return '<div class="sub camera-attachment" data-id="' + d.id + '">' +
+      '<div class="head"><b>' + ico("camera") + esc(d.name) + "</b>" + owner +
+      '<div class="badges">' + cameraBadge(d) + '<span class="badge">camera feed</span>' +
+      '<button class="subtle danger b-camera-detach">Detach</button></div></div>' +
+      '<div class="section"><label># Channels</label>' + chips + picker + "</div></div>";
+  }).join("");
+}
+
+function bindCameraAttachments(g, el) {
+  el.querySelectorAll(".camera-attachment").forEach((row) => {
+    const base = "/api/devices/" + row.dataset.id;
+    const add = row.querySelector(".b-camera-chan");
+    if (add) {
+      add.onclick = async () => {
+        const box = row.querySelector(".f-camera-chan");
+        if (box.disabled || !box.value) return;
+        try {
+          await api(base + "/channels", { method: "POST",
+            body: JSON.stringify({ guild_id: g.id, channel_id: box.value }) });
+          toast("Channel added");
+          renderAll("delivery");
+        } catch (e) { toast(e.message); }
+      };
+    }
+    row.querySelectorAll(".rm-camera-route").forEach((btn) => {
+      btn.onclick = async () => {
+        try {
+          await api(base + "/channels/" + btn.dataset.route, { method: "DELETE" });
+          toast("Channel removed");
+          renderAll("delivery");
+        } catch (e) { toast(e.message); }
+      };
+    });
+    row.querySelector(".b-camera-detach").onclick = async () => {
+      if (!confirm("Detach this camera? Its channel links on this server will be removed.")) return;
+      try {
+        await api(base + "/attachments/" + g.id, { method: "DELETE" });
+        toast("Detached");
+        renderAll("delivery");
+      } catch (e) { toast(e.message); }
+    };
+  });
 }
 
 // ---------- My telescopes ----------
@@ -711,6 +840,7 @@ function ico(name) {
     key: '<path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>',
     share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>',
     globe: '<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
+    camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
     clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
     zap: '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
   };
@@ -821,11 +951,12 @@ function roleChips(options, selected) {
 }
 
 async function renderAttachments(g, el) {
-  let data, options;
+  let data, options, cameras;
   try {
-    [data, options] = await Promise.all([
+    [data, options, cameras] = await Promise.all([
       api("/api/guilds/" + g.id + "/attachments"),
       api("/api/guilds/" + g.id + "/options"),
+      api("/api/guilds/" + g.id + "/devices"),
     ]);
   } catch (e) { el.innerHTML = '<p class="error">' + esc(e.message) + "</p>"; return; }
 
@@ -868,9 +999,10 @@ async function renderAttachments(g, el) {
       commands +
       "</div>";
   }
-  if (!data.attachments.length) {
-    html += '<p class="hint" style="margin:.8rem 0 0">No telescopes attached. Add yours ' +
-      "from “My telescopes”, or use a share code below.</p>";
+  html += renderCameraAttachments(g, cameras.devices, options);
+  if (!data.attachments.length && !cameras.devices.length) {
+    html += '<p class="hint" style="margin:.8rem 0 0">Nothing attached. Add telescopes and ' +
+      "pier cameras from “Observatory devices”, or use a share code below.</p>";
   }
   html +=
     '<details class="redeem"><summary>Use a share code</summary>' +
@@ -879,6 +1011,7 @@ async function renderAttachments(g, el) {
     channelPicker(options, usedChannels, "sub-channel") +
     '<button class="b-subscribe">Subscribe</button></div></details>';
   el.innerHTML = html;
+  bindCameraAttachments(g, el);
 
   el.querySelector(".b-subscribe").onclick = async () => {
     const code = el.querySelector(".share-code").value.trim();
@@ -1164,8 +1297,8 @@ mod tests {
         assert!(INDEX_HTML.contains("function showToken(row"));
         assert!(INDEX_HTML.contains("token-head"));
         assert!(INDEX_HTML.contains("b-close"));
-        // Exactly one token-out container, inside the telescope template.
-        assert_eq!(INDEX_HTML.matches("class=\"token-out\"").count(), 1);
+        // One token-out container each in the telescope and camera templates.
+        assert_eq!(INDEX_HTML.matches("class=\"token-out\"").count(), 2);
     }
 
     #[test]
@@ -1195,21 +1328,34 @@ mod tests {
     }
 
     #[test]
-    fn device_pairing_is_separate_and_server_managers_can_remove_feeds() {
+    fn cameras_follow_the_telescope_setup_flow() {
         assert!(INDEX_HTML.contains("Observatory devices"));
         assert!(INDEX_HTML.contains("mine.telescopes.length + devices.devices.length"));
+        // Same four steps and cues as telescopes: attach, pick channels in
+        // Discord delivery, then pair the device.
         for text in [
-            "Pier cameras &amp; devices",
-            "No telescope control",
-            "Enter in AutoPierCam, not N.I.N.A.",
-            "/api/devices",
-            "function renderDeviceFeeds",
-            "Remove feed",
-            "Revoke this camera and all unused pairing codes?",
+            "<b>4</b> Pair AutoPierCam",
+            "Attach to server",
+            "Pick a channel for camera images.",
+            "paste it into ' +\n      \"AutoPierCam.",
+            "Paste into AutoPierCam, not N.I.N.A.",
+            "Reset camera access",
+            "https://github.com/theatrus/autopiercam",
+            "Refresh camera status",
         ] {
             assert!(INDEX_HTML.contains(text), "missing {text}");
         }
-        assert!(INDEX_HTML.contains("row.querySelector('.device-token').textContent"));
-        assert!(INDEX_HTML.contains("if (guild.value !== selected) return"));
+        // Pairing codes use the shared copyable token box.
+        assert!(INDEX_HTML.contains("showToken(row, \"key\", \"Pairing code — single use, valid \" +\n          Math.round(out.expires_in_seconds / 60) + \" minutes\", out.pairing_token"));
+        // Server cards list cameras beside telescopes; managers can detach,
+        // only owners pick channels.
+        for text in [
+            "api(\"/api/guilds/\" + g.id + \"/devices\")",
+            "base + \"/attachments/\" + g.id",
+            "Only the camera’s owner picks its channels.",
+            "rm-camera-route",
+        ] {
+            assert!(INDEX_HTML.contains(text), "missing {text}");
+        }
     }
 }
