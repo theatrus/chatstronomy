@@ -182,6 +182,13 @@ impl DeviceConnections {
         self.0.lock().is_ok_and(|c| c.contains_key(&id))
     }
 
+    /// Whether the live connection advertised local snapshot consent.
+    pub fn snapshots_shared(&self, id: i64) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|c| c.get(&id).is_some_and(|c| c.snapshots))
+    }
+
     pub fn disconnect(&self, id: i64) {
         if let Ok(c) = self.0.lock()
             && let Some(c) = c.get(&id)
@@ -745,6 +752,7 @@ mod tests {
         .unwrap();
         db.register_guild(10, "Observatory", 1).unwrap();
         let device = db.create_device(1, "Pier", DeviceKind::PierCamera).unwrap();
+        db.attach_device(device.id, 10, 1).unwrap();
         db.add_device_channel(device.id, 10, 100, "pier").unwrap();
         let installation = Uuid::new_v4();
         let token = db.issue_device_token(device.id).unwrap();

@@ -35,6 +35,12 @@ pub struct DeviceChannel {
     pub channel_name: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceAttachment {
+    pub guild_id: String,
+    pub guild_name: String,
+}
+
 fn device_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
     Ok(Device {
         id: row.get(0)?,
@@ -156,14 +162,80 @@ impl Db {
         }))?.collect())
     }
 
+    /// Channels can only be added in a server the device is attached to.
+    /// Returns false when it is not attached there.
     pub fn add_device_channel(
         &self,
         device: i64,
         guild: i64,
         channel: i64,
         name: &str,
-    ) -> Result<(), DbError> {
-        self.with_conn(|c| c.execute("INSERT INTO device_channels(device_id,guild_id,channel_id,channel_name) VALUES(?1,?2,?3,?4) ON CONFLICT(device_id,channel_id) DO NOTHING",params![device,guild,channel,name]).map(|_|()))
+    ) -> Result<bool, DbError> {
+        self.with_conn(|c| {
+            let attached: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM device_attachments WHERE device_id=?1 AND guild_id=?2)",
+                params![device, guild],
+                |r| r.get(0),
+            )?;
+            if attached {
+                c.execute("INSERT INTO device_channels(device_id,guild_id,channel_id,channel_name) VALUES(?1,?2,?3,?4) ON CONFLICT(device_id,channel_id) DO NOTHING",params![device,guild,channel,name])?;
+            }
+            Ok(attached)
+        })
+    }
+
+    /// Returns false when the device is already attached to that server.
+    pub fn attach_device(&self, device: i64, guild: i64, by: i64) -> Result<bool, DbError> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO device_attachments(device_id,guild_id,attached_by,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(device_id,guild_id) DO NOTHING",
+                params![device, guild, by, unix_now()],
+            )
+            .map(|n| n == 1)
+        })
+    }
+
+    /// Removes the attachment and every channel link in that server.
+    pub fn detach_device(&self, device: i64, guild: i64) -> Result<bool, DbError> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM device_channels WHERE device_id=?1 AND guild_id=?2",
+                params![device, guild],
+            )?;
+            let removed = tx.execute(
+                "DELETE FROM device_attachments WHERE device_id=?1 AND guild_id=?2",
+                params![device, guild],
+            )?;
+            tx.commit()?;
+            Ok(removed == 1)
+        })
+    }
+
+    pub fn device_attachments(&self, device: i64) -> Result<Vec<DeviceAttachment>, DbError> {
+        self.with_conn(|c| {
+            c.prepare(
+                "SELECT a.guild_id, g.name FROM device_attachments a JOIN guilds g ON g.guild_id=a.guild_id WHERE a.device_id=?1 ORDER BY a.id",
+            )?
+            .query_map([device], |r| {
+                Ok(DeviceAttachment {
+                    guild_id: super::discord_api::snowflake_string(r.get(0)?),
+                    guild_name: r.get(1)?,
+                })
+            })?
+            .collect()
+        })
+    }
+
+    /// Devices attached to a server, with their owners' display names.
+    pub fn guild_devices(&self, guild: i64) -> Result<Vec<(Device, String)>, DbError> {
+        self.with_conn(|c| {
+            c.prepare(&format!(
+                "SELECT {DEVICE_COLUMNS}, u.username FROM device_attachments a JOIN devices d ON d.id=a.device_id JOIN users u ON u.discord_user_id=d.owner_id WHERE a.guild_id=?1 ORDER BY a.id"
+            ))?
+            .query_map([guild], |r| Ok((device_row(r)?, r.get(4)?)))?
+            .collect()
+        })
     }
 
     pub fn delete_device_channel(&self, device: i64, route: i64) -> Result<(), DbError> {
@@ -250,5 +322,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn channels_require_an_attachment_and_detach_removes_them() {
+        let (db, d) = fixture();
+        db.register_guild(10, "Observatory", 1).unwrap();
+        assert!(!db.add_device_channel(d.id, 10, 100, "pier").unwrap());
+        assert!(db.device_channels(d.id).unwrap().is_empty());
+        assert!(db.attach_device(d.id, 10, 1).unwrap());
+        assert!(!db.attach_device(d.id, 10, 1).unwrap());
+        assert!(db.add_device_channel(d.id, 10, 100, "pier").unwrap());
+        assert_eq!(
+            db.device_attachments(d.id).unwrap()[0].guild_name,
+            "Observatory"
+        );
+        let listed = db.guild_devices(10).unwrap();
+        assert_eq!((listed[0].0.id, listed[0].1.as_str()), (d.id, "owner"));
+        assert!(db.detach_device(d.id, 10).unwrap());
+        assert!(db.device_channels(d.id).unwrap().is_empty());
+        assert!(db.device_attachments(d.id).unwrap().is_empty());
+        assert!(!db.detach_device(d.id, 10).unwrap());
     }
 }

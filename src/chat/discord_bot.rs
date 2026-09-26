@@ -431,6 +431,9 @@ pub async fn run_bot(
         "abort_capture",
         "stop_sequence",
         "start_sequence",
+        // Owner-only pier-camera sharing (a group keeps this at Discord's
+        // 25-subcommand limit)
+        "piercam",
     )
 )]
 async fn chatstronomy(_ctx: Context<'_>) -> Result<(), BotError> {
@@ -439,7 +442,7 @@ async fn chatstronomy(_ctx: Context<'_>) -> Result<(), BotError> {
 }
 
 fn phase1_commands() -> Vec<poise::Command<BotData, BotError>> {
-    vec![chatstronomy(), piercam()]
+    vec![chatstronomy()]
 }
 
 /// Owner-only pier-camera image sharing (never camera hardware control).
@@ -452,7 +455,7 @@ async fn piercam(_ctx: Context<'_>) -> Result<(), BotError> {
 #[poise::command(slash_command, rename = "snapshot")]
 async fn camera_snapshot(
     ctx: Context<'_>,
-    #[description = "Your camera's exact Hub name"] camera: String,
+    #[description = "Camera name; defaults to your camera in this channel"] camera: Option<String>,
 ) -> Result<(), BotError> {
     camera_command(ctx, camera, None).await
 }
@@ -462,7 +465,6 @@ async fn camera_snapshot(
 #[allow(clippy::too_many_arguments)] // Poise requires one parameter per typed slash option.
 async fn camera_triggers(
     ctx: Context<'_>,
-    #[description = "Your camera's exact Hub name"] camera: String,
     #[description = "Periodic interval in minutes; 0 disables"]
     #[min = 0]
     #[max = 1440]
@@ -480,6 +482,7 @@ async fn camera_triggers(
     #[min = 60]
     #[max = 600]
     spacing_seconds: u16,
+    #[description = "Camera name; defaults to your camera in this channel"] camera: Option<String>,
 ) -> Result<(), BotError> {
     camera_command(
         ctx,
@@ -498,7 +501,7 @@ async fn camera_triggers(
 
 async fn camera_command(
     ctx: Context<'_>,
-    camera: String,
+    camera: Option<String>,
     rules: Option<super::CameraTriggerRules>,
 ) -> Result<(), BotError> {
     ctx.defer_ephemeral().await?;
@@ -507,7 +510,7 @@ async fn camera_command(
     let response = match ctx
         .data()
         .resolver
-        .camera_command(&invocation, &camera, rules)
+        .camera_command(&invocation, camera.as_deref(), rules)
         .await
     {
         Ok(()) if configuring => {
@@ -2147,9 +2150,21 @@ mod tests {
     #[test]
     fn autofocus_and_sequence_commands_are_registered_for_the_shared_bot() {
         let commands = phase1_commands();
-        let cameras = commands.iter().find(|c| c.name == "piercam").unwrap();
+        assert_eq!(
+            commands.len(),
+            1,
+            "camera commands live under /chatstronomy"
+        );
+        let cameras = commands[0]
+            .subcommands
+            .iter()
+            .find(|c| c.name == "piercam")
+            .unwrap();
         for name in ["snapshot", "triggers"] {
             let command = cameras.subcommands.iter().find(|c| c.name == name).unwrap();
+            // Optional options must follow required ones.
+            let camera = command.parameters.last().unwrap();
+            assert_eq!((camera.name.as_str(), camera.required), ("camera", false));
             assert!(command.description.as_ref().unwrap().chars().count() <= 100);
             assert!(
                 command

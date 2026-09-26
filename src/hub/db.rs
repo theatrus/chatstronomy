@@ -317,6 +317,20 @@ const MIGRATIONS: &[&str] = &[
         FOREIGN KEY(device_id,event_id) REFERENCES device_events(device_id,event_id) ON DELETE CASCADE
     ) STRICT;
     CREATE INDEX idx_device_events_received ON device_events(received_at);",
+    // V13: devices attach to a server before choosing its channels, like
+    // telescopes. Existing channel links imply an owner-made attachment.
+    "CREATE TABLE device_attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+        attached_by INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(device_id, guild_id)
+    ) STRICT;
+    CREATE INDEX idx_device_attachments_guild ON device_attachments(guild_id);
+    INSERT INTO device_attachments(device_id, guild_id, attached_by, created_at)
+        SELECT DISTINCT dc.device_id, dc.guild_id, d.owner_id, d.created_at
+        FROM device_channels dc JOIN devices d ON d.id = dc.device_id;",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -511,6 +525,42 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upgrade_to_v13_attaches_devices_to_their_routed_servers() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(12).enumerate() {
+            conn.execute_batch(&format!(
+                "BEGIN;\n{sql}\nPRAGMA user_version = {};\nCOMMIT;",
+                i + 1
+            ))
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO users (discord_user_id, username, created_at, last_auth_at)
+                 VALUES (1, 'owner', 0, 0);
+             INSERT INTO guilds (guild_id, name, registered_by, created_at, updated_at)
+                 VALUES (100, 'a', 1, 0, 0), (200, 'b', 1, 0, 0);
+             INSERT INTO devices (owner_id, name, kind, created_at)
+                 VALUES (1, 'Pier', 'pier_camera', 5), (1, 'Unrouted', 'pier_camera', 6);
+             INSERT INTO device_channels (device_id, guild_id, channel_id, channel_name)
+                 VALUES (1, 100, 10, 'x'), (1, 100, 11, 'y'), (1, 200, 20, 'z');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let rows: Vec<(i64, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT device_id, guild_id, attached_by, created_at
+                 FROM device_attachments ORDER BY guild_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(1, 100, 1, 5), (1, 200, 1, 5)]);
     }
 
     #[test]
