@@ -8167,7 +8167,8 @@ mod tests {
                 "DecString": "-12:30:00",
                 "Epoch": "J2000",
                 "Altitude": 31.25,
-                "Azimuth": 127.5
+                "Azimuth": 127.5,
+                "SideOfPier": "East"
             },
             "Target": {
                 "RAString": "03:30:00",
@@ -8192,7 +8193,8 @@ mod tests {
                 "DecString": "-12:30:00",
                 "Epoch": "J2000",
                 "Altitude": 31.25,
-                "Azimuth": 127.5
+                "Azimuth": 127.5,
+                "SideOfPier": "East"
             },
             "Target": {
                 "RAString": "03:30:00",
@@ -8204,7 +8206,8 @@ mod tests {
                 "DecString": "+21:59:58",
                 "Epoch": "J2000",
                 "Altitude": 52.0,
-                "Azimuth": 201.75
+                "Azimuth": 201.75,
+                "SideOfPier": "West"
             },
             "DurationSeconds": 12.25,
             "EndDetection": "motion_state"
@@ -8245,6 +8248,7 @@ mod tests {
         let start_position = message_field(mount_start_message, "From position").unwrap();
         assert!(start_position.contains("RA 01:15:00 · Dec -12:30:00 (J2000)"));
         assert!(start_position.contains("Alt 31.25° · Az 127.50°"));
+        assert!(start_position.contains("Pier side: East"));
         assert!(message_field(mount_start_message, "Start position").is_none());
         assert!(
             message_field(mount_start_message, "Requested destination")
@@ -8256,9 +8260,15 @@ mod tests {
         assert!(mount_end_message.title.contains("Mount Slew Ended"));
         assert!(!mount_end_message.title.contains("Completed"));
         assert!(message_field(mount_end_message, "From position").is_some());
+        assert!(
+            message_field(mount_end_message, "From position")
+                .unwrap()
+                .contains("Pier side: East")
+        );
         let end_position = message_field(mount_end_message, "To position").unwrap();
         assert!(end_position.contains("RA 03:29:59 · Dec +21:59:58 (J2000)"));
         assert!(end_position.contains("Alt 52.00° · Az 201.75°"));
+        assert!(end_position.contains("Pier side: West"));
         assert!(message_field(mount_end_message, "End position").is_none());
         assert_eq!(
             message_field(mount_end_message, "Observed interval"),

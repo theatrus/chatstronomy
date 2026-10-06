@@ -605,6 +605,8 @@ pub struct EventCoordinates {
     pub altitude: Option<f64>,
     #[serde(rename = "Azimuth", default)]
     pub azimuth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_of_pier: Option<String>,
 }
 
 impl EventCoordinates {
@@ -658,11 +660,23 @@ impl EventCoordinates {
     }
 
     pub fn display(&self) -> String {
-        [self.equatorial_display(), self.horizontal_display()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("\n")
+        let pier_side = self.side_of_pier.as_deref().map(|side| {
+            let side = match side.trim().to_ascii_lowercase().as_str() {
+                "east" | "piereast" => "East",
+                "west" | "pierwest" => "West",
+                _ => "Unknown",
+            };
+            format!("Pier side: {side}")
+        });
+        [
+            self.equatorial_display(),
+            self.horizontal_display(),
+            pier_side,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n")
     }
 }
 
@@ -2290,8 +2304,38 @@ mod tests {
             epoch: Some("  ".to_string()),
             altitude: None,
             azimuth: None,
+            side_of_pier: None,
         };
         assert_eq!(blank_strings.display(), "RA 1.50000 h · Dec -2.25000°");
+    }
+
+    #[test]
+    fn coordinate_pier_side_is_optional_and_normalized_for_chat() {
+        let legacy: EventCoordinates = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(legacy.side_of_pier, None);
+        assert_eq!(legacy.display(), "");
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("SideOfPier")
+                .is_none()
+        );
+
+        for (input, expected) in [
+            ("East", "East"),
+            ("West", "West"),
+            (" pierEast ", "East"),
+            ("PIERWEST", "West"),
+            ("pierUnknown", "Unknown"),
+            ("Unknown", "Unknown"),
+            ("unsupported", "Unknown"),
+        ] {
+            let coordinates: EventCoordinates = serde_json::from_value(serde_json::json!({
+                "SideOfPier": input
+            }))
+            .unwrap();
+            assert_eq!(coordinates.display(), format!("Pier side: {expected}"));
+        }
     }
 
     #[test]
@@ -2310,6 +2354,7 @@ mod tests {
                 epoch: None,
                 altitude: None,
                 azimuth: None,
+                side_of_pier: Some("East".to_string()),
             },
             to: EventCoordinates {
                 ra: Some(3.0),
@@ -2320,6 +2365,7 @@ mod tests {
                 epoch: None,
                 altitude: None,
                 azimuth: None,
+                side_of_pier: Some("West".to_string()),
             },
             target: None,
             motion_id: Some(44),
@@ -2329,6 +2375,10 @@ mod tests {
         };
         let decoded = roundtrip(mount_details);
         assert!(matches!(decoded, EventDetails::MountSlewed { .. }));
+        if let EventDetails::MountSlewed { from, to, .. } = decoded {
+            assert_eq!(from.side_of_pier.as_deref(), Some("East"));
+            assert_eq!(to.side_of_pier.as_deref(), Some("West"));
+        }
 
         let legacy_rotator_details = EventDetails::RotatorMoved {
             from: Some(12.0),
