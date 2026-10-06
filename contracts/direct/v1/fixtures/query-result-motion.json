@@ -16,7 +16,8 @@
             "Dec": 30,
             "Epoch": "J2000",
             "Altitude": 25,
-            "Azimuth": 110
+            "Azimuth": 110,
+            "SideOfPier": "East"
           },
           "Target": {
             "RA": 3,
@@ -36,7 +37,8 @@
             "Dec": 30,
             "Epoch": "J2000",
             "Altitude": 25,
-            "Azimuth": 110
+            "Azimuth": 110,
+            "SideOfPier": "East"
           },
           "Target": {
             "RA": 3,
@@ -50,7 +52,8 @@
             "Dec": 40,
             "Epoch": "J2000",
             "Altitude": 35,
-            "Azimuth": 130
+            "Azimuth": 130,
+            "SideOfPier": "West"
           },
           "DurationSeconds": 12,
           "EndDetection": "motion_state"
@@ -139,7 +142,8 @@
             "RA": 4,
             "RADegrees": 60,
             "Dec": 50,
-            "Epoch": "J2000"
+            "Epoch": "J2000",
+            "SideOfPier": "Unknown"
           },
           "EndDetection": "nina_slewed",
           "ObservedInProgress": true
