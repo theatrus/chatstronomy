@@ -56,12 +56,16 @@ Payload version 3 also permits additive motion diagnostics. A plugin may emit
 `ROTATOR-MOVE-STARTED` before the existing `ROTATOR-MOVED` or
 `ROTATOR-MOVED-MECHANICAL` event. Motion IDs, requested targets, observed
 logical/mechanical positions, elapsed observation time, and end-detection provenance are
-optional so older completion payloads remain valid. State-observed mount starts
-and ends can carry altitude and azimuth only when the N.I.N.A. profile permits
+optional so older completion payloads remain valid. Observed mount endpoints may
+include `SideOfPier` (`East`, `West`, or `Unknown`), independently of location
+sharing. Receivers also accept N.I.N.A.'s `pierEast`/`pierWest`/`pierUnknown`
+spellings; an omitted field does not invent a pier side for older payloads.
+State-observed mount starts and ends can carry altitude and azimuth only when the N.I.N.A. profile permits
 location sharing. A callback-only recovery sets `ObservedInProgress`, carries no
 inferred duration, and lets the receiver label the reconstructed pair
 accordingly. Because N.I.N.A.'s completion callback has no start timestamp, its
-recovered `From` position contains RA/Dec but no historical altitude or azimuth.
+recovered `From` position contains RA/Dec but no historical altitude, azimuth,
+or pier side. The available live ending snapshot can still include pier side.
 
 `fixtures/query-result-motion.json` covers state-observed and callback-recovered
 motion, including a location-redacted mount pair. The frozen
