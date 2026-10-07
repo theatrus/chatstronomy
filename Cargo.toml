@@ -31,12 +31,6 @@ async-trait = "0.1"
 mime = "0.3"
 thiserror = "2.0"
 uuid = { version = "1", features = ["serde", "v4"] }
-# Guiding graph rendering. Minimal feature set: PNG bitmap output with the
-# pure-Rust ab_glyph text path so no system font libraries are needed on
-# Windows/ARM release builds (the font itself is embedded from assets/).
-plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "ab_glyph"] }
-# In-memory PNG encoding for the rendered chart (plotters only writes files)
-png = "0.18"
 # Discord bot stack. Note: serenity 0.12 pins tokio-tungstenite 0.21
 # → rustls 0.22 → an old rustls-webpki line. The associated RUSTSEC
 # advisories (-0049/-0098/-0099/-0104) are ignored in `.cargo/audit.toml`
@@ -59,6 +53,8 @@ subtle = { version = "2", optional = true }
 # for the gateway — an upstream limitation, see the audit.toml note.)
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
+# Guiding and autofocus charts: pure Rust, embedded font, in-memory PNG.
+rizzma = { version = "1.13.4", default-features = false }
 
 [dev-dependencies]
 # Deterministic liveness tests advance the Hub's idle deadline without waiting

@@ -26,11 +26,10 @@ release workflow publishes:
 The runtime manifest records the release identity, Direct protocol versions,
 artifact names, sizes, and SHA-256 hashes after signing.
 
-Every Linux archive, Windows ZIP, and plugin-contract archive includes both the
-Apache-2.0 `LICENSE` and the `LiberationSans-LICENSE` notice for the embedded
-chart font. The standalone signed Windows executables remain available for
-existing plugin runtime locks and expose the same embedded notices through
-`chatstronomy licenses`.
+Every Linux archive, Windows ZIP, and plugin-contract archive includes the
+Apache-2.0 `LICENSE`. The standalone signed Windows executables remain
+available for existing plugin runtime locks and expose the same embedded
+notice through `chatstronomy licenses`.
 
 ## Plugin follow-up
 

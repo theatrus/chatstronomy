@@ -201,9 +201,8 @@ On Windows the release artifact also contains the plugin-owned local runtime.
 The plugin repository downloads that signed artifact, verifies its checksum and
 signature metadata, and packages it with the N.I.N.A. plugin.
 
-Release archives include the Apache-2.0 application license and the SIL Open
-Font License notice for the embedded Liberation Sans chart font. Standalone
-executables also expose both notices with `chatstronomy licenses`.
+Release archives include the Apache-2.0 application license. Standalone
+executables also expose it with `chatstronomy licenses`.
 
 ## Architecture
 

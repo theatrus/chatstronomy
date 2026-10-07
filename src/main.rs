@@ -63,9 +63,8 @@ async fn main() {
     let result = match Cli::parse().command {
         Commands::Licenses => {
             println!(
-                "Chatstronomy — Apache License 2.0\n\n{}\n\nLiberation Sans — SIL Open Font License 1.1\n\n{}",
-                include_str!("../LICENSE"),
-                include_str!("../assets/LiberationSans-LICENSE")
+                "Chatstronomy — Apache License 2.0\n\n{}",
+                include_str!("../LICENSE")
             );
             Ok(())
         }

@@ -7,29 +7,30 @@
 //! * the Direct autofocus run — measured HFR
 //!   points with error bars plus initial/calculated position markers.
 //!
-//! Text uses an embedded Liberation Sans (SIL OFL, see
-//! `assets/LiberationSans-LICENSE`) via plotters' `ab_glyph` backend, so
-//! rendering needs no system font libraries on any release target.
+//! Charts are drawn with rizzma, which embeds its own font and encodes PNG in
+//! memory, so rendering needs no system font libraries on any release target.
 
 use crate::autofocus::AutofocusData;
 use crate::guider::GuideStepsHistory;
-use plotters::prelude::*;
-use plotters::style::register_font;
-use std::sync::Once;
+use rizzma::artist::{MarkerStyle, Patch, Rgba};
+use rizzma::{Axes, Figure, RcParams};
 use thiserror::Error;
 
-const WIDTH: u32 = 900;
-const HEIGHT: u32 = 480;
+const RA_COLOR: Rgba = rgb(77, 139, 232);
+const DEC_COLOR: Rgba = rgb(232, 77, 77);
+const DITHER_COLOR: Rgba = rgb(160, 160, 90);
+const HFR_COLOR: Rgba = rgb(96, 189, 232);
+const FOCUS_COLOR: Rgba = rgb(96, 209, 122);
+const FIT_COLOR: Rgba = rgb(213, 143, 255);
 
-const BACKGROUND: RGBColor = RGBColor(24, 26, 31);
-const GRID: RGBColor = RGBColor(58, 62, 70);
-const TEXT: RGBColor = RGBColor(200, 204, 210);
-const RA_COLOR: RGBColor = RGBColor(77, 139, 232);
-const DEC_COLOR: RGBColor = RGBColor(232, 77, 77);
-const DITHER_COLOR: RGBColor = RGBColor(160, 160, 90);
-const HFR_COLOR: RGBColor = RGBColor(96, 189, 232);
-const FOCUS_COLOR: RGBColor = RGBColor(96, 209, 122);
-const FIT_COLOR: RGBColor = RGBColor(213, 143, 255);
+const fn rgb(r: u8, g: u8, b: u8) -> Rgba {
+    Rgba {
+        r: r as f64 / 255.0,
+        g: g as f64 / 255.0,
+        b: b as f64 / 255.0,
+        a: 1.0,
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ChartError {
@@ -39,22 +40,16 @@ pub enum ChartError {
     Render(String),
 }
 
-static FONT_INIT: Once = Once::new();
+/// A 900×480 dark figure with one axes holding the plot.
+fn dark_figure() -> Figure {
+    let mut fig = Figure::new(9.0, 4.8).with_rcparams(RcParams::dark());
+    fig.add_subplot(1, 1, 1);
+    fig
+}
 
-fn ensure_font() {
-    FONT_INIT.call_once(|| {
-        let font = include_bytes!("../assets/LiberationSans-Regular.ttf");
-        for style in [
-            FontStyle::Normal,
-            FontStyle::Bold,
-            FontStyle::Italic,
-            FontStyle::Oblique,
-        ] {
-            // Registration only fails on an invalid font file, which would
-            // be a build asset problem — surface it at render time instead.
-            let _ = register_font("sans-serif", style, font);
-        }
-    });
+fn encode(fig: &Figure) -> Result<Vec<u8>, ChartError> {
+    fig.encode_png()
+        .map_err(|e| ChartError::Render(e.to_string()))
 }
 
 /// Render the guide graph to PNG bytes. Fails when fewer than two guide
@@ -63,7 +58,6 @@ pub fn render_guider_graph_png(history: &GuideStepsHistory) -> Result<Vec<u8>, C
     if !history.has_graph_data() {
         return Err(ChartError::NotEnoughData(history.guide_steps.len()));
     }
-    ensure_font();
 
     let steps = &history.guide_steps;
     let n = steps.len();
@@ -115,135 +109,57 @@ pub fn render_guider_graph_png(history: &GuideStepsHistory) -> Result<Vec<u8>, C
         None => "Guiding".to_string(),
     };
 
-    let mut buffer = vec![0u8; (WIDTH * HEIGHT * 3) as usize];
-    {
-        let root = BitMapBackend::with_buffer(&mut buffer, (WIDTH, HEIGHT)).into_drawing_area();
-        root.fill(&BACKGROUND)
-            .map_err(|e| ChartError::Render(e.to_string()))?;
+    let mut fig = dark_figure();
+    let pulses = fig.twinx(0);
+    let ax: &mut Axes = &mut fig.axes_mut()[0];
+    ax.set_title(title)
+        .set_xlim(0.0, n as f64)
+        .set_ylim(min_y, max_y)
+        .set_xlabel("Guide step")
+        .set_ylabel(format!("Error ({})", unit));
+    ax.yaxis_mut().set_grid(true);
 
-        let mut chart = ChartBuilder::on(&root)
-            .caption(&title, ("sans-serif", 20).into_font().color(&TEXT))
-            .margin(12)
-            .x_label_area_size(32)
-            .y_label_area_size(48)
-            .right_y_label_area_size(56)
-            .build_cartesian_2d(0f64..(n as f64), min_y..max_y)
-            .map_err(|e| ChartError::Render(e.to_string()))?
-            .set_secondary_coord(0f64..(n as f64), -dur_limit..dur_limit);
-
-        chart
-            .configure_mesh()
-            .disable_x_mesh()
-            .bold_line_style(GRID.mix(0.8))
-            .light_line_style(GRID.mix(0.3))
-            .axis_style(GRID)
-            .label_style(("sans-serif", 14).into_font().color(&TEXT))
-            .y_desc(format!("Error ({})", unit))
-            .x_desc("Guide step")
-            .draw()
-            .map_err(|e| ChartError::Render(e.to_string()))?;
-
-        chart
-            .configure_secondary_axes()
-            .axis_style(GRID)
-            .label_style(("sans-serif", 14).into_font().color(&TEXT))
-            .y_desc("Correction (ms)")
-            .draw()
-            .map_err(|e| ChartError::Render(e.to_string()))?;
-
-        // Correction pulses as thin bars on the secondary (ms) axis,
-        // drawn first so the error traces stay on top.
-        let bar_half = 0.18;
-        for (i, s) in steps.iter().enumerate() {
-            let x = i as f64 + 0.5;
-            for (duration, color) in [(s.ra_duration, RA_COLOR), (s.dec_duration, DEC_COLOR)] {
-                if duration.is_finite() && duration != 0.0 {
-                    // Offset RA bars slightly left and Dec bars slightly
-                    // right so simultaneous pulses stay distinguishable.
-                    let shift = if color == RA_COLOR {
-                        -bar_half
-                    } else {
-                        bar_half
-                    };
-                    chart
-                        .draw_secondary_series(std::iter::once(Rectangle::new(
-                            [
-                                (x + shift - bar_half, 0.0),
-                                (x + shift + bar_half, duration),
-                            ],
-                            color.mix(0.35).filled(),
-                        )))
-                        .map_err(|e| ChartError::Render(e.to_string()))?;
-                }
-            }
+    // Dither markers: vertical lines across the error axis.
+    for (i, s) in steps.iter().enumerate() {
+        if GuideStepsHistory::is_dither_step(s) {
+            ax.axvline_with(i as f64 + 0.5, DITHER_COLOR.with_alpha(0.6), 1.0);
         }
-
-        // Dither markers: vertical lines across the error axis.
-        for (i, s) in steps.iter().enumerate() {
-            if GuideStepsHistory::is_dither_step(s) {
-                let x = i as f64 + 0.5;
-                chart
-                    .draw_series(std::iter::once(PathElement::new(
-                        vec![(x, min_y), (x, max_y)],
-                        DITHER_COLOR.mix(0.6),
-                    )))
-                    .map_err(|e| ChartError::Render(e.to_string()))?;
-            }
-        }
-
-        // Error traces. NaN samples (guider gaps) split the trace instead
-        // of drawing bogus segments.
-        for (color, label, values) in [
-            (
-                RA_COLOR,
-                "RA",
-                steps
-                    .iter()
-                    .map(|s| s.ra_distance_raw_display)
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                DEC_COLOR,
-                "Dec",
-                steps
-                    .iter()
-                    .map(|s| s.dec_distance_raw_display)
-                    .collect::<Vec<_>>(),
-            ),
-        ] {
-            for segment in contiguous_finite_runs(&values) {
-                let series = chart
-                    .draw_series(LineSeries::new(
-                        segment
-                            .iter()
-                            .map(|&(i, v)| (i as f64 + 0.5, v))
-                            .collect::<Vec<_>>(),
-                        color.stroke_width(2),
-                    ))
-                    .map_err(|e| ChartError::Render(e.to_string()))?;
-                // Attach the legend entry once per axis, on the first run.
-                if segment.first().map(|&(i, _)| i) == values.iter().position(|v| v.is_finite()) {
-                    series.label(label).legend(move |(x, y)| {
-                        PathElement::new(vec![(x, y), (x + 16, y)], color.stroke_width(2))
-                    });
-                }
-            }
-        }
-
-        chart
-            .configure_series_labels()
-            .position(SeriesLabelPosition::UpperRight)
-            .background_style(BACKGROUND.mix(0.8))
-            .border_style(GRID)
-            .label_font(("sans-serif", 14).into_font().color(&TEXT))
-            .draw()
-            .map_err(|e| ChartError::Render(e.to_string()))?;
-
-        root.present()
-            .map_err(|e| ChartError::Render(e.to_string()))?;
     }
 
-    encode_png(&buffer, WIDTH, HEIGHT)
+    // Error traces. NaN samples (guider gaps) break the line instead of
+    // drawing bogus segments.
+    let x: Vec<f64> = (0..n).map(|i| i as f64 + 0.5).collect();
+    let ra: Vec<f64> = steps.iter().map(|s| s.ra_distance_raw_display).collect();
+    let dec: Vec<f64> = steps.iter().map(|s| s.dec_distance_raw_display).collect();
+    for (color, y) in [(RA_COLOR, ra), (DEC_COLOR, dec)] {
+        ax.plot_with_color(&x, &y, color).set_linewidth(2.0);
+    }
+    ax.legend(vec![(RA_COLOR, "RA".into()), (DEC_COLOR, "Dec".into())]);
+
+    // Correction pulses as thin translucent bars on the right (ms) axis. RA
+    // bars sit slightly left and Dec bars slightly right so simultaneous
+    // pulses stay distinguishable.
+    let ax = &mut fig.axes_mut()[pulses];
+    ax.set_ylim(-dur_limit, dur_limit)
+        .set_ylabel("Correction (ms)");
+    let bar_half = 0.18;
+    for (i, s) in steps.iter().enumerate() {
+        for (duration, color, shift) in [
+            (s.ra_duration, RA_COLOR, -bar_half),
+            (s.dec_duration, DEC_COLOR, bar_half),
+        ] {
+            if duration.is_finite() && duration != 0.0 {
+                let left = i as f64 + 0.5 + shift - bar_half;
+                ax.add_patch(
+                    Patch::rectangle(left, 0.0, 2.0 * bar_half, duration)
+                        .facecolor(Some(color.with_alpha(0.35)))
+                        .edgecolor(None),
+                );
+            }
+        }
+    }
+
+    encode(&fig)
 }
 
 /// Render an autofocus run to PNG bytes: measured HFR vs focuser position
@@ -251,7 +167,7 @@ pub fn render_guider_graph_png(history: &GuideStepsHistory) -> Result<Vec<u8>, C
 /// initial and calculated focus positions. Fails when fewer than two
 /// finite measurement points are present.
 pub fn render_autofocus_graph_png(af: &AutofocusData) -> Result<Vec<u8>, ChartError> {
-    let points: Vec<(f64, f64, f64)> = af
+    let mut points: Vec<(f64, f64, f64)> = af
         .measure_points
         .iter()
         .filter(|p| p.value.is_finite())
@@ -267,39 +183,7 @@ pub fn render_autofocus_graph_png(af: &AutofocusData) -> Result<Vec<u8>, ChartEr
     if points.len() < 2 {
         return Err(ChartError::NotEnoughData(points.len()));
     }
-    ensure_font();
-
-    let initial_pos = af.initial_focus_point.position;
-    let final_pos = af.calculated_focus_point.position;
-    let fit_points: Vec<_> = af
-        .selected_fit_points()
-        .into_iter()
-        .filter(|(_, point)| point.value.is_finite())
-        .collect();
-
-    let x_lo = points
-        .iter()
-        .map(|p| p.0)
-        .chain(fit_points.iter().map(|(_, point)| point.position))
-        .fold(initial_pos.min(final_pos), f64::min);
-    let x_hi = points
-        .iter()
-        .map(|p| p.0)
-        .chain(fit_points.iter().map(|(_, point)| point.position))
-        .fold(initial_pos.max(final_pos), f64::max);
-    let x_pad = ((x_hi - x_lo) * 0.05).max(1.0);
-
-    let y_lo = points
-        .iter()
-        .map(|(_, v, e)| v - e)
-        .chain(fit_points.iter().map(|(_, point)| point.value))
-        .fold(f64::INFINITY, f64::min);
-    let y_hi = points
-        .iter()
-        .map(|(_, v, e)| v + e)
-        .chain(fit_points.iter().map(|(_, point)| point.value))
-        .fold(f64::NEG_INFINITY, f64::max);
-    let y_pad = ((y_hi - y_lo) * 0.1).max(0.1);
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let measurement_name = af.measurement_name();
     let measurement_change = match (af.initial_hfr(), af.final_hfr()) {
@@ -320,150 +204,74 @@ pub fn render_autofocus_graph_png(af: &AutofocusData) -> Result<Vec<u8>, ChartEr
         af.filter_name()
     );
 
-    let mut buffer = vec![0u8; (WIDTH * HEIGHT * 3) as usize];
-    {
-        let root = BitMapBackend::with_buffer(&mut buffer, (WIDTH, HEIGHT)).into_drawing_area();
-        root.fill(&BACKGROUND)
-            .map_err(|e| ChartError::Render(e.to_string()))?;
+    let mut fig = dark_figure();
+    let ax = &mut fig.axes_mut()[0];
+    ax.set_title(title)
+        .set_xlabel("Focuser position")
+        .set_ylabel(measurement_name);
+    ax.grid(true);
 
-        let mut chart = ChartBuilder::on(&root)
-            .caption(&title, ("sans-serif", 18).into_font().color(&TEXT))
-            .margin(12)
-            .x_label_area_size(36)
-            .y_label_area_size(52)
-            .build_cartesian_2d(
-                (x_lo - x_pad)..(x_hi + x_pad),
-                (y_lo - y_pad)..(y_hi + y_pad),
-            )
-            .map_err(|e| ChartError::Render(e.to_string()))?;
+    let markers = [
+        (af.initial_focus_point.position, DITHER_COLOR, "Initial"),
+        (
+            af.calculated_focus_point.position,
+            FOCUS_COLOR,
+            "Calculated",
+        ),
+    ];
+    let fit_points: Vec<_> = af
+        .selected_fit_points()
+        .into_iter()
+        .filter(|(_, point)| point.value.is_finite())
+        .collect();
+    let (x, y): (Vec<f64>, Vec<f64>) = points.iter().map(|&(x, v, _)| (x, v)).unzip();
 
-        chart
-            .configure_mesh()
-            .bold_line_style(GRID.mix(0.8))
-            .light_line_style(GRID.mix(0.3))
-            .axis_style(GRID)
-            .label_style(("sans-serif", 14).into_font().color(&TEXT))
-            .x_desc("Focuser position")
-            .y_desc(measurement_name)
-            .draw()
-            .map_err(|e| ChartError::Render(e.to_string()))?;
+    // Frame every measurement, fit point and position marker.
+    let (x_lo, x_hi) = x
+        .iter()
+        .copied()
+        .chain(fit_points.iter().map(|(_, point)| point.position))
+        .chain(markers.iter().map(|m| m.0))
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            (lo.min(p), hi.max(p))
+        });
+    let x_pad = ((x_hi - x_lo) * 0.05).max(1.0);
+    ax.set_xlim(x_lo - x_pad, x_hi + x_pad);
 
-        // Position markers first so data draws on top of them
-        for (pos, color, label) in [
-            (initial_pos, DITHER_COLOR, "Initial"),
-            (final_pos, FOCUS_COLOR, "Calculated"),
-        ] {
-            chart
-                .draw_series(std::iter::once(PathElement::new(
-                    vec![(pos, y_lo - y_pad), (pos, y_hi + y_pad)],
-                    color.mix(0.7).stroke_width(2),
-                )))
-                .map_err(|e| ChartError::Render(e.to_string()))?
-                .label(label)
-                .legend(move |(x, y)| {
-                    PathElement::new(vec![(x, y), (x + 16, y)], color.stroke_width(2))
-                });
-        }
-
-        // Error bars
-        let cap = x_pad * 0.3;
-        for &(x, v, e) in &points {
-            if e > 0.0 {
-                chart
-                    .draw_series(
-                        [
-                            vec![(x, v - e), (x, v + e)],
-                            vec![(x - cap, v - e), (x + cap, v - e)],
-                            vec![(x - cap, v + e), (x + cap, v + e)],
-                        ]
-                        .into_iter()
-                        .map(|seg| PathElement::new(seg, HFR_COLOR.mix(0.5))),
-                    )
-                    .map_err(|e| ChartError::Render(e.to_string()))?;
-            }
-        }
-
-        // Connecting line through the measurements, then the points
-        let mut sorted = points.clone();
-        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        chart
-            .draw_series(LineSeries::new(
-                sorted.iter().map(|&(x, v, _)| (x, v)),
-                HFR_COLOR.stroke_width(2),
-            ))
-            .map_err(|e| ChartError::Render(e.to_string()))?
-            .label(format!("Measured {measurement_name}"))
-            .legend(|(x, y)| {
-                PathElement::new(vec![(x, y), (x + 16, y)], HFR_COLOR.stroke_width(2))
-            });
-        chart
-            .draw_series(
-                sorted
-                    .iter()
-                    .map(|&(x, v, _)| Circle::new((x, v), 4, HFR_COLOR.filled())),
-            )
-            .map_err(|e| ChartError::Render(e.to_string()))?;
-
-        for (label, point) in fit_points {
-            chart
-                .draw_series(std::iter::once(TriangleMarker::new(
-                    (point.position, point.value),
-                    7,
-                    FIT_COLOR.filled(),
-                )))
-                .map_err(|e| ChartError::Render(e.to_string()))?
-                .label(label)
-                .legend(|(x, y)| TriangleMarker::new((x + 8, y), 5, FIT_COLOR.filled()));
-        }
-
-        chart
-            .configure_series_labels()
-            .position(SeriesLabelPosition::UpperRight)
-            .background_style(BACKGROUND.mix(0.8))
-            .border_style(GRID)
-            .label_font(("sans-serif", 14).into_font().color(&TEXT))
-            .draw()
-            .map_err(|e| ChartError::Render(e.to_string()))?;
-
-        root.present()
-            .map_err(|e| ChartError::Render(e.to_string()))?;
+    // Position markers first so data draws on top of them.
+    let mut legend = Vec::new();
+    for (pos, color, label) in markers {
+        ax.axvline_with(pos, color.with_alpha(0.7), 2.0);
+        legend.push((color, label.to_string()));
     }
 
-    encode_png(&buffer, WIDTH, HEIGHT)
-}
+    // The measurements joined in focuser order, with error bars and points.
+    let first_line = ax.lines().len();
+    let error: Vec<f64> = points.iter().map(|&(_, _, e)| e).collect();
+    ax.errorbar(&x, &y, &error);
+    for (i, line) in ax.lines_mut()[first_line..].iter_mut().enumerate() {
+        match i {
+            0 => line.set_color(HFR_COLOR).set_linewidth(2.0),
+            _ => line.set_color(HFR_COLOR.with_alpha(0.5)),
+        };
+    }
+    let dots = ax.scatter(&x, &y);
+    *dots = dots.clone().with_facecolors(vec![HFR_COLOR]);
+    legend.push((HFR_COLOR, format!("Measured {measurement_name}")));
 
-/// Split a series into runs of consecutive finite samples, keeping the
-/// original indices so gaps stay gaps on the x axis.
-fn contiguous_finite_runs(values: &[f64]) -> Vec<Vec<(usize, f64)>> {
-    let mut runs = Vec::new();
-    let mut current: Vec<(usize, f64)> = Vec::new();
-    for (i, &v) in values.iter().enumerate() {
-        if v.is_finite() {
-            current.push((i, v));
-        } else if !current.is_empty() {
-            runs.push(std::mem::take(&mut current));
-        }
+    let triangle = MarkerStyle::from_char('^').expect("'^' is a known marker");
+    for (label, point) in fit_points {
+        let marker = ax.scatter(&[point.position], &[point.value]);
+        *marker = marker
+            .clone()
+            .with_marker(triangle.path().clone())
+            .with_facecolors(vec![FIT_COLOR])
+            .with_sizes(vec![10.0]);
+        legend.push((FIT_COLOR, label.to_string()));
     }
-    if !current.is_empty() {
-        runs.push(current);
-    }
-    runs
-}
+    ax.legend(legend);
 
-fn encode_png(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, ChartError> {
-    let mut png = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut png, width, height);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| ChartError::Render(e.to_string()))?;
-        writer
-            .write_image_data(rgb)
-            .map_err(|e| ChartError::Render(e.to_string()))?;
-    }
-    Ok(png)
+    encode(&fig)
 }
 
 #[cfg(test)]
@@ -643,13 +451,5 @@ mod tests {
         assert!((before - 3.2493022712759543).abs() < 1e-9);
         let after = af.final_hfr().unwrap();
         assert!((after - 2.90813054456021).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_contiguous_finite_runs() {
-        let runs = contiguous_finite_runs(&[1.0, 2.0, f64::NAN, 3.0]);
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0], vec![(0, 1.0), (1, 2.0)]);
-        assert_eq!(runs[1], vec![(3, 3.0)]);
     }
 }

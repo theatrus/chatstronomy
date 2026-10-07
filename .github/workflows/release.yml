@@ -55,8 +55,7 @@ jobs:
         run: |
           tar -czf "chatstronomy-linux-${{ matrix.arch }}.tar.gz" \
             -C "$GITHUB_WORKSPACE/target/release" chatstronomy \
-            -C "$GITHUB_WORKSPACE" LICENSE \
-            -C "$GITHUB_WORKSPACE/assets" LiberationSans-LICENSE
+            -C "$GITHUB_WORKSPACE" LICENSE
       - name: Upload release asset
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v3
@@ -148,7 +147,7 @@ jobs:
       - shell: pwsh
         run: |
           Copy-Item target/release/chatstronomy.exe chatstronomy-plugin-runtime-windows-x64.exe
-          $notices = @('LICENSE', 'assets/LiberationSans-LICENSE')
+          $notices = @('LICENSE')
           Compress-Archive -Path (@('contracts') + $notices) -DestinationPath chatstronomy-plugin-contracts-v1.zip
           Compress-Archive -Path (@('chatstronomy-windows-x64.exe') + $notices) -DestinationPath chatstronomy-windows-x64.zip
           Compress-Archive -Path (@('chatstronomy-plugin-runtime-windows-x64.exe') + $notices) -DestinationPath chatstronomy-plugin-runtime-windows-x64.zip
