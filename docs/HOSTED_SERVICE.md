@@ -266,6 +266,15 @@ paths, device IDs, images, star lists, optimizer feedback, and complete
 Aberration Inspector analysis remain local.
 Guider graph failures remain non-fatal and the image notification is sent
 without the graph.
+LIGHT-frame posts also show available capture-time focuser temperature/position,
+weather temperature, dew point, and wind. The plugin can request an HFR/star-count
+chart every N LIGHT frames and a nightly summary at sequence end. Charts use
+bounded, in-memory history and do not replay baseline frames or old sequence
+finishes. Sequence-end summaries allow a bounded delay for asynchronous image
+saving. Image sharing controls the readings and charts; the separate weather
+event switches do not govern capture context. Both chart settings are optional.
+[Chart details](NINA_PLUGIN_ARCHITECTURE.md#nightly-image-quality-charts).
+
 Disabled events or images can make state incomplete. Only approved
 notifications are routed to attached Discord channels. Disconnects remove the
 live source; reconnecting with the stored credential replaces the stale session
