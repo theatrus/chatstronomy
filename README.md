@@ -39,6 +39,12 @@ N.I.N.A. Star HFR and Contrast Detection modes and every built-in fit mode are
 supported. Hocus Focus reports add available fit quality, accepted-star range,
 region, validation, and algorithm details; missing Hocus fields fall back to the
 standard N.I.N.A. presentation.
+
+LIGHT-frame posts include available focuser temperature/position and weather
+temperature, dew point, and wind. In the plugin, optionally enable an HFR and
+star-count chart every N LIGHT frames or a nightly chart at sequence end.
+[Chart behavior and compatibility](docs/NINA_PLUGIN_ARCHITECTURE.md#nightly-image-quality-charts).
+
 Supported built-in waits include time, altitude, Moon-altitude, Sun-altitude,
 horizon, and safety waits; supported long-running Sequencer+ waits include
 condition and manual waits. Private condition expressions and pause reasons

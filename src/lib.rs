@@ -16,9 +16,11 @@ mod event_rate_limit;
 pub mod events;
 pub mod filterwheel;
 pub mod focuser;
+mod frame_history;
 pub mod guider;
 #[cfg(feature = "hub")]
 pub mod hub;
+pub mod image_statistics;
 pub mod images;
 pub mod mount;
 pub mod plugin_runtime;
