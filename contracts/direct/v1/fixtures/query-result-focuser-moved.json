@@ -1,0 +1,39 @@
+{
+  "type": "query_result",
+  "payload": {
+    "id": "7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e",
+    "ok": true,
+    "payload": {
+      "Response": [
+        {
+          "Time": "2026-10-11T04:00:00Z",
+          "Event": "FOCUSER-MOVED",
+          "ChatEnabled": true,
+          "From": 30105,
+          "To": 30137,
+          "Temperature": 9.4,
+          "ObservedInProgress": true,
+          "EndDetection": "motion_state"
+        },
+        {
+          "Time": "2026-10-11T04:01:00Z",
+          "Event": "FOCUSER-MOVED",
+          "ChatEnabled": true,
+          "From": 30137,
+          "To": 30140,
+          "ObservedInProgress": false,
+          "EndDetection": "position_change"
+        },
+        {
+          "Time": "2026-10-11T04:02:00Z",
+          "Event": "FOCUSER-USER-FOCUSED"
+        }
+      ],
+      "Error": "",
+      "StatusCode": 200,
+      "Success": true,
+      "Type": "API"
+    },
+    "error": null
+  }
+}
