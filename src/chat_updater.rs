@@ -222,6 +222,14 @@ enum SafetyState {
     Disconnected,
 }
 
+/// An event-time endpoint, not a later driver query or a guarantee that a
+/// requested focus operation succeeded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FocuserObservation {
+    position: i32,
+    temperature: Option<f64>,
+}
+
 impl SafetyState {
     fn status_text(self) -> Option<&'static str> {
         match self {
@@ -234,8 +242,10 @@ impl SafetyState {
     }
 }
 
-fn has_usable_weather_details(event: &Event) -> bool {
+fn has_usable_state_event_details(event: &Event) -> bool {
     match (event.event.as_str(), &event.details) {
+        (event_types::FOCUSER_MOVED, Some(EventDetails::FocuserMoved { to, .. })) => *to >= 0,
+        (event_types::FOCUSER_MOVED, _) => false,
         (event_types::WEATHER_CHANGED, Some(EventDetails::WeatherChanged { conditions, .. })) => {
             !conditions.is_empty()
         }
@@ -713,6 +723,10 @@ struct UpdaterState {
     last_image_time: Option<Instant>,
     skipped_images_count: u32,
     last_filter: Option<FilterInfo>,
+    last_focuser_observation: Option<FocuserObservation>,
+    /// Ordering watermark includes connection and privacy boundaries, so
+    /// delayed history cannot restore an endpoint from the previous epoch.
+    focuser_observation_at: Option<DateTime<Utc>>,
     /// Latest mount-state event we've observed (PARKED, UNPARKED, HOMED, etc.).
     last_mount_event: Option<String>,
     /// Latest guider-state event we've observed (START, STOP, DITHER).
@@ -786,6 +800,8 @@ impl UpdaterState {
             last_image_time: None,
             skipped_images_count: 0,
             last_filter: None,
+            last_focuser_observation: None,
+            focuser_observation_at: None,
             last_mount_event: None,
             last_guider_event: None,
             sequence_running: false,
@@ -1020,7 +1036,8 @@ impl UpdaterState {
             .as_ref()
             .map_or("", |failure| failure.error.as_str());
         format!(
-            "t={target}|te={target_end}|f={filter}|m={mount}|g={guider}|w={scheduler_wait}|sr={}|sf={failure}|so={:?}|safe={:?}|dc={:?}|dso={:?}|daz={:?}|dp={:?}|dh={:?}|fc={:?}|fcs={:?}|fl={:?}|fb={:?}|wc={:?}|wx={:?}|wh={:?}|whx={:?}|wht={:?}|sw={:?}|flip={flip_minutes}|ops={}",
+            "t={target}|te={target_end}|f={filter}|focus={:?}|m={mount}|g={guider}|w={scheduler_wait}|sr={}|sf={failure}|so={:?}|safe={:?}|dc={:?}|dso={:?}|daz={:?}|dp={:?}|dh={:?}|fc={:?}|fcs={:?}|fl={:?}|fb={:?}|wc={:?}|wx={:?}|wh={:?}|whx={:?}|wht={:?}|sw={:?}|flip={flip_minutes}|ops={}",
+            self.last_focuser_observation,
             self.sequence_running,
             self.sequence_outcome,
             self.safety_state,
@@ -2186,6 +2203,12 @@ impl ChatUpdater {
             EventDeliveryScope::FilterFocuserRotator => {
                 self.state.last_filter = None;
             }
+            EventDeliveryScope::FocuserMotion => {
+                self.state.last_focuser_observation = None;
+                self.state.focuser_observation_at = event_time
+                    .and_then(parse_nina_timestamp)
+                    .map(|timestamp| timestamp.with_timezone(&Utc));
+            }
             EventDeliveryScope::Mount => {
                 self.state.last_mount_event = None;
                 self.state.center_event_seen_at = None;
@@ -2271,13 +2294,39 @@ impl ChatUpdater {
     }
 
     fn apply_event_state(&mut self, event: &Event) -> bool {
-        if !has_usable_weather_details(event) {
+        if !has_usable_state_event_details(event) {
             return false;
         }
         if event.event == event_types::TS_WAITSTART && !self.state.record_scheduler_wait(event) {
             return false;
         }
         match event.event.as_str() {
+            event_types::FOCUSER_CONNECTED
+            | event_types::FOCUSER_DISCONNECTED
+            | event_types::FOCUSER_MOVED => {
+                let occurred_at = parse_nina_timestamp(&event.time)
+                    .map(|timestamp| timestamp.with_timezone(&Utc));
+                if self.state.focuser_observation_at.is_some_and(|latest| {
+                    occurred_at.is_none_or(|occurred_at| occurred_at < latest)
+                }) {
+                    return false;
+                }
+                if event.event == event_types::FOCUSER_MOVED {
+                    if let Some(EventDetails::FocuserMoved {
+                        to, temperature, ..
+                    }) = &event.details
+                    {
+                        self.state.last_focuser_observation = Some(FocuserObservation {
+                            position: *to,
+                            temperature: *temperature,
+                        });
+                        self.state.focuser_observation_at = occurred_at;
+                    }
+                } else {
+                    self.state.last_focuser_observation = None;
+                    self.state.focuser_observation_at = occurred_at;
+                }
+            }
             event_types::MOUNT_PARKED
             | event_types::MOUNT_UNPARKED
             | event_types::MOUNT_HOMED
@@ -2691,7 +2740,7 @@ impl ChatUpdater {
 
         // These names drive durable state and user-visible alerts. Never
         // guess from absent, malformed, or sensor-empty typed details.
-        if !has_usable_weather_details(event) {
+        if !has_usable_state_event_details(event) {
             return false;
         }
 
@@ -2708,13 +2757,13 @@ impl ChatUpdater {
     }
 
     async fn handle_event(&mut self, event: &Event) {
-        if !has_usable_weather_details(event) {
-            return;
-        }
         if !event.chat_enabled {
             if !self.state.has_seen_disabled_event(event) {
                 self.revoke_state_for_disabled_event(&event.event, Some(&event.time));
             }
+            return;
+        }
+        if !has_usable_state_event_details(event) {
             return;
         }
 
@@ -3888,6 +3937,17 @@ impl ChatUpdater {
             parts.push(safety.to_string());
         }
 
+        if let Some(focuser) = self.state.last_focuser_observation {
+            let temperature = focuser
+                .temperature
+                .map(|temperature| format!(" · {temperature:.1} °C"))
+                .unwrap_or_default();
+            parts.push(format!(
+                "🔧 Focuser: {} steps{temperature} (last observed)",
+                focuser.position
+            ));
+        }
+
         let mut dome_detail = Vec::new();
         if let Some(connected) = self.state.dome_connected {
             dome_detail.push(
@@ -4798,6 +4858,39 @@ impl ChatUpdater {
                         );
                     }
                 }
+                EventDetails::FocuserMoved {
+                    from,
+                    to,
+                    temperature,
+                    observed_in_progress,
+                    end_detection,
+                } => {
+                    if let Some(from) = from {
+                        message = message
+                            .field("From position", &format!("{from} steps"), true)
+                            .field(
+                                "Position change",
+                                &format!("{:+} steps", i64::from(*to) - i64::from(*from)),
+                                true,
+                            );
+                    }
+                    message = message.field("To position", &format!("{to} steps"), true);
+                    if let Some(temperature) = temperature {
+                        message =
+                            message.field("Temperature", &format!("{temperature:.1} °C"), true);
+                    }
+                    message = message.field(
+                        "Observation",
+                        if *observed_in_progress && end_detection == "motion_state" {
+                            "Moving → idle observed"
+                        } else if *observed_in_progress {
+                            "Moving state observed; endpoint snapshot"
+                        } else {
+                            "Position change observed; moving state not seen"
+                        },
+                        false,
+                    );
+                }
                 EventDetails::RotatorMoveStarted {
                     position,
                     mechanical_position,
@@ -5266,7 +5359,7 @@ fn get_event_color(event: &str) -> u32 {
         // Focuser events
         event_types::FOCUSER_CONNECTED => colors::GREEN,
         event_types::FOCUSER_DISCONNECTED => colors::RED,
-        event_types::FOCUSER_USER_FOCUSED => colors::PURPLE,
+        event_types::FOCUSER_USER_FOCUSED | event_types::FOCUSER_MOVED => colors::PURPLE,
         event_types::AUTOFOCUS_STARTING => colors::PURPLE,
         event_types::AUTOFOCUS_FINISHED => colors::PURPLE,
         event_types::AUTOFOCUS_POINT_ADDED => colors::PURPLE,
@@ -5448,6 +5541,7 @@ fn get_event_title(event: &str) -> String {
         event_types::TS_TARGETSTART => "🎯 Target Started".to_string(),
         event_types::TS_WAITSTART => "⏳ Target Scheduler wait".to_string(),
         event_types::AUTOFOCUS_POINT_ADDED => "📈 Autofocus Point".to_string(),
+        event_types::FOCUSER_MOVED => "🔧 Focuser position changed".to_string(),
         event_types::ROTATOR_MOVE_STARTED => "🧭 Rotator move started".to_string(),
         event_types::ROTATOR_MOVED => "🧭 Rotator move ended".to_string(),
         event_types::ROTATOR_MOVED_MECHANICAL => "🧭 Rotator mechanical move ended".to_string(),
@@ -8021,6 +8115,161 @@ mod tests {
             .iter()
             .find(|field| field.name == name)
             .map(|field| field.value.as_str())
+    }
+
+    fn focuser_movement_event(time: &str, from: Option<i32>, to: i32, observed: bool) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "Time": time, "Event": "FOCUSER-MOVED", "From": from, "To": to,
+            "Temperature": 9.4, "ObservedInProgress": observed,
+            "EndDetection": if observed { "motion_state" } else { "position_change" }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn focuser_movement_uses_captured_endpoints_without_a_live_driver_query() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let event = focuser_movement_event("2026-10-11T04:00:00Z", Some(30105), 30137, true);
+        // The source intentionally panics on any focuser query. A snapshot
+        // notification must remain valid even if the driver has since moved.
+        updater.process_live_events(vec![event.clone()]).await;
+        updater.process_live_events(vec![event]).await;
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        let message = &deliveries[0].0;
+        assert!(message.title.contains("Focuser position changed"));
+        assert_eq!(message_field(message, "From position"), Some("30105 steps"));
+        assert_eq!(message_field(message, "To position"), Some("30137 steps"));
+        assert_eq!(message_field(message, "Position change"), Some("+32 steps"));
+        assert_eq!(message_field(message, "Temperature"), Some("9.4 °C"));
+        assert_eq!(
+            message_field(message, "Observation"),
+            Some("Moving → idle observed")
+        );
+        assert!(!message.title.to_ascii_lowercase().contains("success"));
+        assert!(!message.title.to_ascii_lowercase().contains("complete"));
+        assert!(
+            updater
+                .format_startup_status()
+                .contains("30137 steps · 9.4 °C (last observed)")
+        );
+    }
+
+    #[tokio::test]
+    async fn focuser_position_only_observations_do_not_invent_start_or_success() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-10-11T04:00:00Z", "Event": "FOCUSER-MOVED", "To": 0,
+            "Temperature": "NaN", "ObservedInProgress": false, "EndDetection": "position_change"
+        }))
+        .unwrap();
+        updater.process_live_events(vec![event]).await;
+        let deliveries = chat_state.deliveries.lock().unwrap();
+        let message = &deliveries[0].0;
+        assert_eq!(message_field(message, "To position"), Some("0 steps"));
+        assert_eq!(message_field(message, "From position"), None);
+        assert_eq!(message_field(message, "Position change"), None);
+        assert_eq!(message_field(message, "Temperature"), None);
+        assert_eq!(
+            message_field(message, "Observation"),
+            Some("Position change observed; moving state not seen")
+        );
+        assert!(
+            !message
+                .fields
+                .iter()
+                .any(|field| field.value.contains("settled"))
+        );
+    }
+
+    #[tokio::test]
+    async fn focuser_baseline_is_silent_and_older_events_do_not_replace_newer_state() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let older = focuser_movement_event("2026-10-11T04:00:00Z", Some(30105), 30137, true);
+        let newer = focuser_movement_event("2026-10-11T04:01:00Z", Some(30137), 30140, false);
+        updater.process_baseline_events(&[newer.clone(), older.clone()]);
+        assert_eq!(
+            updater.state.last_focuser_observation.unwrap().position,
+            30140
+        );
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+        updater.process_live_events(vec![older, newer]).await;
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+
+        let fingerprint = updater.state.status_fingerprint();
+        let next = focuser_movement_event("2026-10-11T04:02:00Z", Some(30140), 30142, false);
+        updater.process_live_events(vec![next]).await;
+        assert_ne!(fingerprint, updater.state.status_fingerprint());
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 1);
+        let stale = focuser_movement_event("2026-10-11T04:00:30Z", Some(30105), 30138, false);
+        updater.process_live_events(vec![stale]).await;
+        assert_eq!(
+            updater.state.last_focuser_observation.unwrap().position,
+            30142
+        );
+        assert_eq!(chat_state.deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn focuser_movement_state_respects_its_own_privacy_and_connection_epoch() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let observation = focuser_movement_event("2026-10-11T04:00:00Z", Some(10), 20, false);
+        updater.process_baseline_events(std::slice::from_ref(&observation));
+        updater.revoke_state_for_disabled_event(event_types::FOCUSER_USER_FOCUSED, None);
+        assert!(
+            updater.state.last_focuser_observation.is_some(),
+            "legacy focus switch is independent"
+        );
+        let mut disabled = observation.clone();
+        disabled.chat_enabled = false;
+        disabled.time = "2026-10-11T04:01:00Z".into();
+        disabled.details = None;
+        updater.process_live_events(vec![disabled]).await;
+        assert!(updater.state.last_focuser_observation.is_none());
+        assert!(!updater.format_startup_status().contains("Focuser:"));
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+
+        let delayed = focuser_movement_event("2026-10-11T04:00:30Z", Some(10), 25, false);
+        updater.process_live_events(vec![delayed]).await;
+        assert!(updater.state.last_focuser_observation.is_none());
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
+
+        let next = focuser_movement_event("2026-10-11T04:02:00Z", Some(20), 30, false);
+        updater.process_baseline_events(&[next]);
+        updater.apply_event_state(&Event {
+            time: "2026-10-11T04:03:00Z".into(),
+            event: event_types::FOCUSER_DISCONNECTED.into(),
+            chat_enabled: true,
+            details: None,
+        });
+        assert!(updater.state.last_focuser_observation.is_none());
+        assert!(
+            !updater.apply_event_state(&observation),
+            "stale pre-disconnect endpoint must not return"
+        );
+        assert!(updater.state.last_focuser_observation.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_focuser_observations_are_accepted_on_wire_but_not_announced() {
+        let (mut updater, chat_state) = recording_test_updater();
+        let events = [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::Value::Null,
+        ]
+        .into_iter()
+        .map(|to| {
+            serde_json::from_value(serde_json::json!({
+                "Time": "2026-10-11T04:00:00Z", "Event": "FOCUSER-MOVED", "To": to,
+                "ObservedInProgress": false, "EndDetection": "position_change"
+            }))
+            .unwrap()
+        })
+        .collect();
+        updater.process_live_events(events).await;
+        assert!(updater.state.last_focuser_observation.is_none());
+        assert!(chat_state.deliveries.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

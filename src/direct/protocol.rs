@@ -657,6 +657,7 @@ mod tests {
             include_str!("../../contracts/direct/v1/fixtures/query-result-autofocus-hocus.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-motion.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-motion-legacy.json"),
+            include_str!("../../contracts/direct/v1/fixtures/query-result-focuser-moved.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-elided-events.json"),
             include_str!("../../contracts/direct/v1/fixtures/query-result-resource-not-ready.json"),
             include_str!("../../contracts/direct/v1/fixtures/heartbeat.json"),
@@ -760,6 +761,43 @@ mod tests {
                 .unwrap()
                 .contains("\"command\"")
         );
+    }
+
+    #[test]
+    fn published_focuser_fixture_preserves_snapshot_and_legacy_callback() {
+        use crate::events::{EventDetails, EventHistoryResponse};
+        let message: DirectMessage = serde_json::from_str(include_str!(
+            "../../contracts/direct/v1/fixtures/query-result-focuser-moved.json"
+        ))
+        .unwrap();
+        let DirectMessage::QueryResult(result) = message else {
+            panic!("expected query result")
+        };
+        let history: EventHistoryResponse = serde_json::from_value(result.payload).unwrap();
+        assert!(history.success);
+        assert_eq!(history.response.len(), 3);
+        assert!(matches!(
+            history.response[0].details,
+            Some(EventDetails::FocuserMoved {
+                from: Some(30105),
+                to: 30137,
+                temperature: Some(9.4),
+                observed_in_progress: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            history.response[1].details,
+            Some(EventDetails::FocuserMoved {
+                from: Some(30137),
+                to: 30140,
+                temperature: None,
+                observed_in_progress: false,
+                ..
+            })
+        ));
+        assert!(history.response[2].details.is_none());
+        assert!(history.response[2].chat_enabled);
     }
 
     #[test]

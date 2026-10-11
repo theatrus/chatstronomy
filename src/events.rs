@@ -1,5 +1,6 @@
 use crate::serde_helpers::{
-    de_f64_tolerant, de_i32_tolerant, de_optional_finite_f64, de_string_tolerant,
+    de_f64_tolerant, de_i32_tolerant, de_optional_finite_f64, de_optional_nonnegative_i32,
+    de_string_tolerant,
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::{Map, Value};
@@ -369,6 +370,22 @@ pub enum EventDetails {
         threshold_meters_per_second: Option<f64>,
         #[serde(flatten)]
         conditions: WeatherConditions,
+    },
+    /// A changed focuser endpoint observed by the plugin, including native
+    /// sequencer moves. Numeric `From`/`To` overlap with rotator payloads, so
+    /// only the event-name-aware `Event` decoder may select this variant.
+    #[serde(skip_deserializing)]
+    FocuserMoved {
+        #[serde(rename = "From", skip_serializing_if = "Option::is_none")]
+        from: Option<i32>,
+        #[serde(rename = "To")]
+        to: i32,
+        #[serde(rename = "Temperature", skip_serializing_if = "Option::is_none")]
+        temperature: Option<f64>,
+        #[serde(rename = "ObservedInProgress")]
+        observed_in_progress: bool,
+        #[serde(rename = "EndDetection")]
+        end_detection: String,
     },
     /// Rotator movement ended. Emitted for both ROTATOR-MOVED and
     /// ROTATOR-MOVED-MECHANICAL. Legacy plugins provide only `{From, To}`;
@@ -807,6 +824,17 @@ struct RotatorMoveStartedWire {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
+struct FocuserMovedWire {
+    #[serde(default, deserialize_with = "de_optional_nonnegative_i32")]
+    from: Option<i32>,
+    to: i32,
+    #[serde(default, deserialize_with = "de_optional_finite_f64")]
+    temperature: Option<f64>,
+    observed_in_progress: bool,
+    end_detection: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
 struct RotatorMovedWire {
     #[serde(default, deserialize_with = "de_optional_finite_f64")]
     from: Option<f64>,
@@ -916,6 +944,15 @@ fn unknown_details(fields: Map<String, Value>) -> Option<EventDetails> {
 
 fn decode_motion_event_details(event: &str, fields: &Map<String, Value>) -> Option<EventDetails> {
     match event {
+        event_types::FOCUSER_MOVED => decode_wire::<FocuserMovedWire>(fields)
+            .filter(|wire| wire.to >= 0)
+            .map(|wire| EventDetails::FocuserMoved {
+                from: wire.from,
+                to: wire.to,
+                temperature: wire.temperature,
+                observed_in_progress: wire.observed_in_progress,
+                end_detection: wire.end_detection,
+            }),
         event_types::ROTATOR_MOVE_STARTED => {
             decode_wire::<RotatorMoveStartedWire>(fields).map(|wire| {
                 EventDetails::RotatorMoveStarted {
@@ -966,7 +1003,8 @@ fn decode_motion_event_details(event: &str, fields: &Map<String, Value>) -> Opti
 fn decode_event_details(event: &str, fields: Map<String, Value>) -> Option<EventDetails> {
     if matches!(
         event,
-        event_types::ROTATOR_MOVE_STARTED
+        event_types::FOCUSER_MOVED
+            | event_types::ROTATOR_MOVE_STARTED
             | event_types::ROTATOR_MOVED
             | event_types::ROTATOR_MOVED_MECHANICAL
             | event_types::MOUNT_SLEW_STARTED
@@ -1217,6 +1255,7 @@ pub mod event_types {
     pub const FOCUSER_DISCONNECTED: &str = "FOCUSER-DISCONNECTED";
     pub const FOCUSER_CONNECTED: &str = "FOCUSER-CONNECTED";
     pub const FOCUSER_USER_FOCUSED: &str = "FOCUSER-USER-FOCUSED";
+    pub const FOCUSER_MOVED: &str = "FOCUSER-MOVED";
     pub const ROTATOR_DISCONNECTED: &str = "ROTATOR-DISCONNECTED";
     pub const ROTATOR_CONNECTED: &str = "ROTATOR-CONNECTED";
     pub const ROTATOR_MOVE_STARTED: &str = "ROTATOR-MOVE-STARTED";
@@ -1288,6 +1327,7 @@ pub(crate) enum EventDeliveryScope {
     HighWindAlerts,
     TargetScheduler,
     FilterFocuserRotator,
+    FocuserMotion,
     RotatorMotion,
     EquipmentConnections,
     Observatory,
@@ -1342,6 +1382,9 @@ pub(crate) fn event_delivery_scope(event: &str) -> EventDeliveryScope {
     }
     if event == event_types::ROTATOR_MOVE_STARTED {
         return EventDeliveryScope::RotatorMotion;
+    }
+    if event == event_types::FOCUSER_MOVED {
+        return EventDeliveryScope::FocuserMotion;
     }
     if event.starts_with("MOUNT-") || event == event_types::ERROR_PLATESOLVE {
         return EventDeliveryScope::Mount;
@@ -2366,6 +2409,90 @@ mod tests {
     }
 
     #[test]
+    fn focuser_movement_is_decoded_by_event_name_without_colliding_with_rotator() {
+        let payload = serde_json::json!({
+            "Time": "2026-10-11T04:00:00Z", "Event": "FOCUSER-MOVED",
+            "From": 30105, "To": 30137, "Temperature": 9.4,
+            "ObservedInProgress": true, "EndDetection": "motion_state"
+        });
+        let event: Event = serde_json::from_value(payload.clone()).unwrap();
+        assert!(matches!(event.details, Some(EventDetails::FocuserMoved {
+            from: Some(30105), to: 30137, temperature: Some(9.4),
+            observed_in_progress: true, ref end_detection
+        }) if end_detection == "motion_state"));
+        assert_eq!(serde_json::to_value(&event).unwrap()["To"], 30137);
+        let decoded: Event = serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+        assert!(matches!(
+            decoded.details,
+            Some(EventDetails::FocuserMoved { .. })
+        ));
+
+        let mut rotator = payload;
+        rotator["Event"] = serde_json::json!("ROTATOR-MOVED");
+        let event: Event = serde_json::from_value(rotator).unwrap();
+        assert!(matches!(
+            event.details,
+            Some(EventDetails::RotatorMoved { .. })
+        ));
+        let legacy: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-10-11T04:00:00Z", "Event": "FOCUSER-USER-FOCUSED"
+        }))
+        .unwrap();
+        assert!(legacy.details.is_none());
+    }
+
+    #[test]
+    fn focuser_movement_accepts_unknown_sensors_but_rejects_invalid_endpoints() {
+        for temperature in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("NaN"),
+            serde_json::json!("Infinity"),
+        ] {
+            let event: Event = serde_json::from_value(serde_json::json!({
+                "Time": "2026-10-11T04:00:00Z", "Event": "FOCUSER-MOVED",
+                "From": -1, "To": 0, "Temperature": temperature,
+                "ObservedInProgress": false, "EndDetection": "position_change"
+            }))
+            .unwrap();
+            assert!(matches!(
+                event.details,
+                Some(EventDetails::FocuserMoved {
+                    from: None,
+                    to: 0,
+                    temperature: None,
+                    observed_in_progress: false,
+                    ..
+                })
+            ));
+        }
+        for endpoint in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(2147483648_i64),
+            serde_json::Value::Null,
+            serde_json::json!([]),
+        ] {
+            let event: Event = serde_json::from_value(serde_json::json!({
+                "Time": "2026-10-11T04:00:00Z", "Event": "FOCUSER-MOVED",
+                "To": endpoint, "ObservedInProgress": false, "EndDetection": "position_change"
+            }))
+            .unwrap();
+            assert!(matches!(event.details, Some(EventDetails::Unknown(_))));
+        }
+        let missing: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-10-11T04:00:00Z", "Event": "FOCUSER-MOVED", "To": 10
+        }))
+        .unwrap();
+        assert!(matches!(missing.details, Some(EventDetails::Unknown(_))));
+        let future: Event = serde_json::from_value(serde_json::json!({
+            "Time": "2026-10-11T04:00:00Z", "Event": "FOCUSER-FUTURE-MOVE", "To": 10
+        }))
+        .unwrap();
+        assert!(matches!(future.details, Some(EventDetails::Unknown(_))));
+    }
+
+    #[test]
     fn event_details_roundtrips_do_not_hit_the_optional_motion_start_arm() {
         fn roundtrip(details: EventDetails) -> EventDetails {
             serde_json::from_value(serde_json::to_value(details).unwrap()).unwrap()
@@ -2628,6 +2755,10 @@ mod tests {
         assert_eq!(
             event_delivery_scope(event_types::FOCUSER_USER_FOCUSED),
             EventDeliveryScope::FilterFocuserRotator
+        );
+        assert_eq!(
+            event_delivery_scope(event_types::FOCUSER_MOVED),
+            EventDeliveryScope::FocuserMotion
         );
         assert_eq!(
             event_delivery_scope(event_types::CHATSTRONOMY_COMMAND_FAILED),

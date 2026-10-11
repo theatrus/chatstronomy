@@ -113,6 +113,21 @@ their own delivery switch. A **Wait Until Safe** operation is visible only when
 both sequence and safety delivery are enabled, and its state comes from the
 safety-monitor mediator rather than a potentially stale sequence item property.
 
+Focuser-motion sharing has its own opt-in switch, separate from legacy
+filter/focuser/rotator messages. The plugin observes focuser position and moving
+state, so native **Move Focuser by Temperature** actions are captured without
+depending on the manual-focus callback. An endpoint is reported after two
+consecutive idle snapshots at the same changed position. These observations
+also include manual and autofocus moves when enabled; the plugin does not guess
+the cause. The additive `FOCUSER-MOVED` event contains captured previous/end
+positions in steps, available focuser temperature, and whether moving was
+observed. The updater uses
+that snapshot, not a later hardware query, and displays the last observed
+endpoint in status. Historical observations seed state silently without
+replaying messages; connection transitions and focuser-motion privacy changes
+clear cached endpoints. A position change or idle observation does not establish
+command success or promise that the hardware has settled.
+
 Sequence snapshots identify N.I.N.A.'s built-in timed, altitude, Moon-altitude,
 Sun-altitude, horizon, and safety waits, camera cooling and warming, mount slews,
 centering, and standalone plate solves. They also identify selected long-running

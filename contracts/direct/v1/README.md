@@ -73,6 +73,25 @@ motion, including a location-redacted mount pair. The frozen
 start events, provenance, and delivery flags. Both use the existing unrestricted
 query-result payload in the v1 envelope schema.
 
+Payload version 3 additionally permits `FOCUSER-MOVED`, an opt-in snapshot of
+a changed focuser endpoint. `To` is a required nonnegative integer in steps;
+`From` is optional and uses the same units. Optional finite `Temperature` is
+in Celsius. `ObservedInProgress` states whether a moving state was actually
+seen. `EndDetection` is `motion_state` when moving then idle were observed, or
+`position_change` when only the changed position was observed. The plugin
+waits for two consecutive idle snapshots at the same position before reporting
+an endpoint; this coalesces brief moving/idle edges but is not a guarantee of
+settling, command success, or the cause of the change. Native temperature
+compensation and sequencer focus moves, manual moves, and autofocus steps can
+all produce these observations when focuser-motion sharing is enabled.
+The independent focuser-motion switch is off by default; the legacy
+filter/focuser/rotator switch and details-less `FOCUSER-USER-FOCUSED` callback
+are unchanged. `fixtures/query-result-focuser-moved.json` covers both observed
+and position-only endpoints plus the legacy callback. The event-name-aware
+decoder distinguishes these integer endpoints from rotator degree values;
+unsupported or malformed details remain wire-compatible without becoming
+guessed focuser state.
+
 An event-history response may include `ElidedEvents`, an array of cumulative
 plugin rate-limit counters. Each entry contains `Event`, optional `Level`,
 `Count` (an unsigned 64-bit integer), and `Epoch` (an opaque identifier for the
