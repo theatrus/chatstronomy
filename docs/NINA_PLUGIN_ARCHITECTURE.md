@@ -53,6 +53,45 @@ default to delivery enabled. The server labels unmarked payloads as legacy
 Direct v1; this is Direct protocol compatibility, not a second data-source
 mode.
 
+The image-history envelope accepts optional `ImageStatistics` settings
+(`EveryNFrames`, where 0 disables periodic charts, and `OnSequenceEnd`). LIGHT
+metadata may include `FocuserTemperature`, `FocuserPosition`,
+`WeatherTemperature`, `DewPoint`, `WindSpeed`, and `WindGust`: Celsius, steps,
+and meters per second respectively. Unavailable readings are omitted, not zero.
+`Timestamp` is offset-aware; `TimestampIsExposureStart` distinguishes a known
+exposure start from fallback save time. `StarDetectionAvailable` distinguishes
+missing analysis from a zero-star measurement. These are additive payload-v3
+extensions: older readers ignore them; older plugins work without the extra
+readings or automatic charts.
+
+### Nightly image-quality charts
+
+In the plugin's **HFR and star-count charts** settings, choose every N LIGHT frames,
+sequence end, or both. Calibration frames do not advance the interval; LIGHT
+frames skipped by ordinary chat cooldown still do. The two-panel PNG plots HFR
+and detected stars against UTC time, with filter colors and gaps for missing
+measurements. Backlogs produce one latest periodic chart, not a flood.
+
+Charts retain up to 2,000 enabled LIGHT frames from the last 24 hours in memory.
+Ordinary same-session reconnects preserve history and cadence. When the updater
+is recreated (for example after a Hub/runtime restart, new plugin session,
+profile/privacy change, or route change), history is reseeded silently from the
+plugin's retained images (up to 500), and the interval starts again. Historical
+sequence-end events never trigger a summary. Both chart settings start disabled.
+
+A live sequence end schedules a nightly summary, not a success claim. Because
+N.I.N.A. saves asynchronously, it waits at least 15 seconds and for 10 seconds
+without another relevant capture, with a 120-second maximum. Known exposure
+timestamps identify late saves from the ended run. Save-time-only payloads get
+a bounded allowance ending at the next sequence start; exact attribution is
+not possible. Later saves can still enter periodic charts. Empty runs do not
+produce summaries.
+
+Image transmission permission controls the extra readings and both charts.
+Disabling it clears chart data and pending summaries; disabling sequence events
+also disables sequence-end summaries. Capture-time weather is part of image
+sharing, independently of weather-change and high-wind event switches.
+
 For compatibility with existing Direct v1 runtimes, position-redacted mount
 snapshots keep their required location-related fields but replace sensitive
 numbers and strings with zero or empty sentinels. The additive

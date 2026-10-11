@@ -40,11 +40,30 @@ mod thumbnail_base64 {
 #[serde(rename_all = "PascalCase")]
 pub struct ImageHistoryResponse {
     pub response: Vec<ImageMetadata>,
+    /// Additive local plugin settings; absent on older peers means no charts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_statistics: Option<ImageStatisticsOptions>,
     pub error: String,
     pub status_code: i32,
     pub success: bool,
     #[serde(rename = "Type")]
     pub response_type: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageStatisticsOptions {
+    /// Zero disables periodic charts. Counts LIGHT frames, not chat posts.
+    #[serde(default)]
+    pub every_n_frames: u32,
+    #[serde(default)]
+    pub on_sequence_end: bool,
+}
+
+impl ImageStatisticsOptions {
+    pub fn enabled(self) -> bool {
+        self.every_n_frames > 0 || self.on_sequence_end
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +89,50 @@ pub struct ImageMetadata {
     #[serde(rename = "HFR")]
     pub hfr: f64,
     pub is_bayered: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::de_optional_finite_f64"
+    )]
+    pub focuser_temperature: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::de_optional_nonnegative_i32"
+    )]
+    pub focuser_position: Option<i32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::de_optional_finite_f64"
+    )]
+    pub weather_temperature: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::de_optional_finite_f64"
+    )]
+    pub dew_point: Option<f64>,
+    /// Capture-time wind readings, in meters per second.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::de_optional_finite_f64"
+    )]
+    pub wind_speed: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::de_optional_finite_f64"
+    )]
+    pub wind_gust: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub star_detection_available: Option<bool>,
+    /// Offset-aware capture time from new plugins; `Date` remains unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_is_exposure_start: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -206,6 +269,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn published_capture_statistics_fixture_decodes_through_direct_v1() {
+        let message: crate::direct::protocol::DirectMessage = serde_json::from_str(include_str!(
+            "../contracts/direct/v1/fixtures/query-result-image-statistics.json"
+        ))
+        .unwrap();
+        let crate::direct::protocol::DirectMessage::QueryResult(result) = message else {
+            panic!("expected query result")
+        };
+        let history: ImageHistoryResponse = serde_json::from_value(result.payload).unwrap();
+        assert_eq!(
+            history.image_statistics,
+            Some(ImageStatisticsOptions {
+                every_n_frames: 10,
+                on_sequence_end: true
+            })
+        );
+        assert_eq!(history.response[0].focuser_position, Some(30105));
+        assert_eq!(history.response[0].weather_temperature, Some(8.2));
+        assert_eq!(history.response[0].timestamp_is_exposure_start, Some(true));
+        assert_eq!(history.response[1].focuser_temperature, None);
+        assert_eq!(history.response[1].star_detection_available, Some(false));
+        assert_eq!(history.response[1].timestamp_is_exposure_start, Some(false));
+    }
+
+    #[test]
+    fn additive_capture_fields_accept_legacy_missing_and_unknown_values() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../example_image-history.json")).unwrap();
+        let legacy: ImageHistoryResponse = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.image_statistics.is_none());
+        assert!(legacy.response[0].focuser_temperature.is_none());
+        assert!(legacy.response[0].timestamp.is_none());
+        value["ImageStatistics"] =
+            serde_json::json!({"EveryNFrames": 10, "OnSequenceEnd": true, "FutureOption": true});
+        value["Response"][0]["FocuserTemperature"] = serde_json::json!("NaN");
+        value["Response"][0]["FocuserPosition"] = serde_json::json!(-1);
+        value["Response"][0]["WeatherTemperature"] = serde_json::json!(-2.5);
+        value["Response"][0]["DewPoint"] = serde_json::json!(null);
+        value["Response"][0]["WindSpeed"] = serde_json::json!([]);
+        value["Response"][0]["WindGust"] = serde_json::json!(3.0);
+        value["Response"][0]["StarDetectionAvailable"] = serde_json::json!(false);
+        value["Response"][0]["Timestamp"] = serde_json::json!("2026-10-10T04:30:00Z");
+        let response: ImageHistoryResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            response.image_statistics,
+            Some(ImageStatisticsOptions {
+                every_n_frames: 10,
+                on_sequence_end: true
+            })
+        );
+        let image = &response.response[0];
+        assert_eq!(image.focuser_temperature, None);
+        assert_eq!(image.focuser_position, None);
+        assert_eq!(image.weather_temperature, Some(-2.5));
+        assert_eq!(image.dew_point, None);
+        assert_eq!(image.wind_speed, None);
+        assert_eq!(image.wind_gust, Some(3.0));
+        assert_eq!(image.star_detection_available, Some(false));
+        assert_eq!(image.timestamp.as_deref(), Some("2026-10-10T04:30:00Z"));
+    }
+
+    #[test]
     fn test_image_metadata_parsing() {
         let image_json = r#"{
             "ExposureTime": 300.0,
@@ -262,6 +387,15 @@ mod tests {
             stars: 200,
             hfr: 2.8,
             is_bayered: false,
+            focuser_temperature: None,
+            focuser_position: None,
+            weather_temperature: None,
+            dew_point: None,
+            wind_speed: None,
+            wind_gust: None,
+            star_detection_available: None,
+            timestamp: None,
+            timestamp_is_exposure_start: None,
         };
 
         assert!(light_frame.is_light_frame());
@@ -286,6 +420,15 @@ mod tests {
             stars: 0,
             hfr: 0.0,
             is_bayered: false,
+            focuser_temperature: None,
+            focuser_position: None,
+            weather_temperature: None,
+            dew_point: None,
+            wind_speed: None,
+            wind_gust: None,
+            star_detection_available: None,
+            timestamp: None,
+            timestamp_is_exposure_start: None,
         };
 
         assert!(!flat_frame.is_light_frame());

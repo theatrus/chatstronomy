@@ -92,6 +92,20 @@ decoder distinguishes these integer endpoints from rotator degree values;
 unsupported or malformed details remain wire-compatible without becoming
 guessed focuser state.
 
+Image-history responses may include `ImageStatistics` with `EveryNFrames`
+(0 disables periodic charts) and `OnSequenceEnd`. Missing settings disable
+automatic charts. These settings are locally controlled and become disabled
+when image transmission is off; summaries also require sequence transmission.
+The additive fields on LIGHT frames are `FocuserTemperature`, `FocuserPosition`,
+`WeatherTemperature`, `DewPoint`, `WindSpeed`, and `WindGust` (Celsius, steps,
+and m/s). Missing sensors omit their fields. `StarDetectionAvailable`
+distinguishes missing analysis from a measured zero-star frame. `Timestamp` is
+offset-aware; `TimestampIsExposureStart` marks whether it is a true exposure
+start or a save-time fallback. The legacy `Date` remains unchanged.
+`fixtures/query-result-image-statistics.json` covers populated and missing
+capture context without changing the envelope or requiring these additions
+from older peers.
+
 An event-history response may include `ElidedEvents`, an array of cumulative
 plugin rate-limit counters. Each entry contains `Event`, optional `Level`,
 `Count` (an unsigned 64-bit integer), and `Epoch` (an opaque identifier for the

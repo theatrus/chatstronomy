@@ -8,6 +8,7 @@ use crate::events::{
     Event, EventDeliveryScope, EventDetails, FilterInfo, TargetCoordinates, WeatherConditions,
     event_delivery_scope, event_types,
 };
+use crate::frame_history::LightFrameHistory;
 use crate::images::ImageMetadata;
 use crate::sequence::{
     PlateSolveOutput, SequenceOperation, SequenceOperationKind, SequenceResponse,
@@ -698,6 +699,40 @@ fn claim_plate_solve_output(
 /// history either side returns in one poll, so nothing is re-announced while
 /// it is still visible in the source history.
 const SEEN_SET_CAPACITY: usize = 20_000;
+const IMAGE_SUMMARY_MIN_DELAY: Duration = Duration::from_secs(15);
+const IMAGE_SUMMARY_QUIET: Duration = Duration::from_secs(10);
+const IMAGE_SUMMARY_MAX_DELAY: Duration = Duration::from_secs(120);
+
+struct PendingImageSummary {
+    started_at: Option<DateTime<Utc>>,
+    finished_at: DateTime<Utc>,
+    next_sequence_at: Option<DateTime<Utc>>,
+    queued_at: TokioInstant,
+    last_image_at: TokioInstant,
+}
+
+impl PendingImageSummary {
+    fn ready(&self, now: TokioInstant) -> bool {
+        let elapsed = now.duration_since(self.queued_at);
+        elapsed >= IMAGE_SUMMARY_MAX_DELAY
+            || (elapsed >= IMAGE_SUMMARY_MIN_DELAY
+                && now.duration_since(self.last_image_at) >= IMAGE_SUMMARY_QUIET)
+    }
+
+    fn includes(&self, point: &crate::image_statistics::ImageStatisticsPoint) -> bool {
+        self.includes_capture(point.captured_at, point.exposure_start_known)
+    }
+
+    fn includes_capture(&self, captured_at: DateTime<Utc>, exposure_start_known: bool) -> bool {
+        captured_at <= self.finished_at
+            || (!exposure_start_known
+                && captured_at.signed_duration_since(self.finished_at)
+                    <= chrono::Duration::seconds(120)
+                && self
+                    .next_sequence_at
+                    .is_none_or(|start| captured_at < start))
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct SchedulerWaitState {
@@ -733,6 +768,7 @@ struct UpdaterState {
     last_guider_event: Option<String>,
     /// True if the last sequence event was STARTING (not FINISHED).
     sequence_running: bool,
+    sequence_started_at: Option<DateTime<Utc>>,
     /// Failure from the current or most recently ended sequence. Cleared by a
     /// subsequent sequence start so a normal finish is never called success.
     sequence_failure: Option<SequenceFailureInfo>,
@@ -805,6 +841,7 @@ impl UpdaterState {
             last_mount_event: None,
             last_guider_event: None,
             sequence_running: false,
+            sequence_started_at: None,
             sequence_failure: None,
             sequence_outcome: None,
             scheduler_wait: None,
@@ -1139,6 +1176,10 @@ pub struct ChatUpdater {
     /// established its baseline, every later event response is a live delta
     /// even if another capability (such as image history) is still offline.
     event_baseline_complete: bool,
+    light_frame_history: LightFrameHistory,
+    /// Live terminal events only. Drain after image polling so the final
+    /// capture is included, even when it arrived in the same poll cycle.
+    pending_image_summaries: Vec<PendingImageSummary>,
 }
 
 struct PendingAutofocusDelivery {
@@ -1199,6 +1240,8 @@ impl ChatUpdater {
             #[cfg(feature = "hub")]
             autofocus_delivery_store: None,
             event_baseline_complete: false,
+            light_frame_history: LightFrameHistory::default(),
+            pending_image_summaries: Vec::new(),
         }
     }
 
@@ -2139,6 +2182,9 @@ impl ChatUpdater {
         // Load images
         if capabilities.image_history {
             let images = self.source.get_all_image_history().await?;
+            let now = Utc::now();
+            self.light_frame_history
+                .configure(images.image_statistics.unwrap_or_default(), now);
             let privacy_boundary = images
                 .response
                 .iter()
@@ -2149,7 +2195,9 @@ impl ChatUpdater {
                 }
                 if image.chat_enabled {
                     let key = self.state.image_key(image);
-                    self.state.images_seen.insert(key);
+                    if !self.state.images_seen.check_and_insert(key) {
+                        self.record_light_frame(image, now, false);
+                    }
                 }
             }
         }
@@ -2231,6 +2279,8 @@ impl ChatUpdater {
                 self.state.last_guider_event = None;
             }
             EventDeliveryScope::Sequence => {
+                self.state.sequence_started_at = None;
+                self.pending_image_summaries.clear();
                 self.state.sequence_running = false;
                 self.state.sequence_failure = None;
                 self.state.sequence_outcome = None;
@@ -2269,6 +2319,8 @@ impl ChatUpdater {
             EventDeliveryScope::Images => {
                 self.state.last_image_time = None;
                 self.state.skipped_images_count = 0;
+                self.light_frame_history.clear();
+                self.pending_image_summaries.clear();
             }
             EventDeliveryScope::Observatory => {
                 self.state.dome_shutter_open = None;
@@ -2348,6 +2400,8 @@ impl ChatUpdater {
             event_types::GUIDER_DITHER => {}
             event_types::SEQUENCE_STARTING => {
                 self.state.sequence_running = true;
+                self.state.sequence_started_at =
+                    parse_nina_timestamp(&event.time).map(|time| time.with_timezone(&Utc));
                 self.state.sequence_failure = None;
                 self.state.sequence_outcome = None;
                 self.state.clear_scheduler_waits_at(&event.time);
@@ -3335,13 +3389,37 @@ impl ChatUpdater {
             .await;
     }
 
-    async fn handle_sequence_event(&self, event: &Event) {
+    async fn handle_sequence_event(&mut self, event: &Event) {
         if self.chat_manager.service_count() == 0 {
             return;
         }
         // Use the freshest sequence we have. The poll_sequence loop refreshes
         // this every cycle, so it's typically <interval seconds stale.
         self.send_sequence_event_notification(event).await;
+        if event.event == event_types::SEQUENCE_STARTING {
+            for summary in &mut self.pending_image_summaries {
+                if summary.next_sequence_at.is_none() {
+                    summary.next_sequence_at = self.state.sequence_started_at;
+                }
+            }
+        }
+        if event.event == event_types::SEQUENCE_FINISHED
+            && !matches!(&event.details, Some(EventDetails::SequenceFinished { outcome, .. })
+                if outcome == "cancelled_or_not_started")
+            && let Some(finished_at) = parse_nina_timestamp(&event.time)
+        {
+            if self.pending_image_summaries.len() == 8 {
+                self.pending_image_summaries.remove(0);
+            }
+            let queued_at = TokioInstant::now();
+            self.pending_image_summaries.push(PendingImageSummary {
+                started_at: self.state.sequence_started_at,
+                finished_at: finished_at.with_timezone(&Utc),
+                next_sequence_at: None,
+                queued_at,
+                last_image_at: queued_at,
+            });
+        }
     }
 
     /// ROTATOR-SYNCED ships only `{Time, Event}`. Query the Direct equipment
@@ -3489,6 +3567,13 @@ impl ChatUpdater {
         }
         match self.source.get_all_image_history().await {
             Ok(images) => {
+                let now = Utc::now();
+                let seed_existing = !self.light_frame_history.options.enabled();
+                self.light_frame_history
+                    .configure(images.image_statistics.unwrap_or_default(), now);
+                if !self.light_frame_history.options.on_sequence_end {
+                    self.pending_image_summaries.clear();
+                }
                 let privacy_boundary = images
                     .response
                     .iter()
@@ -3503,7 +3588,11 @@ impl ChatUpdater {
                         }
                         continue;
                     }
-                    if !self.state.has_seen_image(image) {
+                    let seen = self.state.has_seen_image(image);
+                    if !seen || seed_existing {
+                        self.record_light_frame(image, now, !seen);
+                    }
+                    if !seen {
                         if image.chat_enabled {
                             self.print_new_image(image);
                         }
@@ -3513,6 +3602,7 @@ impl ChatUpdater {
                         }
                     }
                 }
+                self.send_pending_image_statistics(now).await;
                 true
             }
             Err(e) => {
@@ -3520,6 +3610,121 @@ impl ChatUpdater {
                 false
             }
         }
+    }
+
+    fn record_light_frame(&mut self, image: &ImageMetadata, now: DateTime<Utc>, live: bool) {
+        let timestamp = image.timestamp.as_deref().unwrap_or(&image.date);
+        if let Some(captured_at) = parse_nina_timestamp(timestamp) {
+            let captured_at = captured_at.with_timezone(&Utc);
+            self.light_frame_history
+                .record(image, captured_at, now, live);
+            if live && image.chat_enabled && image.is_light_frame() {
+                for summary in &mut self.pending_image_summaries {
+                    if summary.includes_capture(
+                        captured_at,
+                        image.timestamp_is_exposure_start == Some(true),
+                    ) {
+                        summary.last_image_at = TokioInstant::now();
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_pending_image_statistics(&mut self, now: DateTime<Utc>) {
+        let periodic_due = self.light_frame_history.take_periodic_due();
+        let summaries = std::mem::take(&mut self.pending_image_summaries);
+        if !self.light_frame_history.options.enabled() || self.chat_manager.service_count() == 0 {
+            return;
+        }
+        let points = self.light_frame_history.snapshot(now);
+        let mut summarized_latest = false;
+        if self.light_frame_history.options.on_sequence_end {
+            for pending in summaries {
+                if !pending.ready(TokioInstant::now()) {
+                    self.pending_image_summaries.push(pending);
+                    continue;
+                }
+                let summary: Vec<_> = points
+                    .iter()
+                    .filter(|point| pending.includes(point))
+                    .cloned()
+                    .collect();
+                // Do not summarize a cancelled/empty run using an earlier run's
+                // measurements. The chart itself still covers the night.
+                if !summary.iter().any(|point| {
+                    pending
+                        .started_at
+                        .is_none_or(|start| point.captured_at >= start)
+                }) {
+                    continue;
+                }
+                summarized_latest |= summary.len() == points.len();
+                self.send_image_statistics_chart(summary, true).await;
+            }
+        }
+        if periodic_due && !summarized_latest {
+            self.send_image_statistics_chart(points, false).await;
+        }
+    }
+
+    async fn send_image_statistics_chart(
+        &self,
+        points: Vec<crate::image_statistics::ImageStatisticsPoint>,
+        summary: bool,
+    ) {
+        if !points
+            .iter()
+            .any(|point| point.hfr.is_some() || point.stars.is_some())
+        {
+            return;
+        }
+        let count = points.len();
+        let started_at = points.first().map(|point| point.captured_at);
+        let ended_at = points.last().map(|point| point.captured_at);
+        // Plotting is CPU work, not a Direct request, and must not occupy a
+        // Tokio worker servicing other telescopes or WebSocket heartbeats.
+        let rendered = tokio::task::spawn_blocking(move || {
+            crate::charts::render_image_statistics_png(&points)
+        })
+        .await;
+        let png = match rendered {
+            Ok(Ok(png)) => png,
+            other => {
+                eprintln!("Image statistics chart unavailable: {other:?}");
+                return;
+            }
+        };
+        let title = if summary {
+            "📊 Night summary (sequence ended)"
+        } else {
+            "📊 Nightly image statistics"
+        };
+        let mut message = ChatMessage::new(&self.titled(title))
+            .color(colors::CYAN)
+            .field("LIGHT frames", &count.to_string(), true)
+            .field("History", "Last 24 hours · up to 2,000 frames", false);
+        if let (Some(start), Some(end)) = (started_at, ended_at) {
+            message = message.field(
+                "Time (UTC)",
+                &format!(
+                    "{} – {}",
+                    format_utc_timestamp(start),
+                    format_utc_timestamp(end)
+                ),
+                false,
+            );
+        }
+        self.chat_manager
+            .send_message_with_attachments(
+                &message,
+                &self.chat_target,
+                &[ChatAttachment {
+                    data: png,
+                    filename: "image_statistics.png".into(),
+                }],
+            )
+            .await;
     }
 
     async fn handle_new_image(&mut self, image: &ImageMetadata, index: usize) {
@@ -5121,6 +5326,10 @@ impl ChatUpdater {
             .field("StDev", &format!("{:.1}", image.st_dev), true)
             .footer(&format!("Telescope: {}", image.telescope_name));
 
+        if image.is_light_frame() {
+            message = add_capture_context_fields(message, image);
+        }
+
         if self
             .state
             .meridian_flip_time
@@ -5239,6 +5448,38 @@ impl ChatUpdater {
             });
         }
     }
+}
+
+fn add_capture_context_fields(mut message: ChatMessage, image: &ImageMetadata) -> ChatMessage {
+    for (name, value) in [
+        ("Focuser temperature", image.focuser_temperature),
+        ("Weather temperature", image.weather_temperature),
+        ("Dew point", image.dew_point),
+    ] {
+        if let Some(value) = value.filter(|value| value.is_finite()) {
+            message = message.field(name, &format!("{value:.1}°C"), true);
+        }
+    }
+    if let Some(position) = image.focuser_position.filter(|position| *position >= 0) {
+        message = message.field("Focuser position", &format!("{position} steps"), true);
+    }
+    let mut wind = Vec::new();
+    if let Some(speed) = image
+        .wind_speed
+        .filter(|speed| speed.is_finite() && *speed >= 0.0)
+    {
+        wind.push(format!("{speed:.1} m/s"));
+    }
+    if let Some(gust) = image
+        .wind_gust
+        .filter(|gust| gust.is_finite() && *gust >= 0.0)
+    {
+        wind.push(format!("Gusts {gust:.1} m/s"));
+    }
+    if !wind.is_empty() {
+        message = message.field("Wind", &wind.join(" · "), true);
+    }
+    message
 }
 
 fn add_coordinate_field(
@@ -5615,6 +5856,7 @@ mod tests {
         invalid_response: bool,
         baseline_retry: bool,
         hocus_response: bool,
+        image_response: Mutex<Option<serde_json::Value>>,
     }
 
     impl FlakyAutofocusSource {
@@ -5634,6 +5876,7 @@ mod tests {
                 invalid_response: false,
                 baseline_retry: false,
                 hocus_response: false,
+                image_response: Mutex::new(None),
             }
         }
 
@@ -5649,6 +5892,7 @@ mod tests {
                 invalid_response: true,
                 baseline_retry: false,
                 hocus_response: false,
+                image_response: Mutex::new(None),
             }
         }
 
@@ -5664,6 +5908,7 @@ mod tests {
                 invalid_response: false,
                 baseline_retry: true,
                 hocus_response: false,
+                image_response: Mutex::new(None),
             }
         }
 
@@ -5679,6 +5924,7 @@ mod tests {
                 invalid_response: false,
                 baseline_retry: false,
                 hocus_response: false,
+                image_response: Mutex::new(None),
             }
         }
 
@@ -5694,6 +5940,7 @@ mod tests {
                 invalid_response: false,
                 baseline_retry: false,
                 hocus_response: false,
+                image_response: Mutex::new(None),
             }
         }
 
@@ -5715,7 +5962,7 @@ mod tests {
         }
 
         fn capabilities(&self) -> RigCapabilities {
-            if self.baseline_retry {
+            if self.baseline_retry || self.image_response.lock().unwrap().is_some() {
                 let mut capabilities = RigCapabilities::none();
                 capabilities.event_history = true;
                 capabilities.image_history = true;
@@ -5758,6 +6005,9 @@ mod tests {
         }
 
         async fn get_all_image_history(&self) -> RigSourceResult<ImageHistoryResponse> {
+            if let Some(response) = self.image_response.lock().unwrap().as_ref() {
+                return Ok(serde_json::from_value(response.clone()).unwrap());
+            }
             if !self.baseline_retry {
                 return Self::unexpected();
             }
@@ -5769,6 +6019,7 @@ mod tests {
             }
             Ok(ImageHistoryResponse {
                 response: Vec::new(),
+                image_statistics: None,
                 error: String::new(),
                 status_code: 200,
                 success: true,
@@ -8270,6 +8521,274 @@ mod tests {
         updater.process_live_events(events).await;
         assert!(updater.state.last_focuser_observation.is_none());
         assert!(chat_state.deliveries.lock().unwrap().is_empty());
+    }
+
+    fn statistics_frame(at: DateTime<Utc>) -> ImageMetadata {
+        let history: ImageHistoryResponse =
+            serde_json::from_str(include_str!("../example_image-history.json")).unwrap();
+        let mut image = history.response.into_iter().next().unwrap();
+        image.image_type = "LIGHT".into();
+        image.date = at.to_rfc3339();
+        image.timestamp = Some(at.to_rfc3339());
+        image.timestamp_is_exposure_start = Some(true);
+        image.hfr = 1.5;
+        image.stars = 100;
+        image.star_detection_available = Some(true);
+        image
+    }
+
+    fn set_statistics_response(
+        source: &FlakyAutofocusSource,
+        frames: Vec<ImageMetadata>,
+        options: Option<crate::images::ImageStatisticsOptions>,
+    ) {
+        *source.image_response.lock().unwrap() = Some(
+            serde_json::to_value(ImageHistoryResponse {
+                response: frames,
+                image_statistics: options,
+                error: String::new(),
+                status_code: 200,
+                success: true,
+                response_type: "API".into(),
+            })
+            .unwrap(),
+        );
+    }
+
+    fn statistics_updater() -> (
+        ChatUpdater,
+        Arc<FlakyAutofocusSource>,
+        Arc<RecordingChatState>,
+    ) {
+        let (mut updater, chat) = recording_test_updater();
+        let source = Arc::new(FlakyAutofocusSource::unavailable_for(
+            Event {
+                time: Utc::now().to_rfc3339(),
+                event: "IMAGE-SAVE".into(),
+                chat_enabled: true,
+                details: None,
+            },
+            0,
+        ));
+        updater.source = source.clone();
+        updater.announce_lifecycle = false;
+        // Exercise plot cadence independently of ordinary image-post cooldown.
+        updater.state.last_image_time = Some(Instant::now());
+        updater.image_cooldown = Duration::from_secs(3600);
+        (updater, source, chat)
+    }
+
+    fn statistics_deliveries(
+        state: &RecordingChatState,
+    ) -> Vec<(ChatMessage, Vec<ChatAttachment>)> {
+        state
+            .deliveries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, attachments)| {
+                attachments
+                    .iter()
+                    .any(|attachment| attachment.filename == "image_statistics.png")
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn capture_context_fields_use_saved_measurements_and_explicit_units() {
+        let mut image = statistics_frame(Utc::now());
+        image.focuser_temperature = Some(0.0);
+        image.focuser_position = Some(30105);
+        image.weather_temperature = Some(-1.0);
+        image.dew_point = Some(-3.5);
+        image.wind_speed = Some(2.0);
+        image.wind_gust = Some(4.0);
+        let message = add_capture_context_fields(ChatMessage::new("LIGHT"), &image);
+        assert_eq!(
+            message_field(&message, "Focuser temperature"),
+            Some("0.0°C")
+        );
+        assert_eq!(
+            message_field(&message, "Focuser position"),
+            Some("30105 steps")
+        );
+        assert_eq!(
+            message_field(&message, "Weather temperature"),
+            Some("-1.0°C")
+        );
+        assert_eq!(message_field(&message, "Dew point"), Some("-3.5°C"));
+        assert_eq!(
+            message_field(&message, "Wind"),
+            Some("2.0 m/s · Gusts 4.0 m/s")
+        );
+        image.focuser_temperature = Some(f64::NAN);
+        image.focuser_position = Some(-1);
+        image.weather_temperature = None;
+        image.dew_point = Some(f64::INFINITY);
+        image.wind_speed = Some(-1.0);
+        image.wind_gust = None;
+        assert!(
+            add_capture_context_fields(ChatMessage::new("LIGHT"), &image)
+                .fields
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn image_summary_settling_is_bounded_and_fallback_stops_at_next_sequence() {
+        let finished_at = Utc::now();
+        let queued_at = TokioInstant::now();
+        let mut pending = PendingImageSummary {
+            started_at: None,
+            finished_at,
+            next_sequence_at: None,
+            queued_at,
+            last_image_at: queued_at,
+        };
+        assert!(!pending.ready(queued_at + Duration::from_secs(14)));
+        assert!(pending.ready(queued_at + Duration::from_secs(15)));
+        pending.last_image_at = queued_at + Duration::from_secs(14);
+        assert!(!pending.ready(queued_at + Duration::from_secs(23)));
+        assert!(pending.ready(queued_at + Duration::from_secs(24)));
+        pending.last_image_at = queued_at + Duration::from_secs(119);
+        assert!(pending.ready(queued_at + Duration::from_secs(120)));
+        assert!(pending.includes_capture(finished_at - chrono::Duration::seconds(1), true));
+        assert!(!pending.includes_capture(finished_at + chrono::Duration::seconds(1), true));
+        assert!(pending.includes_capture(finished_at + chrono::Duration::seconds(119), false));
+        assert!(!pending.includes_capture(finished_at + chrono::Duration::seconds(121), false));
+        pending.next_sequence_at = Some(finished_at + chrono::Duration::seconds(5));
+        assert!(pending.includes_capture(finished_at + chrono::Duration::seconds(4), false));
+        assert!(!pending.includes_capture(finished_at + chrono::Duration::seconds(5), false));
+        assert!(!pending.includes_capture(finished_at + chrono::Duration::seconds(6), false));
+    }
+
+    #[tokio::test]
+    async fn image_statistics_polling_seeds_silently_and_counts_even_cooldown_skipped_lights() {
+        use crate::images::ImageStatisticsOptions;
+        let now = Utc::now();
+        let (mut updater, source, chat) = statistics_updater();
+        let options = Some(ImageStatisticsOptions {
+            every_n_frames: 2,
+            on_sequence_end: false,
+        });
+        let mut frames = vec![statistics_frame(now - chrono::Duration::minutes(10))];
+        set_statistics_response(&source, frames.clone(), options);
+        updater.initialize_baseline().await.unwrap();
+        assert!(statistics_deliveries(&chat).is_empty());
+        let mut flat = statistics_frame(now - chrono::Duration::minutes(9));
+        flat.image_type = "FLAT".into();
+        frames.push(flat);
+        frames.push(statistics_frame(now - chrono::Duration::minutes(8)));
+        set_statistics_response(&source, frames.clone(), options);
+        assert!(updater.poll_images().await);
+        assert!(statistics_deliveries(&chat).is_empty());
+        frames.push(statistics_frame(now - chrono::Duration::minutes(7)));
+        set_statistics_response(&source, frames.clone(), options);
+        assert!(updater.poll_images().await);
+        let deliveries = statistics_deliveries(&chat);
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(message_field(&deliveries[0].0, "LIGHT frames"), Some("3"));
+        assert!(deliveries[0].1[0].data.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(updater.poll_images().await);
+        assert_eq!(statistics_deliveries(&chat).len(), 1);
+        for minutes in (3..7).rev() {
+            frames.push(statistics_frame(now - chrono::Duration::minutes(minutes)));
+        }
+        set_statistics_response(&source, frames, options);
+        assert!(updater.poll_images().await);
+        assert_eq!(
+            statistics_deliveries(&chat).len(),
+            2,
+            "coalesce backlog into one chart"
+        );
+        assert!(updater.state.skipped_images_count > 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn image_statistics_summary_waits_for_final_frame_and_never_replays_baseline_finish() {
+        use crate::images::ImageStatisticsOptions;
+        let now = Utc::now();
+        let (mut updater, source, chat) = statistics_updater();
+        let options = Some(ImageStatisticsOptions {
+            every_n_frames: 0,
+            on_sequence_end: true,
+        });
+        set_statistics_response(&source, Vec::new(), options);
+        updater.initialize_baseline().await.unwrap();
+        let start: Event = serde_json::from_value(serde_json::json!({
+            "Event": "SEQUENCE-STARTING", "Time": (now - chrono::Duration::minutes(20)).to_rfc3339()
+        }))
+        .unwrap();
+        let finish: Event = serde_json::from_value(serde_json::json!({
+            "Event": "SEQUENCE-FINISHED", "Time": now.to_rfc3339(), "Outcome": "completed", "Status": "FINISHED", "HadFailures": false
+        })).unwrap();
+        updater
+            .process_live_events(vec![start, finish.clone()])
+            .await;
+        assert!(statistics_deliveries(&chat).is_empty());
+        assert!(updater.poll_images().await);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        set_statistics_response(
+            &source,
+            vec![statistics_frame(now - chrono::Duration::minutes(1))],
+            options,
+        );
+        assert!(updater.poll_images().await);
+        assert!(
+            statistics_deliveries(&chat).is_empty(),
+            "late save restarts quiet window"
+        );
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(updater.poll_images().await);
+        let deliveries = statistics_deliveries(&chat);
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].0.title.contains("Night summary"));
+        assert_eq!(message_field(&deliveries[0].0, "LIGHT frames"), Some("1"));
+        updater.process_live_events(vec![finish.clone()]).await;
+        assert!(updater.poll_images().await);
+        assert_eq!(statistics_deliveries(&chat).len(), 1);
+        let mut restarted = ChatUpdater::new(
+            source,
+            "Restart".into(),
+            ChatTarget::default(),
+            updater.chat_manager.clone(),
+        );
+        restarted.announce_lifecycle = false;
+        restarted.process_baseline_events(&[finish]);
+        restarted.initialize_baseline().await.unwrap();
+        assert!(restarted.poll_images().await);
+        assert_eq!(statistics_deliveries(&chat).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn image_statistics_legacy_and_disabled_settings_never_post_or_retain_charts() {
+        use crate::images::ImageStatisticsOptions;
+        let now = Utc::now();
+        let (mut updater, source, chat) = statistics_updater();
+        set_statistics_response(&source, vec![statistics_frame(now)], None);
+        assert!(updater.poll_images().await);
+        assert!(statistics_deliveries(&chat).is_empty());
+        assert!(updater.light_frame_history.snapshot(now).is_empty());
+        let options = Some(ImageStatisticsOptions {
+            every_n_frames: 10,
+            on_sequence_end: true,
+        });
+        set_statistics_response(&source, vec![statistics_frame(now)], options);
+        assert!(updater.poll_images().await);
+        assert_eq!(updater.light_frame_history.snapshot(now).len(), 1);
+        updater.pending_image_summaries.push(PendingImageSummary {
+            started_at: None,
+            finished_at: now,
+            next_sequence_at: None,
+            queued_at: TokioInstant::now(),
+            last_image_at: TokioInstant::now(),
+        });
+        set_statistics_response(&source, Vec::new(), Some(ImageStatisticsOptions::default()));
+        assert!(updater.poll_images().await);
+        assert!(updater.light_frame_history.snapshot(now).is_empty());
+        assert!(updater.pending_image_summaries.is_empty());
+        assert!(statistics_deliveries(&chat).is_empty());
     }
 
     #[tokio::test(start_paused = true)]

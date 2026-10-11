@@ -1,0 +1,68 @@
+{
+  "type": "query_result",
+  "payload": {
+    "id": "7afcde18-b5a8-46fd-ad1f-ed54cf3bbc4e",
+    "ok": true,
+    "payload": {
+      "Response": [
+        {
+          "ExposureTime": 300.0,
+          "ImageType": "LIGHT",
+          "Filter": "L",
+          "RmsText": "0.61 arcsec",
+          "Temperature": -7.0,
+          "CameraName": "Simulator",
+          "Gain": 100,
+          "Offset": 30,
+          "Date": "2026-10-10T01:05:00-07:00",
+          "TelescopeName": "Simulator",
+          "FocalLength": 800,
+          "StDev": 200.0,
+          "Mean": 800.0,
+          "Median": 790.0,
+          "Stars": 3000,
+          "HFR": 1.45,
+          "IsBayered": false,
+          "ChatEnabled": true,
+          "FocuserTemperature": 10.5,
+          "FocuserPosition": 30105,
+          "WeatherTemperature": 8.2,
+          "DewPoint": 4.1,
+          "WindSpeed": 2.0,
+          "WindGust": 3.5,
+          "StarDetectionAvailable": true,
+          "Timestamp": "2026-10-10T08:00:00Z",
+          "TimestampIsExposureStart": true
+        },
+        {
+          "ExposureTime": 300.0,
+          "ImageType": "LIGHT",
+          "Filter": "R",
+          "RmsText": "0.62 arcsec",
+          "Temperature": -7.0,
+          "CameraName": "Simulator",
+          "Gain": 100,
+          "Offset": 30,
+          "Date": "2026-10-10T01:10:00-07:00",
+          "TelescopeName": "Simulator",
+          "FocalLength": 800,
+          "StDev": 201.0,
+          "Mean": 801.0,
+          "Median": 791.0,
+          "Stars": 0,
+          "HFR": 0.0,
+          "IsBayered": false,
+          "ChatEnabled": true,
+          "StarDetectionAvailable": false,
+          "Timestamp": "2026-10-10T08:10:00Z",
+          "TimestampIsExposureStart": false
+        }
+      ],
+      "ImageStatistics": { "EveryNFrames": 10, "OnSequenceEnd": true },
+      "Error": "",
+      "StatusCode": 200,
+      "Success": true,
+      "Type": "API"
+    }
+  }
+}
