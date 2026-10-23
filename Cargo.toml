@@ -37,13 +37,12 @@ uuid = { version = "1", features = ["serde", "v4"] }
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "line_series", "ab_glyph"] }
 # In-memory PNG encoding for the rendered chart (plotters only writes files)
 png = "0.18"
-# Discord bot stack. Note: serenity 0.12 pins tokio-tungstenite 0.21
-# → rustls 0.22 → an old rustls-webpki line. The associated RUSTSEC
-# advisories (-0049/-0098/-0099/-0104) are ignored in `.cargo/audit.toml`
-# until serenity ships against a newer tokio-tungstenite. The HTTP path
-# (reqwest 0.13 / matrix-sdk) uses modern rustls 0.23.
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "cache", "http", "builder", "utils"] }
-poise = "0.6"
+# Discord bot stack. Serenity 0.12's Rustls backend is stuck on unpatched
+# rustls 0.22 / rustls-webpki 0.102. Use platform TLS for Discord instead
+# (Schannel on Windows; OpenSSL and the system CA store on Linux). Keep
+# Poise's normal non-TLS defaults without re-enabling Serenity's old Rustls.
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "native_tls_backend", "model", "cache", "http", "builder", "utils"] }
+poise = { version = "0.6", default-features = false, features = ["cache", "chrono", "handle_panics"] }
 # SQLite bundled to avoid libsqlite3 dependency issues on Windows CI/releases
 libsqlite3-sys = { version = "0", features = ["bundled"] }
 # Hub service (feature = "hub"). rusqlite is pinned to the same line
@@ -54,9 +53,8 @@ rusqlite = { version = "0.40.2", optional = true }
 hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 subtle = { version = "2", optional = true }
-# WebSocket client used by Direct Hub integration tests. Serenity 0.12 still
-# pins its own older tokio-tungstenite copy
-# for the gateway — an upstream limitation, see the audit.toml note.)
+# WebSocket client used by Direct Hub integration tests. This uses the current
+# Rustls line independently of Serenity's platform-TLS Discord gateway.
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 

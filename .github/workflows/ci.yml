@@ -28,6 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux TLS build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev ca-certificates
       - name: Cache Rust build
         uses: actions/cache@v6
         with:
@@ -55,6 +58,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install Linux TLS build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev ca-certificates
       - name: Cache Rust build
         uses: actions/cache@v6
         with:

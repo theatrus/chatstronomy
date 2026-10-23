@@ -1,27 +1,8 @@
 # cargo-audit configuration.
 #
-# Advisories listed under `ignore` are silenced when CI runs
-# `cargo audit`. Each entry must include a short comment explaining
-# *why* it's tolerated and the condition under which it can be removed.
+# Do not hide vulnerable TLS dependencies behind advisory exceptions. Discord
+# uses Serenity's platform-TLS backend, so its old Rustls/WebPKI stack is absent.
+# Any future exception must explain the affected path and removal condition.
 
 [advisories]
-ignore = [
-    # rustls-webpki 0.102.8 (pulled in by serenity 0.12 → tokio-tungstenite
-    # 0.21 → rustls 0.22 → rustls-webpki 0.102.x for the Discord gateway
-    # websocket). All fixes are in 0.103.x, which requires rustls 0.23+,
-    # which requires tokio-tungstenite 0.23+, which serenity 0.12 doesn't
-    # use. The HTTP path (reqwest / matrix-sdk / our NINA client) uses
-    # modern rustls 0.23 / rustls-webpki 0.103.13 — unaffected.
-    #
-    # The advisories cover CRL parsing and name-constraint validation on
-    # the cert path we use for one well-known endpoint (gateway.discord.gg),
-    # signed by a major public CA — these CVEs aren't reachable in our
-    # threat model.
-    #
-    # Drop these once serenity ships a release that uses tokio-tungstenite
-    # ≥ 0.23 (tracked upstream — serenity issue tracker).
-    "RUSTSEC-2026-0049",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
-]
+ignore = []

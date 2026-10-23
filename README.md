@@ -197,6 +197,13 @@ application, bot token, signing key, bind address, and SQLite database. See
 
 ## Build and test
 
+Linux builds need `pkg-config` and OpenSSL development headers (`libssl-dev`
+on Debian/Ubuntu). Linux executables also need the OpenSSL 3 runtime and
+`ca-certificates`. The Discord gateway and HTTP clients use platform TLS
+(Schannel on Windows, OpenSSL on Linux) instead of Serenity's obsolete Rustls
+dependency. The separate Direct WebSocket client uses current Rustls. Certificate
+and hostname verification stay enabled for both TLS backends.
+
 ```bash
 cargo build --release
 cargo test --all-features
