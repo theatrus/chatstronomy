@@ -134,6 +134,8 @@ Native target-container status transitions establish visits. Target Scheduler
 the same visit do not reset it when per-exposure plan objects change. Returning
 to the same target name after a new visit or sequence run gets a new `run_id`.
 Pause/resume and transport-only reconnects do not reset a visit.
+Target Scheduler waits clear the active scheduler target; a later ordinary
+`TargetStart` cannot reconstruct a complete count after that gap.
 
 Saved-frame counters are source-owned, independent of the 500-entry history ring.
 They require a confirmed start and matching target metadata plus a zoned exposure

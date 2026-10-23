@@ -319,7 +319,11 @@ control or image permission is granted by pairing or upgrading.
 Timelapse sharing is a separate local opt-in; enabling snapshots, image triggers,
 target context, or pairing does not enable video uploads. After v3 `ready`, an
 enabled camera sends `{"type":"media_capabilities","timelapses":true}` and waits
-for `{"type":"media_ready","max_timelapse_bytes":20971520}` before uploading.
+for `{"type":"media_ready","max_timelapse_bytes":134217728}` before uploading.
+Treat this as the operator's upload ceiling, not a guarantee of Discord acceptance.
+Older Hubs may advertise 20971520; always honor the negotiated value. The Hub
+setting `max_timelapse_bytes` defaults to 128 MiB and accepts 1 through 536870912
+bytes (512 MiB).
 Changing this permission disconnects the camera and cancels in-flight work.
 
 POST the finalized **H.264 MP4** as a binary body to `/v1/devices/timelapse` over
@@ -331,17 +335,22 @@ X-Installation-ID: <paired installation UUID>
 X-Event-ID: <immutable clip UUID>
 X-Captured-At: <UTC RFC3339 day-end timestamp>
 Content-Type: video/mp4
-Content-Length: <bytes, at most 20971520>
+Content-Length: <bytes, at most the negotiated max_timelapse_bytes>
 ```
 
-The camera must still have a live, consented v3 connection for that credential
+The camera must still have a live, consented v3 or v4 connection for that credential
 and installation. No browser session, client-selected channel, path, URL,
 filename, or arbitrary caption is accepted. The Hub authenticates before reading
 the body, permits at most two concurrent clips globally and one per device,
-bounds the read to 120 seconds and the request to 180 seconds, and rejects stale
+bounds the read to 180 seconds and the request to 360 seconds, and rejects stale
 (over 24 hours), malformed, or oversized clips. It checks the ISO-BMFF envelope,
 not decoded pixels/codecs; Discord may still reject an unplayable attachment.
-There is no transcoder or persistent video store on the Hub.
+The Hub hashes while spooling to a private temporary file, then streams that file
+to each route with independent read cursors and a 120-second Discord timeout.
+Temporary files are deleted on completion, error, or cancellation. Operators need
+free temporary-disk space for up to two configured maximum-size clips, and must
+set reverse-proxy body-size/time limits accordingly. There is no transcoder or
+persistent video store on the Hub.
 
 Clips are uploaded to the camera's current, owner-authorized Discord routes as
 `video/mp4` / `timelapse.mp4` attachments so Discord can show its video player.

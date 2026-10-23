@@ -8,7 +8,6 @@ use super::{
 };
 use axum::{
     Json,
-    body::{Bytes, to_bytes},
     extract::{
         ConnectInfo, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -31,7 +30,6 @@ use uuid::Uuid;
 const MAX_JPEG: usize = 512 * 1024;
 const MAX_WIRE: usize = 720 * 1024;
 const COOLDOWN: i64 = 60;
-pub const MAX_TIMELAPSE_BYTES: usize = 20 * 1024 * 1024;
 use crate::chat::CameraTriggerRules;
 
 enum ControlRequest {
@@ -562,75 +560,7 @@ impl Drop for TimelapseLease {
     }
 }
 
-/// Validate only the bounded ISO-BMFF envelope. No untrusted video is decoded
-/// or transcoded on the Hub. Discord checks whether the attachment is playable.
-fn valid_mp4(bytes: &[u8]) -> bool {
-    let mut offset = 0usize;
-    let (mut ftyp, mut moov, mut mdat) = (false, false, false);
-    while offset < bytes.len() {
-        let Some(header) = bytes.get(offset..offset.saturating_add(8)) else {
-            return false;
-        };
-        let mut size = u32::from_be_bytes(header[..4].try_into().expect("four bytes")) as u64;
-        let kind = &header[4..8];
-        let header_len = if size == 1 {
-            let Some(large) = bytes.get(offset + 8..offset + 16) else {
-                return false;
-            };
-            size = u64::from_be_bytes(large.try_into().expect("eight bytes"));
-            16
-        } else {
-            8
-        };
-        if size == 0 {
-            size = (bytes.len() - offset) as u64;
-        }
-        let Ok(size) = usize::try_from(size) else {
-            return false;
-        };
-        let Some(end) = offset.checked_add(size).filter(|end| *end <= bytes.len()) else {
-            return false;
-        };
-        if size < header_len {
-            return false;
-        }
-        if offset == 0 && kind != b"ftyp" {
-            return false;
-        }
-        match kind {
-            b"ftyp" => {
-                if ftyp || size < header_len + 8 {
-                    return false;
-                }
-                let payload = &bytes[offset + header_len..end];
-                if !payload.chunks_exact(4).enumerate().any(|(index, brand)| {
-                    index != 1
-                        && matches!(
-                            brand,
-                            b"isom"
-                                | b"iso2"
-                                | b"iso4"
-                                | b"iso5"
-                                | b"iso6"
-                                | b"mp41"
-                                | b"mp42"
-                                | b"avc1"
-                        )
-                }) {
-                    return false;
-                }
-                ftyp = true;
-            }
-            b"moov" => moov = size > header_len,
-            b"mdat" => mdat = size > header_len,
-            _ => {}
-        }
-        offset = end;
-    }
-    ftyp && moov && mdat
-}
-
-/// Raw MP4 HTTP body, authenticated before buffering. No URLs, file paths,
+/// Raw MP4 HTTP body, authenticated before disk-backed spooling. No URLs, file paths,
 /// filenames, destinations, cookies or user-authored captions are accepted.
 pub async fn timelapse_upload(State(state): State<HubState>, request: Request) -> Response {
     let headers = request.headers();
@@ -670,8 +600,15 @@ pub async fn timelapse_upload(State(state): State<HubState>, request: Request) -
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
     let Some(length) = value("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0 && *n <= MAX_TIMELAPSE_BYTES)
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| {
+            *n > 0
+                && *n
+                    <= state
+                        .config
+                        .max_timelapse_bytes
+                        .min(super::config::MAX_TIMELAPSE_BYTES)
+        })
     else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
@@ -707,14 +644,17 @@ pub async fn timelapse_upload(State(state): State<HubState>, request: Request) -
     tokio::select! {
         biased;
         _ = closed.changed() => StatusCode::FORBIDDEN.into_response(),
-        result = tokio::time::timeout(Duration::from_secs(180), async {
-            let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(120), to_bytes(request.into_body(), MAX_TIMELAPSE_BYTES)).await else {return StatusCode::PAYLOAD_TOO_LARGE.into_response();};
-            if bytes.len() != length || !valid_mp4(&bytes) {return StatusCode::UNPROCESSABLE_ENTITY.into_response();}
+        result = tokio::time::timeout(Duration::from_secs(360), async {
+            let movie = match tokio::time::timeout(Duration::from_secs(180), super::timelapse::Timelapse::receive(request.into_body(), length)).await {
+                Ok(Ok(movie)) => movie,
+                Ok(Err(status)) => return status.into_response(),
+                Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+            };
             if !lease.authorized(&state) {return StatusCode::FORBIDDEN.into_response();}
-            let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build() else {return StatusCode::SERVICE_UNAVAILABLE.into_response();};
+            let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(120)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build() else {return StatusCode::SERVICE_UNAVAILABLE.into_response();};
             let event = CameraEvent {event_id, kind: EventKind::Timelapse, captured_at,
                 summary: "Daily pier-camera timelapse".into(), jpeg_base64: String::new(), request_id: None};
-            let status = deliver_media(&state, &http, id, &event, Some((bytes, &lease))).await;
+            let status = deliver_media(&state, &http, id, &event, Some((&movie, &lease))).await;
             Json(json!({"status":status,"retry_after_seconds":if status=="retry" {60} else {0}})).into_response()
         }) => result.unwrap_or_else(|_| StatusCode::GATEWAY_TIMEOUT.into_response()),
     }
@@ -959,7 +899,7 @@ async fn run(
                             if c.timelapses && !timelapses {return;}
                             c.timelapses=timelapses;
                         }
-                        if timelapses && !send(socket,json!({"type":"media_ready","max_timelapse_bytes":MAX_TIMELAPSE_BYTES})).await {return;}
+                        if timelapses && !send(socket,json!({"type":"media_ready","max_timelapse_bytes":state.config.max_timelapse_bytes.min(super::config::MAX_TIMELAPSE_BYTES)})).await {return;}
                     }
                     ClientMessage::TriggerCapabilities {chat_configuration,telescope_events,observation_context} => {
                         if ![2,3,4].contains(&protocol_version) {return;}
@@ -1080,11 +1020,11 @@ async fn deliver_media(
     http: &reqwest::Client,
     id: i64,
     event: &CameraEvent,
-    video: Option<(Bytes, &TimelapseLease)>,
+    video: Option<(&super::timelapse::Timelapse, &TimelapseLease)>,
 ) -> &'static str {
     let is_video = video.is_some();
-    let media = match &video {
-        Some((bytes, _)) => bytes.clone(),
+    let media: axum::body::Bytes = match &video {
+        Some(_) => axum::body::Bytes::new(),
         None => match event.jpeg() {
             Ok(j) => j,
             Err(e) => return e,
@@ -1101,8 +1041,7 @@ async fn deliver_media(
         return "retry";
     };
     let reservation = if is_video {
-        use sha2::{Digest, Sha256};
-        let digest = STANDARD.encode(Sha256::digest(&media));
+        let digest = &video.expect("video").0.digest;
         let hash = super::auth::sha256_b64url(&format!(
             "{}:{digest}",
             serde_json::to_string(event).expect("serializable event")
@@ -1169,8 +1108,16 @@ async fn deliver_media(
             let (filename, mime) = if is_video {("timelapse.mp4", "video/mp4")} else {("piercam.jpg", "image/jpeg")};
             let payload=if is_video {json!({"allowed_mentions":{"parse":[]},"content":format!("{name} · {label}\nCompleted: {}",event.captured_at.to_rfc3339()),"attachments":[{"id":0,"filename":filename}]})}
                 else {json!({"allowed_mentions":{"parse":[]},"embeds":[{"title":format!("{name} · {label}"),"description":event.summary,"timestamp":event.captured_at.to_rfc3339(),"image":{"url":"attachment://piercam.jpg"},"footer":{"text":"AutoPierCam · automated camera observation"}}],"attachments":[{"id":0,"filename":filename}]})};
-            let part=reqwest::multipart::Part::stream_with_length(reqwest::Body::from(media.clone()),media.len() as u64).file_name(filename).mime_str(mime).expect("constant MIME");
+            let (body, length) = match video {
+                Some((movie, _)) => match movie.body().await { Ok(body) => (body, movie.length), Err(_) => return false },
+                None => (reqwest::Body::from(media.clone()), media.len() as u64),
+            };
+            let part=reqwest::multipart::Part::stream_with_length(body,length).file_name(filename).mime_str(mime).expect("constant MIME");
             let form=reqwest::multipart::Form::new().text("payload_json",payload.to_string()).part("files[0]",part);
+            // File opens and Discord membership checks yielded above. Recheck
+            // current route and device consent immediately before external I/O.
+            if authority.is_some_and(|lease| !lease.authorized(state))
+                || !state.db.pending_device_targets(id,event.event_id).is_ok_and(|current| current.contains(&(route,guild,channel))) {return false;}
             let result=http.post(format!("{}/api/v10/channels/{}/messages",state.config.discord.base_url.trim_end_matches('/'),channel as u64))
                 .header("authorization",format!("Bot {}",state.config.discord.bot_token)).multipart(form).send().await;
             let Ok(response)=result else {return false;};
@@ -1255,7 +1202,13 @@ mod tests {
         store::UserRow,
     };
     use super::*;
-    use axum::{Router, body::Bytes, extract::Path, http::StatusCode, routing::post};
+    use axum::{
+        Router,
+        body::{Bytes, to_bytes},
+        extract::Path,
+        http::StatusCode,
+        routing::post,
+    };
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message as ClientFrame};
 
@@ -1316,6 +1269,7 @@ mod tests {
         let discord = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new()
             .route("/api/v10/channels/{channel}/messages", post(post_image))
+            .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
             .with_state(posts.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let db = Db::open_in_memory().unwrap();
@@ -1836,9 +1790,15 @@ mod tests {
         b"\0\0\0\x18ftypmp42\0\0\0\0isommp42\0\0\0\x09moovx\0\0\0\x09mdatx".to_vec()
     }
 
-    #[test]
-    fn mp4_envelope_checks_are_bounded_and_do_not_trust_extensions() {
-        assert!(valid_mp4(&mp4_fixture()));
+    async fn valid_mp4(bytes: &[u8]) -> bool {
+        super::super::timelapse::valid_mp4(&mut std::io::Cursor::new(bytes), bytes.len() as u64)
+            .await
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn mp4_envelope_checks_are_bounded_and_do_not_trust_extensions() {
+        assert!(valid_mp4(&mp4_fixture()).await);
         for invalid in [
             Vec::new(),
             b"not an mp4".to_vec(),
@@ -1846,11 +1806,11 @@ mod tests {
             b"\0\0\0\x08ftyp".to_vec(),
             b"\0\0\0\x01ftyp".to_vec(),
         ] {
-            assert!(!valid_mp4(&invalid));
+            assert!(!valid_mp4(&invalid).await);
         }
         let mut truncated = mp4_fixture();
         truncated.pop();
-        assert!(!valid_mp4(&truncated));
+        assert!(!valid_mp4(&truncated).await);
     }
 
     fn clip_request(h: &Harness, event_id: Uuid, body: axum::body::Body) -> Request {
@@ -1879,7 +1839,10 @@ mod tests {
             .unwrap();
         let ready = next(&mut client).await;
         assert_eq!(ready["type"], "media_ready");
-        assert_eq!(ready["max_timelapse_bytes"], MAX_TIMELAPSE_BYTES);
+        assert_eq!(
+            ready["max_timelapse_bytes"],
+            h.state.config.max_timelapse_bytes
+        );
         client
     }
 
@@ -1940,7 +1903,10 @@ mod tests {
         let mut oversized = clip_request(&h, Uuid::new_v4(), axum::body::Body::empty());
         oversized.headers_mut().insert(
             "content-length",
-            (MAX_TIMELAPSE_BYTES + 1).to_string().parse().unwrap(),
+            (h.state.config.max_timelapse_bytes + 1)
+                .to_string()
+                .parse()
+                .unwrap(),
         );
         assert_eq!(
             timelapse_upload(State(h.state.clone()), oversized)
@@ -1981,9 +1947,10 @@ mod tests {
         let h = harness().await;
         let _client = enable_timelapses(&h).await;
         let mut movie = mp4_fixture();
-        movie[33..37].copy_from_slice(&5009_u32.to_be_bytes());
-        movie.extend_from_slice(&vec![0; 5000]);
-        assert!(valid_mp4(&movie));
+        let padding = 21 * 1024 * 1024;
+        movie[33..37].copy_from_slice(&((padding + 9) as u32).to_be_bytes());
+        movie.resize(movie.len() + padding, 0);
+        assert!(valid_mp4(&movie).await);
         let response = reqwest::Client::new()
             .post(format!("{}/v1/devices/timelapse", h.base))
             .bearer_auth(&h.credential)

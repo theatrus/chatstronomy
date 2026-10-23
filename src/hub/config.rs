@@ -33,6 +33,9 @@ pub struct HubConfig {
     /// attacker-chosen values.
     #[serde(default)]
     pub trust_x_forwarded_for: bool,
+    /// Operator storage/relay ceiling, not a promise of Discord acceptance.
+    #[serde(default = "default_max_timelapse_bytes")]
+    pub max_timelapse_bytes: u64,
     #[serde(default)]
     pub discord: HubDiscordConfig,
     #[serde(default)]
@@ -133,6 +136,11 @@ fn default_session_hours() -> u64 {
     720
 }
 
+pub const MAX_TIMELAPSE_BYTES: u64 = 512 * 1024 * 1024;
+pub const fn default_max_timelapse_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
 impl Default for HubConfig {
     fn default() -> Self {
         Self {
@@ -140,6 +148,7 @@ impl Default for HubConfig {
             database_path: default_database_path(),
             public_base_url: String::new(),
             trust_x_forwarded_for: false,
+            max_timelapse_bytes: default_max_timelapse_bytes(),
             discord: HubDiscordConfig::default(),
             session: HubSessionConfig::default(),
         }
@@ -167,6 +176,11 @@ impl HubConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_TIMELAPSE_BYTES).contains(&self.max_timelapse_bytes) {
+            return Err(format!(
+                "max_timelapse_bytes must be between 1 and {MAX_TIMELAPSE_BYTES}"
+            ));
+        }
         self.bind_address
             .parse::<SocketAddr>()
             .map_err(|e| format!("Invalid bind_address '{}': {e}", self.bind_address))?;
@@ -225,6 +239,7 @@ mod tests {
         assert_eq!(config.bind_address, "127.0.0.1:8092");
         assert_eq!(config.database_path, "chatstronomy-hub.db");
         assert_eq!(config.session.session_hours, 720);
+        assert_eq!(config.max_timelapse_bytes, 128 * 1024 * 1024);
         assert!(!config.oauth_configured());
         assert!(config.validate().is_ok());
     }
@@ -236,6 +251,27 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().unwrap_err().contains("bind_address"));
+    }
+
+    #[test]
+    fn timelapse_limit_is_operator_configurable_but_bounded() {
+        for value in [0, MAX_TIMELAPSE_BYTES + 1, u64::MAX] {
+            let config = HubConfig {
+                max_timelapse_bytes: value,
+                ..Default::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .contains("max_timelapse_bytes")
+            );
+        }
+        let config = HubConfig {
+            max_timelapse_bytes: MAX_TIMELAPSE_BYTES,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

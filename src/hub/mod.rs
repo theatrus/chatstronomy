@@ -25,5 +25,6 @@ pub mod rig_resolver;
 pub mod server;
 pub mod store;
 pub mod tenants;
+mod timelapse;
 pub mod updaters;
 pub mod web_ui;
