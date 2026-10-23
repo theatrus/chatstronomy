@@ -388,6 +388,10 @@ struct TrackedSequenceOperation {
     camera: Option<CameraInfo>,
     last_milestone: u8,
     last_output_key: Option<String>,
+    #[cfg(feature = "hub")]
+    camera_target_fingerprint: Option<u64>,
+    #[cfg(feature = "hub")]
+    camera_start_live: bool,
 }
 
 impl TrackedSequenceOperation {
@@ -418,6 +422,10 @@ impl TrackedSequenceOperation {
             camera,
             last_milestone: 0,
             last_output_key: None,
+            #[cfg(feature = "hub")]
+            camera_target_fingerprint: None,
+            #[cfg(feature = "hub")]
+            camera_start_live: false,
         }
     }
 
@@ -612,6 +620,117 @@ enum OperationUpdate {
     Finished { attach_output: bool },
     Ended { attach_output: bool },
     Failed { attach_output: bool },
+}
+
+/// Camera annotations are an allowlisted projection, never raw sequence-item
+/// names, predicates, coordinates or failure text. A disappearing item only
+/// reports `ended`; it is not evidence of successful completion.
+#[cfg(any(feature = "hub", test))]
+fn camera_sequence_action(
+    operation: &SequenceOperation,
+    update: OperationUpdate,
+) -> Option<&'static str> {
+    if !operation.chat_enabled {
+        return None;
+    }
+    let actions = match &operation.kind {
+        SequenceOperationKind::CameraCooling { .. } => [
+            "camera_cooling_started",
+            "camera_cooling_completed",
+            "camera_cooling_ended",
+            "camera_cooling_failed",
+        ],
+        SequenceOperationKind::CameraWarming { .. } => [
+            "camera_warming_started",
+            "camera_warming_completed",
+            "camera_warming_ended",
+            "camera_warming_failed",
+        ],
+        SequenceOperationKind::TimeWait { .. } => [
+            "time_wait_started",
+            "time_wait_completed",
+            "time_wait_ended",
+            "time_wait_failed",
+        ],
+        SequenceOperationKind::AstronomicalWait { .. } => [
+            "astronomical_wait_started",
+            "astronomical_wait_completed",
+            "astronomical_wait_ended",
+            "astronomical_wait_failed",
+        ],
+        SequenceOperationKind::SafetyWait { .. } => [
+            "safety_wait_started",
+            "safety_wait_completed",
+            "safety_wait_ended",
+            "safety_wait_failed",
+        ],
+        SequenceOperationKind::ConditionWait { .. } => [
+            "condition_wait_started",
+            "condition_wait_completed",
+            "condition_wait_ended",
+            "condition_wait_failed",
+        ],
+        SequenceOperationKind::ManualWait => [
+            "manual_wait_started",
+            "manual_wait_completed",
+            "manual_wait_ended",
+            "manual_wait_failed",
+        ],
+        SequenceOperationKind::MountSlew { .. } => [
+            "sequence_slew_started",
+            "sequence_slew_completed",
+            "sequence_slew_ended",
+            "sequence_slew_failed",
+        ],
+        SequenceOperationKind::MountCenter { .. } => [
+            "mount_center_started",
+            "mount_center_completed",
+            "mount_center_ended",
+            "mount_center_failed",
+        ],
+        SequenceOperationKind::PlateSolve { .. } => [
+            "plate_solve_started",
+            "plate_solve_completed",
+            "plate_solve_ended",
+            "plate_solve_failed",
+        ],
+    };
+    match update {
+        OperationUpdate::Started => Some(actions[0]),
+        OperationUpdate::Finished { .. } => Some(actions[1]),
+        OperationUpdate::Ended { .. } => Some(actions[2]),
+        OperationUpdate::Failed { .. } => Some(actions[3]),
+        OperationUpdate::Progress(_) | OperationUpdate::Output => None,
+    }
+}
+
+/// Target Scheduler admission precedes state reconstruction, so the target in
+/// the current event must take priority over the preceding retained target.
+#[cfg(feature = "hub")]
+fn camera_sequence_target(projection: &Option<(String, bool)>) -> Option<String> {
+    projection
+        .as_ref()
+        .filter(|(name, enabled)| {
+            *enabled && !name.trim().is_empty() && name.trim() != "Sequential Instruction Set"
+        })
+        .map(|(name, _)| name.clone())
+}
+
+#[cfg(any(feature = "hub", test))]
+fn camera_event_target<'a>(event: &'a Event, _current: Option<&'a TargetInfo>) -> Option<&'a str> {
+    if !event.chat_enabled {
+        return None;
+    }
+    let target = match event.event.as_str() {
+        event_types::TS_TARGETSTART | event_types::TS_NEWTARGETSTART => match &event.details {
+            Some(EventDetails::TargetStart { target_name, .. }) => Some(target_name.as_str()),
+            _ => None,
+        },
+        // Status deliberately retains a target across empty snapshots. That
+        // cache is not capture-time provenance for an independent hardware event.
+        _ => None,
+    };
+    target.filter(|name| !name.trim().is_empty() && name.trim() != "Sequential Instruction Set")
 }
 
 /// Insert-only dedup set with a bounded memory footprint.
@@ -1176,6 +1295,17 @@ pub struct ChatUpdater {
     /// established its baseline, every later event response is a live delta
     /// even if another capability (such as image history) is still offline.
     event_baseline_complete: bool,
+    /// A first successful native sequence snapshot is a silent camera target
+    /// baseline, including when the sequence stream was unavailable at startup.
+    sequence_target_baseline_complete: bool,
+    /// Independent of target-name consent: operations already active when the
+    /// sequence stream first recovers must not become camera start triggers.
+    #[cfg(feature = "hub")]
+    camera_sequence_operations_baseline_complete: bool,
+    #[cfg(feature = "hub")]
+    camera_sequence_target: Option<String>,
+    #[cfg(feature = "hub")]
+    camera_suppressed_operation_keys: HashSet<u64>,
     light_frame_history: LightFrameHistory,
     /// Live terminal events only. Drain after image polling so the final
     /// capture is included, even when it arrived in the same poll cycle.
@@ -1240,6 +1370,13 @@ impl ChatUpdater {
             #[cfg(feature = "hub")]
             autofocus_delivery_store: None,
             event_baseline_complete: false,
+            sequence_target_baseline_complete: false,
+            #[cfg(feature = "hub")]
+            camera_sequence_operations_baseline_complete: false,
+            #[cfg(feature = "hub")]
+            camera_sequence_target: None,
+            #[cfg(feature = "hub")]
+            camera_suppressed_operation_keys: HashSet::new(),
             light_frame_history: LightFrameHistory::default(),
             pending_image_summaries: Vec::new(),
         }
@@ -1540,6 +1677,26 @@ impl ChatUpdater {
         camera: Option<CameraInfo>,
         announce: bool,
     ) {
+        #[cfg(feature = "hub")]
+        let announce_camera = {
+            let announce_camera = announce && self.camera_sequence_operations_baseline_complete;
+            self.camera_sequence_operations_baseline_complete = true;
+            announce_camera
+        };
+        #[cfg(feature = "hub")]
+        let previously_suppressed = std::mem::replace(
+            &mut self.camera_suppressed_operation_keys,
+            suppressed_operation_keys
+                .iter()
+                .take(SEEN_SET_CAPACITY)
+                .map(|key| self.state.dedup_hasher.hash_one(key))
+                .collect(),
+        );
+        #[cfg(feature = "hub")]
+        let camera_target_fingerprint = self
+            .camera_sequence_target
+            .as_ref()
+            .map(|name| self.state.dedup_hasher.hash_one(name));
         let now = Utc::now();
         if self
             .state
@@ -1741,6 +1898,12 @@ impl ChatUpdater {
             .then(|| camera.clone())
             .flatten();
             let mut tracked = TrackedSequenceOperation::new(operation, now, operation_camera);
+            #[cfg(feature = "hub")]
+            {
+                tracked.camera_target_fingerprint = camera_target_fingerprint;
+                tracked.camera_start_live = announce_camera
+                    && !previously_suppressed.contains(&self.state.dedup_hasher.hash_one(&key));
+            }
             if !announce {
                 tracked.last_milestone = tracked
                     .progress_percent(now)
@@ -1763,11 +1926,29 @@ impl ChatUpdater {
             self.state.sequence_operations.insert(key, tracked);
         }
 
-        if announce && self.chat_manager.service_count() > 0 {
+        if announce {
             for (operation, update) in notifications {
                 if operation.operation.chat_enabled {
-                    self.send_sequence_operation_update(&operation, update)
-                        .await;
+                    #[cfg(feature = "hub")]
+                    if announce_camera
+                        && (!matches!(update, OperationUpdate::Started)
+                            || operation.camera_start_live)
+                        && let Some((db, id, devices)) = &self.camera_triggers
+                        && let Some(action) = camera_sequence_action(&operation.operation, update)
+                    {
+                        devices.telescope_action(
+                            db,
+                            *id,
+                            action,
+                            self.camera_sequence_target.as_deref().filter(|_| {
+                                operation.camera_target_fingerprint == camera_target_fingerprint
+                            }),
+                        );
+                    }
+                    if self.chat_manager.service_count() > 0 {
+                        self.send_sequence_operation_update(&operation, update)
+                            .await;
+                    }
                 }
             }
         }
@@ -2168,7 +2349,15 @@ impl ChatUpdater {
                     // revocation before formatting startup status or welcome
                     // output. The latter must clear any historical Target
                     // Scheduler event reconstructed above.
-                    self.reconcile_sequence_target(extract_current_target_with_delivery(&sequence));
+                    let target = extract_current_target_with_delivery(&sequence);
+                    #[cfg(feature = "hub")]
+                    {
+                        self.camera_sequence_target = camera_sequence_target(&target);
+                    }
+                    self.sequence_target_baseline_complete = target
+                        .as_ref()
+                        .is_none_or(|(_, chat_enabled)| *chat_enabled);
+                    self.reconcile_sequence_target(target);
 
                     self.state.sequence_container_counts =
                         Some(sequence_container_counts(&sequence));
@@ -2770,7 +2959,12 @@ impl ChatUpdater {
                 self.print_new_event(&event);
                 #[cfg(feature = "hub")]
                 if let Some((db, id, devices)) = &self.camera_triggers {
-                    devices.telescope_event(db, *id, &event);
+                    devices.telescope_event_with_target(
+                        db,
+                        *id,
+                        &event,
+                        camera_event_target(&event, self.state.current_target.as_ref()),
+                    );
                 }
                 self.handle_event(&event).await;
             }
@@ -3459,6 +3653,9 @@ impl ChatUpdater {
         match self.source.get_sequence().await {
             Ok(sequence) => {
                 let new_sequence_target = extract_current_target_with_delivery(&sequence);
+                // Reconcile identity before operation admission: an action in a
+                // newly selected native target must never carry its predecessor.
+                let target_change = self.reconcile_live_sequence_target(new_sequence_target);
                 let new_meridian_flip_time = extract_meridian_flip_time(&sequence);
                 let operations = extract_sequence_operations(&sequence);
                 let suppressed_operation_keys =
@@ -3475,9 +3672,7 @@ impl ChatUpdater {
                 self.state.meridian_flip_time = new_meridian_flip_time;
                 self.state.sequence_container_counts = Some(sequence_container_counts(&sequence));
 
-                if let Some((old_target, new_target)) =
-                    self.reconcile_sequence_target(new_sequence_target)
-                {
+                if let Some((old_target, new_target)) = target_change {
                     println!("[SEQUENCE TARGET] {}", new_target.name);
 
                     if self.chat_manager.service_count() > 0 {
@@ -3498,6 +3693,33 @@ impl ChatUpdater {
                 false
             }
         }
+    }
+
+    fn reconcile_live_sequence_target(
+        &mut self,
+        projection: Option<(String, bool)>,
+    ) -> Option<(Option<TargetInfo>, TargetInfo)> {
+        let baseline_complete = self.sequence_target_baseline_complete;
+        #[cfg(feature = "hub")]
+        {
+            self.camera_sequence_target = camera_sequence_target(&projection);
+        }
+        // An explicit privacy boundary also resets camera target admission.
+        // Re-enabling sharing seeds a new baseline rather than replaying it.
+        self.sequence_target_baseline_complete = projection
+            .as_ref()
+            .is_none_or(|(_, chat_enabled)| *chat_enabled);
+        let change = self.reconcile_sequence_target(projection);
+        #[cfg(feature = "hub")]
+        if baseline_complete
+            && let Some((_, new_target)) = &change
+            && let Some((db, id, devices)) = &self.camera_triggers
+        {
+            devices.telescope_target_changed(db, *id, &new_target.name);
+        }
+        #[cfg(not(feature = "hub"))]
+        let _ = baseline_complete;
+        change
     }
 
     /// Apply the target identity carried by a sequence snapshot.
@@ -7950,6 +8172,243 @@ mod tests {
                 .map(|target| target.name.as_str()),
             Some("M42")
         );
+    }
+
+    #[test]
+    fn camera_target_projection_uses_admitted_scheduler_identity_not_predecessor() {
+        let previous = TargetInfo {
+            name: "Previous target".to_string(),
+            source: TargetSource::Sequence,
+            coordinates: None,
+            project: Some("Private project".into()),
+            rotation: None,
+            target_end_time: None,
+        };
+        for kind in [event_types::TS_TARGETSTART, event_types::TS_NEWTARGETSTART] {
+            let mut event = target_event(true, "NGC 7023");
+            event.event = kind.into();
+            assert_eq!(
+                camera_event_target(&event, Some(&previous)),
+                Some("NGC 7023")
+            );
+
+            event.chat_enabled = false;
+            assert_eq!(camera_event_target(&event, Some(&previous)), None);
+            event.chat_enabled = true;
+            event.details = None;
+            assert_eq!(camera_event_target(&event, Some(&previous)), None);
+            event.details = target_event(true, "Sequential Instruction Set").details;
+            assert_eq!(camera_event_target(&event, Some(&previous)), None);
+        }
+        let event = Event {
+            time: Utc::now().to_rfc3339(),
+            event: event_types::MOUNT_SLEW_STARTED.into(),
+            chat_enabled: true,
+            details: None,
+        };
+        assert_eq!(camera_event_target(&event, Some(&previous)), None);
+        assert_eq!(camera_event_target(&event, None), None);
+    }
+
+    #[test]
+    fn native_camera_target_baseline_is_independent_and_resets_with_privacy() {
+        let mut updater = state_test_updater();
+        assert!(!updater.sequence_target_baseline_complete);
+        let first = updater
+            .reconcile_live_sequence_target(Some(("First observed target".into(), true)))
+            .unwrap();
+        assert!(first.0.is_none());
+        assert!(updater.sequence_target_baseline_complete);
+        assert!(
+            updater
+                .reconcile_live_sequence_target(Some(("First observed target".into(), true)))
+                .is_none()
+        );
+
+        let next = updater
+            .reconcile_live_sequence_target(Some(("Next live target".into(), true)))
+            .unwrap();
+        assert_eq!(next.0.unwrap().name, "First observed target");
+        assert_eq!(next.1.name, "Next live target");
+        assert!(
+            updater
+                .reconcile_live_sequence_target(Some(("Private name".into(), false)))
+                .is_none()
+        );
+        assert!(updater.state.current_target.is_none());
+        assert!(!updater.sequence_target_baseline_complete);
+        updater.reconcile_live_sequence_target(Some(("Fresh shared baseline".into(), true)));
+        assert!(updater.sequence_target_baseline_complete);
+
+        let mut restarted = state_test_updater();
+        assert!(!restarted.sequence_target_baseline_complete);
+        restarted.reconcile_live_sequence_target(None);
+        assert!(restarted.sequence_target_baseline_complete);
+    }
+
+    #[test]
+    fn camera_sequence_actions_are_consent_gated_and_truthfully_phased() {
+        let kinds = [
+            (
+                SequenceOperationKind::CameraCooling {
+                    target_temperature: -10.0,
+                    minimum_duration: None,
+                },
+                "camera_cooling",
+            ),
+            (
+                SequenceOperationKind::CameraWarming {
+                    minimum_duration: None,
+                },
+                "camera_warming",
+            ),
+            (
+                SequenceOperationKind::TimeWait {
+                    target_time: None,
+                    configured_duration: None,
+                },
+                "time_wait",
+            ),
+            (
+                SequenceOperationKind::AstronomicalWait {
+                    target_altitude_degrees: Some(30.0),
+                    current_altitude_degrees: None,
+                    comparator: None,
+                    expected_time: None,
+                },
+                "astronomical_wait",
+            ),
+            (
+                SequenceOperationKind::SafetyWait {
+                    is_safe: Some(false),
+                    wait_interval: None,
+                },
+                "safety_wait",
+            ),
+            (
+                SequenceOperationKind::ConditionWait {
+                    wait_interval: None,
+                },
+                "condition_wait",
+            ),
+            (SequenceOperationKind::ManualWait, "manual_wait"),
+            (
+                SequenceOperationKind::MountSlew {
+                    coordinates: None,
+                    may_be_center: false,
+                },
+                "sequence_slew",
+            ),
+            (
+                SequenceOperationKind::MountCenter {
+                    coordinates: None,
+                    rotation: None,
+                    output: None,
+                },
+                "mount_center",
+            ),
+            (
+                SequenceOperationKind::PlateSolve {
+                    coordinates: None,
+                    rotation: None,
+                    output: None,
+                },
+                "plate_solve",
+            ),
+        ];
+        for (kind, action) in kinds {
+            let mut operation = operation(kind);
+            operation.name = "Private arbitrary sequence item".into();
+            for (update, phase) in [
+                (OperationUpdate::Started, "started"),
+                (
+                    OperationUpdate::Finished {
+                        attach_output: false,
+                    },
+                    "completed",
+                ),
+                (
+                    OperationUpdate::Ended {
+                        attach_output: false,
+                    },
+                    "ended",
+                ),
+                (
+                    OperationUpdate::Failed {
+                        attach_output: false,
+                    },
+                    "failed",
+                ),
+            ] {
+                assert_eq!(
+                    camera_sequence_action(&operation, update),
+                    Some(format!("{action}_{phase}").as_str())
+                );
+            }
+            assert_eq!(
+                camera_sequence_action(&operation, OperationUpdate::Progress(50)),
+                None
+            );
+            assert_eq!(
+                camera_sequence_action(&operation, OperationUpdate::Output),
+                None
+            );
+            operation.chat_enabled = false;
+            assert_eq!(
+                camera_sequence_action(&operation, OperationUpdate::Started),
+                None
+            );
+            assert_eq!(
+                camera_sequence_action(
+                    &operation,
+                    OperationUpdate::Ended {
+                        attach_output: false
+                    }
+                ),
+                None
+            );
+        }
+    }
+
+    #[cfg(feature = "hub")]
+    #[tokio::test]
+    async fn camera_operations_do_not_relabel_old_targets_or_replay_reenabled_starts() {
+        let mut updater = state_test_updater();
+        updater
+            .reconcile_sequence_operations(Vec::new(), HashSet::new(), None, false)
+            .await;
+        updater.reconcile_live_sequence_target(Some(("Target A".into(), true)));
+        let item = operation(SequenceOperationKind::SafetyWait {
+            is_safe: Some(false),
+            wait_interval: None,
+        });
+        let key = item.key.clone();
+        updater
+            .reconcile_sequence_operations(vec![item.clone()], HashSet::new(), None, true)
+            .await;
+        let admitted = updater.state.sequence_operations[&key].clone();
+        assert!(admitted.camera_start_live);
+        let target_a = admitted.camera_target_fingerprint;
+        updater.reconcile_live_sequence_target(Some(("Target B".into(), true)));
+        assert_ne!(
+            target_a,
+            updater
+                .camera_sequence_target
+                .as_ref()
+                .map(|name| updater.state.dedup_hasher.hash_one(name))
+        );
+        // A disabled item's key is only retained as a bounded opaque fingerprint.
+        updater
+            .reconcile_sequence_operations(Vec::new(), HashSet::from([key.clone()]), None, true)
+            .await;
+        updater
+            .reconcile_sequence_operations(vec![item], HashSet::new(), None, true)
+            .await;
+        assert!(!updater.state.sequence_operations[&key].camera_start_live);
+        // Legacy status may retain a last-known target; camera labels never do.
+        updater.reconcile_live_sequence_target(None);
+        assert!(updater.state.current_target.is_some());
+        assert!(updater.camera_sequence_target.is_none());
     }
 
     #[test]

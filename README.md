@@ -195,6 +195,11 @@ Edit `hub.json` after initialization to configure the public URL, Discord OAuth
 application, bot token, signing key, bind address, and SQLite database. See
 [docs/HOSTED_SERVICE.md](docs/HOSTED_SERVICE.md).
 
+AutoPierCam can share pier-camera images, opt-in target/action observations, and
+newly finalized daily MP4 timelapses through the Hub. Timelapses have a separate
+local permission and a 16 MiB cap; older image-only cameras remain compatible.
+See the [device protocol](docs/DEVICE_PROTOCOL.md).
+
 ## Build and test
 
 Linux builds need `pkg-config` and OpenSSL development headers (`libssl-dev`
