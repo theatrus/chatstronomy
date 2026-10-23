@@ -80,12 +80,13 @@ struct PendingQueryGuard<'a> {
     id: Uuid,
     sent: bool,
     completed: bool,
+    replay_on_cancel: bool,
 }
 
 impl Drop for PendingQueryGuard<'_> {
     fn drop(&mut self) {
         self.connection.remove_pending(&self.id);
-        if self.sent && !self.completed {
+        if self.sent && !self.completed && self.replay_on_cancel {
             // The plugin advances its private history cursor when it writes a
             // result. If this future is cancelled or times out before the Hub
             // consumes that result, only a physical reconnect can rewind the
@@ -119,6 +120,8 @@ impl RigConnection {
             id,
             sent: false,
             completed: false,
+            // Overlay reads have no history cursor or hardware side effects.
+            replay_on_cancel: !matches!(kind, QueryKind::ObservationState),
         };
         // The rig must not execute this after the hub has stopped waiting.
         let expires_at = Some(crate::hub::db::unix_now() + timeout.as_secs() as i64);
@@ -182,7 +185,7 @@ impl RigConnection {
         });
     }
 
-    fn is_retiring(&self) -> bool {
+    pub(crate) fn is_retiring(&self) -> bool {
         self.close_request.borrow().is_some()
     }
 
@@ -1135,6 +1138,21 @@ mod tests {
             queued += 1;
         }
         assert_eq!(queued, MAX_PENDING_QUERIES);
+    }
+
+    #[tokio::test]
+    async fn cancelled_overlay_reads_do_not_retire_or_clog_the_command_transport() {
+        let (connection, mut rx) = RigConnection::stub(7, Uuid::new_v4());
+        let used = connection.clone();
+        let query = tokio::spawn(async move {
+            used.query(QueryKind::ObservationState, Duration::from_secs(20))
+                .await
+        });
+        assert!(matches!(rx.recv().await, Some(DirectMessage::Query(_))));
+        query.abort();
+        let _ = query.await;
+        assert!(connection.pending.lock().unwrap().is_empty());
+        assert!(!connection.is_retiring());
     }
 
     #[tokio::test]

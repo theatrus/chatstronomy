@@ -200,6 +200,10 @@ newly finalized daily MP4 timelapses through the Hub. Timelapses have a separate
 local permission and a 20 MiB cap; older image-only cameras remain compatible.
 See the [device protocol](docs/DEVICE_PROTOCOL.md).
 
+An optional [v4 overlay state feed](docs/OBSERVATION_STATE_PROTOCOL.md) supplies
+target visits, permitted focuser/external temperatures, and source-owned
+saved-LIGHT-frame counts without triggering image posts on reconnect.
+
 ## Build and test
 
 Linux builds need `pkg-config` and OpenSSL development headers (`libssl-dev`

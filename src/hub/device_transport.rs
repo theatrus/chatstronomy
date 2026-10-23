@@ -422,6 +422,9 @@ impl Drop for Lease {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientMessage {
+    ObservationCapabilities {
+        telemetry: bool,
+    },
     MediaCapabilities {
         timelapses: bool,
     },
@@ -545,7 +548,7 @@ impl TimelapseLease {
                 == Some(self.id)
             && self.connections.0.lock().is_ok_and(|connections| {
                 connections.get(&self.id).is_some_and(|c| {
-                    c.generation == self.generation && c.protocol_version == 3 && c.timelapses
+                    c.generation == self.generation && c.protocol_version >= 3 && c.timelapses
                 })
             })
     }
@@ -681,7 +684,7 @@ pub async fn timelapse_upload(State(state): State<HubState>, request: Request) -
         };
         let Some(c) = connections
             .get(&id)
-            .filter(|c| c.protocol_version == 3 && c.timelapses && !*c.close.borrow())
+            .filter(|c| c.protocol_version >= 3 && c.timelapses && !*c.close.borrow())
         else {
             return StatusCode::FORBIDDEN.into_response();
         };
@@ -751,7 +754,7 @@ async fn session(state: HubState, mut socket: WebSocket, ip: String) {
         .await;
         return;
     };
-    if ![PROTOCOL_VERSION, 2, 3].contains(&protocol_version) {
+    if ![PROTOCOL_VERSION, 2, 3, 4].contains(&protocol_version) {
         let _ = send(
             &mut socket,
             json!({"type":"error","code":"unsupported_version"}),
@@ -852,6 +855,11 @@ async fn run(
     let mut pending_configuration: Option<ControlRequest> = None;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     let mut last_received = tokio::time::Instant::now();
+    let mut telemetry = false;
+    let mut observation_ticks = tokio::time::interval(Duration::from_secs(5));
+    observation_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut observed_telescopes = HashSet::new();
+    let mut observation_query: Option<super::observation::ObservationQuery<'_>> = None;
     loop {
         // Recheck durable authority, not just the original handshake.
         if state
@@ -864,6 +872,28 @@ async fn run(
             return;
         }
         tokio::select! {
+            observations=async {observation_query.as_mut().expect("guarded observation query").await}, if observation_query.is_some()=>{
+                observation_query=None;
+                if !telemetry {continue;}
+                let routed = state.db.observation_telescopes(id).unwrap_or_default();
+                let current: HashSet<_> = routed.iter().map(|(id,_)|*id).collect();
+                for (telescope,mut message,connection_id) in observations {
+                    if !current.contains(&telescope) {continue;}
+                    // Revalidate the exact source after async work. Profile/consent
+                    // rotations cannot republish a retiring connection's snapshot.
+                    let live = connection_id.is_some_and(|expected|state.rig_connections.get(telescope)
+                        .is_some_and(|c|c.connection_id==expected && !c.is_retiring()));
+                    if !live {message=super::observation::unavailable(telescope);}
+                    if !send(socket,message).await {return;}
+                }
+                for removed in observed_telescopes.difference(&current) {
+                    if !send(socket,super::observation::unavailable(*removed)).await {return;}
+                }
+                observed_telescopes=current;
+            },
+            _=observation_ticks.tick(), if telemetry && observation_query.is_none()=>{
+                observation_query=Some(Box::pin(super::observation::collect(state,id)));
+            },
             control=controls.recv()=>{
                 let Some(control)=control else {return;};
                 match control {
@@ -871,7 +901,7 @@ async fn run(
                         // Authority may have changed after queue admission. Never
                         // drain queued labels across a local consent/route boundary.
                         let allowed = state.device_connections.0.lock().is_ok_and(|connections|
-                            connections.get(&id).is_some_and(|c| c.telescope_events));
+                             connections.get(&id).is_some_and(|c| c.telescope_events && (context.is_none() || c.observation_context)));
                         let routed = state.db.trigger_devices(telescope_id).is_ok_and(|ids| ids.contains(&id));
                         if !allowed || !routed || expires_at<=unix_now() || deadline<=tokio::time::Instant::now() {continue;}
                         let mut message = json!({"type":"telescope_event","event":event,"expires_at":expires_at});
@@ -915,8 +945,15 @@ async fn run(
                 };
                 let Ok(message)=serde_json::from_str::<ClientMessage>(&text) else {return;};
                 match message {
+                    ClientMessage::ObservationCapabilities {telemetry: enabled} => {
+                        if protocol_version != 4 {return;}
+                        observation_query=None;
+                        telemetry=enabled;
+                        observed_telescopes.clear();
+                        if !send(socket,json!({"type":"observation_ready","telemetry":enabled,"interval_seconds":5,"max_age_seconds":30})).await {return;}
+                    }
                     ClientMessage::MediaCapabilities {timelapses} => {
-                        if protocol_version != 3 {return;}
+                        if ![3,4].contains(&protocol_version) {return;}
                         if let Ok(mut connections)=state.device_connections.0.lock() && let Some(c)=connections.get_mut(&id) {
                             if c.timelapses && !timelapses {return;}
                             c.timelapses=timelapses;
@@ -924,15 +961,15 @@ async fn run(
                         if timelapses && !send(socket,json!({"type":"media_ready","max_timelapse_bytes":MAX_TIMELAPSE_BYTES})).await {return;}
                     }
                     ClientMessage::TriggerCapabilities {chat_configuration,telescope_events,observation_context} => {
-                        if ![2,3].contains(&protocol_version) {return;}
+                        if ![2,3,4].contains(&protocol_version) {return;}
                         if protocol_version == 2 && observation_context.is_some() {return;}
                         if let Ok(mut connections)=state.device_connections.0.lock() && let Some(c)=connections.get_mut(&id) {
                             c.chat_configuration=chat_configuration; c.telescope_events=telescope_events;
-                            c.observation_context=protocol_version==3 && observation_context.unwrap_or(true);
+                            c.observation_context=protocol_version>=3 && observation_context.unwrap_or(true);
                         }
                     }
                     ClientMessage::TriggerConfigurationResult {request_id,accepted} => {
-                        if ![2,3].contains(&protocol_version) {return;}
+                        if ![2,3,4].contains(&protocol_version) {return;}
                         if pending_configuration.as_ref().is_some_and(|p|matches!(p,ControlRequest::Configure{id,..} if *id==request_id))
                             && let Some(ControlRequest::Configure{reply,deadline,..})=pending_configuration.take() {
                             let _=reply.send(if deadline<=tokio::time::Instant::now() {Err("Configuration reply expired; check AutoPierCam")}
@@ -974,6 +1011,14 @@ enum Reservation {
     Elided(i64),
 }
 impl Db {
+    /// Same owner AND exact shared guild/channel; cap fan-out per camera.
+    pub(crate) fn observation_telescopes(
+        &self,
+        camera: i64,
+    ) -> Result<Vec<(i64, String)>, DbError> {
+        self.with_conn(|c|c.prepare("SELECT DISTINCT t.id,t.name FROM telescopes t JOIN devices d ON d.owner_id=t.owner_id JOIN device_channels dc ON dc.device_id=d.id JOIN telescope_channels tc ON tc.telescope_id=t.id AND tc.channel_id=dc.channel_id AND tc.guild_id=dc.guild_id WHERE d.id=?1 ORDER BY t.id LIMIT 16")?
+            .query_map([camera],|r|Ok((r.get(0)?,r.get(1)?)))?.collect())
+    }
     fn trigger_devices(&self, telescope_id: i64) -> Result<Vec<i64>, DbError> {
         self.with_conn(|c| {
             c.prepare("SELECT DISTINCT d.id FROM devices d JOIN telescopes t ON t.owner_id=d.owner_id JOIN device_channels dc ON dc.device_id=d.id JOIN telescope_channels tc ON tc.telescope_id=t.id AND tc.channel_id=dc.channel_id AND tc.guild_id=dc.guild_id WHERE t.id=?1")?
@@ -1326,7 +1371,7 @@ mod tests {
     }
     type Client = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
     async fn next(client: &mut Client) -> serde_json::Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match client.next().await.unwrap().unwrap() {
                     ClientFrame::Text(t) => return serde_json::from_str(&t).unwrap(),
@@ -1540,6 +1585,85 @@ mod tests {
         .await
         .unwrap();
         client
+    }
+
+    #[tokio::test]
+    async fn v4_state_is_opt_in_live_routed_and_does_not_trigger_image_posts() {
+        use crate::direct::protocol::{DirectMessage, QueryKind, QueryResult};
+        let h = harness().await;
+        let telescope = routed_telescope(&h);
+        let (rig, mut queries) =
+            super::super::direct_server::RigConnection::stub(telescope, Uuid::new_v4());
+        h.state.rig_connections.insert(rig.clone());
+        tokio::spawn(async move {
+            while let Some(DirectMessage::Query(request)) = queries.recv().await {
+                assert_eq!(request.kind, QueryKind::ObservationState);
+                let now = chrono::Utc::now();
+                rig.resolve(QueryResult {id:request.id,ok:true,error:None,error_code:None,payload:json!({
+                    "state_epoch":"6a9a7146-60eb-47ea-abec-43ad43af71e1","revision":42,
+                    "observed_at":now,"available":true,
+                    "target":{"run_id":"2d3768d4-3bf2-4a6e-a568-776aa6a22a39","name":"NGC 7023","started_at":now-chrono::Duration::hours(1)},
+                    "temperatures":{"focuser":{"celsius":21.3,"observed_at":now,"valid_until":now+chrono::Duration::minutes(2)},"external":null},
+                    "completed_exposures":{"count":505,"image_type":"LIGHT","basis":"successfully_saved","as_of":now}
+                })});
+            }
+        });
+        let mut client = connect_triggers(&h, 4).await;
+        // v4 alone never grants overlay telemetry consent.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next(&mut client))
+                .await
+                .is_err()
+        );
+        client
+            .send(ClientFrame::Text(
+                json!({"type":"observation_capabilities","telemetry":true})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut client).await["type"], "observation_ready");
+        let state = next(&mut client).await;
+        assert_eq!(state["type"], "observation_state");
+        assert_eq!(state["target"]["name"], "NGC 7023");
+        assert_eq!(state["completed_exposures"]["count"], 505);
+        assert_eq!(state["temperatures"]["focuser"]["celsius"], 21.3);
+        assert!(state["temperatures"]["external"].is_null());
+        assert!(h.posts.lock().unwrap().bodies.is_empty());
+        client.close(None).await.unwrap();
+        // A reconnect gets state, never a telescope_event or image trigger replay.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut client = connect_triggers(&h, 4).await;
+        client
+            .send(ClientFrame::Text(
+                json!({"type":"observation_capabilities","telemetry":true})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next(&mut client).await["type"], "observation_ready");
+        let fresh = next(&mut client).await;
+        assert_eq!(fresh["state_epoch"], state["state_epoch"]);
+        assert_eq!(fresh["completed_exposures"]["count"], 505);
+        // The exact guild/channel relationship is a second trust boundary.
+        h.state
+            .db
+            .with_conn(|c| {
+                c.execute(
+                    "DELETE FROM telescope_channels WHERE telescope_id=?1",
+                    [telescope],
+                )
+                .map(|_| ())
+            })
+            .unwrap();
+        let clear = tokio::time::timeout(Duration::from_secs(7), next(&mut client))
+            .await
+            .unwrap();
+        assert_eq!(clear["available"], false);
+        assert!(clear["target"].is_null() && clear["completed_exposures"].is_null());
+        assert!(h.posts.lock().unwrap().bodies.is_empty());
     }
 
     fn routed_telescope(h: &Harness) -> i64 {

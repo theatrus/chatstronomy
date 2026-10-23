@@ -241,6 +241,8 @@ pub enum QueryKind {
     GuiderGraph,
     RotatorInfo,
     FocuserInfo,
+    /// Only send to peers advertising observation_state; older plugins never see this query.
+    ObservationState,
     Command {
         command: RigCommand,
     },

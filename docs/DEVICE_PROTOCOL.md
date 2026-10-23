@@ -252,6 +252,10 @@ provided by this extension.
 
 ## Target and action observations (transport v3)
 
+For the independent opt-in overlay state feed (transport v4), see
+[the observation-state wire contract](OBSERVATION_STATE_PROTOCOL.md). V3 context
+objects are unchanged and do not receive the overlay fields.
+
 A camera can explicitly opt into richer telescope observations by authenticating
 with `protocol_version:3`. Pairing stays v1. Versions 1 and 2 keep their existing
 messages, fields, and four-event allowlist exactly: strict older camera clients

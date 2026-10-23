@@ -19,6 +19,7 @@ pub mod direct_server;
 pub mod direct_source;
 pub mod discord_api;
 pub mod guild_check;
+pub mod observation;
 pub mod rate_limit;
 pub mod rig_resolver;
 pub mod server;

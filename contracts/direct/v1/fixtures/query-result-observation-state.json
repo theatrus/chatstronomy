@@ -1,0 +1,33 @@
+{
+  "type": "query_result",
+  "payload": {
+    "id": "a251dd58-7f9c-49ad-a6d8-c305b0a71fb0",
+    "ok": true,
+    "payload": {
+      "state_epoch": "6a9a7146-60eb-47ea-abec-43ad43af71e1",
+      "revision": 42,
+      "observed_at": "2026-10-22T05:10:00Z",
+      "available": true,
+      "target": {
+        "run_id": "2d3768d4-3bf2-4a6e-a568-776aa6a22a39",
+        "name": "NGC 7023",
+        "started_at": "2026-10-22T04:00:00Z"
+      },
+      "temperatures": {
+        "focuser": {
+          "celsius": 21.3,
+          "observed_at": "2026-10-22T05:09:58Z",
+          "valid_until": "2026-10-22T05:11:58Z"
+        },
+        "external": null
+      },
+      "completed_exposures": {
+        "count": 505,
+        "image_type": "LIGHT",
+        "basis": "successfully_saved",
+        "as_of": "2026-10-22T05:09:55Z"
+      }
+    },
+    "error": null
+  }
+}

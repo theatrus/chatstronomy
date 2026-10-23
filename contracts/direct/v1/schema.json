@@ -41,7 +41,9 @@
         "autofocus_details": { "type": "boolean" },
         "guider_graph": { "type": "boolean" },
         "commands": { "type": "boolean" },
-        "target_commands": { "type": "boolean", "default": false }
+        "target_commands": { "type": "boolean", "default": false },
+        "autofocus_delivery_ack": { "type": "boolean", "default": false },
+        "observation_state": { "type": "boolean", "default": false }
       }
     },
     "client_hello": {
@@ -201,7 +203,8 @@
                 "guider_info",
                 "guider_graph",
                 "rotator_info",
-                "focuser_info"
+                "focuser_info",
+                "observation_state"
               ]
             }
           }

@@ -50,6 +50,9 @@ pub struct RigCapabilities {
     /// Supports retiring a completed notification without granting hardware control.
     #[serde(default, skip_serializing_if = "is_false")]
     pub autofocus_delivery_ack: bool,
+    /// Additive read-only, locally consented observation snapshots.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub observation_state: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -69,6 +72,7 @@ impl RigCapabilities {
             commands: false,
             target_commands: false,
             autofocus_delivery_ack: false,
+            observation_state: false,
         }
     }
 
@@ -84,6 +88,7 @@ impl RigCapabilities {
             commands: true,
             target_commands: true,
             autofocus_delivery_ack: true,
+            observation_state: true,
         }
     }
 }
@@ -226,6 +231,18 @@ mod tests {
                 .target_commands
         );
         assert!(RigCapabilities::all().target_commands);
+    }
+
+    #[test]
+    fn overlay_query_support_requires_an_explicit_additive_capability() {
+        let mut value = serde_json::to_value(RigCapabilities::all()).unwrap();
+        value.as_object_mut().unwrap().remove("observation_state");
+        assert!(
+            !serde_json::from_value::<RigCapabilities>(value)
+                .unwrap()
+                .observation_state
+        );
+        assert!(!RigCapabilities::none().observation_state);
     }
 
     #[test]
