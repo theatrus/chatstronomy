@@ -31,7 +31,7 @@ use uuid::Uuid;
 const MAX_JPEG: usize = 512 * 1024;
 const MAX_WIRE: usize = 720 * 1024;
 const COOLDOWN: i64 = 60;
-pub const MAX_TIMELAPSE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_TIMELAPSE_BYTES: usize = 20 * 1024 * 1024;
 use crate::chat::CameraTriggerRules;
 
 enum ControlRequest {
@@ -704,8 +704,8 @@ pub async fn timelapse_upload(State(state): State<HubState>, request: Request) -
     tokio::select! {
         biased;
         _ = closed.changed() => StatusCode::FORBIDDEN.into_response(),
-        result = tokio::time::timeout(Duration::from_secs(90), async {
-            let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(30), to_bytes(request.into_body(), MAX_TIMELAPSE_BYTES)).await else {return StatusCode::PAYLOAD_TOO_LARGE.into_response();};
+        result = tokio::time::timeout(Duration::from_secs(180), async {
+            let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(120), to_bytes(request.into_body(), MAX_TIMELAPSE_BYTES)).await else {return StatusCode::PAYLOAD_TOO_LARGE.into_response();};
             if bytes.len() != length || !valid_mp4(&bytes) {return StatusCode::UNPROCESSABLE_ENTITY.into_response();}
             if !lease.authorized(&state) {return StatusCode::FORBIDDEN.into_response();}
             let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build() else {return StatusCode::SERVICE_UNAVAILABLE.into_response();};

@@ -315,7 +315,7 @@ control or image permission is granted by pairing or upgrading.
 Timelapse sharing is a separate local opt-in; enabling snapshots, image triggers,
 target context, or pairing does not enable video uploads. After v3 `ready`, an
 enabled camera sends `{"type":"media_capabilities","timelapses":true}` and waits
-for `{"type":"media_ready","max_timelapse_bytes":16777216}` before uploading.
+for `{"type":"media_ready","max_timelapse_bytes":20971520}` before uploading.
 Changing this permission disconnects the camera and cancels in-flight work.
 
 POST the finalized **H.264 MP4** as a binary body to `/v1/devices/timelapse` over
@@ -327,14 +327,14 @@ X-Installation-ID: <paired installation UUID>
 X-Event-ID: <immutable clip UUID>
 X-Captured-At: <UTC RFC3339 day-end timestamp>
 Content-Type: video/mp4
-Content-Length: <bytes, at most 16777216>
+Content-Length: <bytes, at most 20971520>
 ```
 
 The camera must still have a live, consented v3 connection for that credential
 and installation. No browser session, client-selected channel, path, URL,
 filename, or arbitrary caption is accepted. The Hub authenticates before reading
 the body, permits at most two concurrent clips globally and one per device,
-bounds the read to 30 seconds and the request to 90 seconds, and rejects stale
+bounds the read to 120 seconds and the request to 180 seconds, and rejects stale
 (over 24 hours), malformed, or oversized clips. It checks the ISO-BMFF envelope,
 not decoded pixels/codecs; Discord may still reject an unplayable attachment.
 There is no transcoder or persistent video store on the Hub.

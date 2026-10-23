@@ -197,7 +197,7 @@ application, bot token, signing key, bind address, and SQLite database. See
 
 AutoPierCam can share pier-camera images, opt-in target/action observations, and
 newly finalized daily MP4 timelapses through the Hub. Timelapses have a separate
-local permission and a 16 MiB cap; older image-only cameras remain compatible.
+local permission and a 20 MiB cap; older image-only cameras remain compatible.
 See the [device protocol](docs/DEVICE_PROTOCOL.md).
 
 ## Build and test
