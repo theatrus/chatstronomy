@@ -878,7 +878,8 @@ async fn run(
                 let routed = state.db.observation_telescopes(id).unwrap_or_default();
                 let current: HashSet<_> = routed.iter().map(|(id,_)|*id).collect();
                 for (telescope,mut message,connection_id) in observations {
-                    if !current.contains(&telescope) {continue;}
+                    if !current.contains(&telescope) || !state.db.observation_telescopes(id)
+                        .is_ok_and(|routes|routes.iter().any(|(target,_)|*target==telescope)) {continue;}
                     // Revalidate the exact source after async work. Profile/consent
                     // rotations cannot republish a retiring connection's snapshot.
                     let live = connection_id.is_some_and(|expected|state.rig_connections.get(telescope)
