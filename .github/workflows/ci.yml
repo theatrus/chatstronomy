@@ -1,5 +1,10 @@
 name: CI
 
+# Linux and Windows jobs run on ephemeral 32-core runners (tfinfra
+# roots/github-runners, docs/github-runners-plan.md). Other platforms, releases,
+# and every pull request from a fork stay on GitHub's runners: a fork's code
+# never runs on ours. Job names are unchanged.
+
 on:
   push:
     branches: [main]
@@ -24,7 +29,7 @@ jobs:
             os: windows-latest
           - name: Linux ARM64
             os: ubuntu-24.04-arm
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || (matrix.os != 'ubuntu-latest' && matrix.os != 'windows-latest')) && matrix.os || fromJSON(matrix.os == 'windows-latest' && '["self-hosted","windows","ghr-windows-x64"]' || '["self-hosted","linux","ghr-linux-x64"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -32,6 +37,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev ca-certificates
       - name: Cache Rust build
+        # Our runners skip GitHub's cache: Linux ones compile through sccache in
+        # S3, and saving the cache to GitHub from AWS is slow.
+        if: ${{ !startsWith(runner.name, 'ghr-') }}
         uses: actions/cache@v6
         with:
           path: |
@@ -52,7 +60,7 @@ jobs:
 
   lint:
     name: Format and Clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","ghr-linux-x64"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -61,6 +69,9 @@ jobs:
       - name: Install Linux TLS build dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev ca-certificates
       - name: Cache Rust build
+        # Our runners skip GitHub's cache: Linux ones compile through sccache in
+        # S3, and saving the cache to GitHub from AWS is slow.
+        if: ${{ !startsWith(runner.name, 'ghr-') }}
         uses: actions/cache@v6
         with:
           path: |
@@ -75,7 +86,7 @@ jobs:
 
   security:
     name: Security audit
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted","linux","ghr-linux-x64"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
