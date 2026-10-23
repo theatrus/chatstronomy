@@ -538,7 +538,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serenity",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -1096,7 +1096,7 @@ dependencies = [
  "ed25519",
  "rand_core 0.10.1",
  "serde",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "signature",
  "subtle",
  "zeroize",
@@ -1572,7 +1572,7 @@ dependencies = [
  "hkdf",
  "hybrid-array",
  "rand_core 0.10.1",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "x25519-dalek",
  "zeroize",
@@ -2294,7 +2294,7 @@ dependencies = [
  "serde",
  "serde_html_form",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2385,7 +2385,7 @@ dependencies = [
  "ruma",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.21",
  "time",
@@ -2421,7 +2421,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_bytes",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2478,7 +2478,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "zeroize",
 ]
@@ -3907,9 +3907,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -4799,7 +4799,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.21",
  "x25519-dalek",
