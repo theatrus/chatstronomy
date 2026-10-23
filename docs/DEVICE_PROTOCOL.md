@@ -1,4 +1,4 @@
-# Observatory device protocol (pairing v1, transport v1/v2)
+# Observatory device protocol (pairing v1, transport v1/v2/v3)
 
 [AutoPierCam](https://github.com/theatrus/autopiercam) is a user-owned
 `pier_camera`, not a N.I.N.A. telescope/profile. Cameras set up the same way as
@@ -249,3 +249,123 @@ still apply; bursts do not bypass either. Periodic schedules send one distinct
 recent frame, start after a full interval and reset on reconnect without backfill.
 Scene detection is not a semantic roof/person detector; no such classifier is
 provided by this extension.
+
+## Target and action observations (transport v3)
+
+For the independent opt-in overlay state feed (transport v4), see
+[the observation-state wire contract](OBSERVATION_STATE_PROTOCOL.md). V3 context
+objects are unchanged and do not receive the overlay fields.
+
+A camera can explicitly opt into richer telescope observations by authenticating
+with `protocol_version:3`. Pairing stays v1. Versions 1 and 2 keep their existing
+messages, fields, and four-event allowlist exactly: strict older camera clients
+must never receive new context fields or action names. A v3 camera advertises the
+same `trigger_capabilities` message as v2, with an optional v3-only
+`observation_context` flag (omit this field entirely for v2). Set it false when
+using v3 only for timelapses: the camera then receives just the four legacy
+triggers without context. `telescope_events:true` is still required locally for
+any telescope events. An older Hub rejects v3 with `unsupported_version`; show that as an
+operator-action error, not a reconnect loop or a silent permission downgrade.
+
+```json
+{"type":"telescope_event","event":"autofocus_started","expires_at":1792707330,"context":{"telescope_id":17,"telescope_name":"UC131","target_name":"NGC 7023","occurred_at":"2026-10-22T20:55:00+00:00"}}
+```
+
+`telescope_id` is the Hub's telescope record, not an equipment identifier. Context
+contains only that source identity, an 80-character telescope display name, a
+nullable 120-character target display name, and the original observation time in
+UTC. Control/bidirectional-formatting characters are removed. No coordinates,
+project names, script paths, raw logs, hardware IDs, or sequence payloads enter
+this projection. `target_name:null` means unavailable for **this observation**;
+it must not reuse a previous target or another telescope's name. The generic
+“Sequential Instruction Set” wrapper is not a target.
+Independent hardware events do not inherit the Hub's retained status target:
+without event-time target provenance their target is null. Native sequence
+operations use a fresh consented snapshot and an admission-time target
+fingerprint; a terminal action cannot inherit the next target's name.
+
+The four v2 events remain supported. Additional v3 events are `target_changed`,
+`autofocus_started`, `autofocus_completed`, `autofocus_failed`, `mount_parked`,
+`mount_unparked`, `meridian_flip_started`, `meridian_flip_completed`,
+`guiding_started`, `guiding_stopped`, `guiding_dithered`, `rotator_move_started`,
+`rotator_moved`, `focuser_moved`, and `filter_changed`. A fresh Target Scheduler
+wait-start is reported as `time_wait_started`, never as a predicted completion.
+Typed sequence operations use a fixed kind
+(`camera_cooling`, `camera_warming`, `time_wait`, `astronomical_wait`, `safety_wait`,
+`condition_wait`, `manual_wait`, `sequence_slew`, `mount_center`, `plate_solve`)
+plus `_started`, `_completed`, `_ended`, or `_failed`. An operation disappearing
+without an explicit successful outcome is **ended**, never **completed**. Routine
+progress polls and raw sequence-item names are not forwarded.
+
+Target Scheduler events use their own admitted target, not the predecessor's
+name. Native sequence target changes are observed independently of slews; their
+first successful snapshot seeds a silent baseline. Startup history does not
+trigger camera images. All plugin category consent, same-owner, exact shared
+guild/channel routing, and camera-local trigger permissions still apply. Queued
+observations are checked against current camera consent and route authority
+again before sending. They expire 30 seconds after the original event, with a
+monotonic queue deadline as well as the wire timestamp. Queue overflow drops
+observations rather than blocking N.I.N.A. or building an event backlog.
+
+This is per-event context, not a durable current-state subscription or hardware
+command. Cameras may label locally consented event images with it, but must not
+relabel queued/retried images when a later target/action arrives, infer success,
+keep stale global target state, or weaken capture-session/consent/expiry and
+image-rate limits. New actions remain opt-in at the camera; no extra camera
+control or image permission is granted by pairing or upgrading.
+
+## Timelapse uploads (transport v3 + HTTPS)
+
+Timelapse sharing is a separate local opt-in; enabling snapshots, image triggers,
+target context, or pairing does not enable video uploads. After v3 `ready`, an
+enabled camera sends `{"type":"media_capabilities","timelapses":true}` and waits
+for `{"type":"media_ready","max_timelapse_bytes":134217728}` before uploading.
+Treat this as the operator's upload ceiling, not a guarantee of Discord acceptance.
+Older Hubs may advertise 20971520; always honor the negotiated value. The Hub
+setting `max_timelapse_bytes` defaults to 128 MiB and accepts 1 through 536870912
+bytes (512 MiB).
+Changing this permission disconnects the camera and cancels in-flight work.
+
+POST the finalized **H.264 MP4** as a binary body to `/v1/devices/timelapse` over
+HTTPS, never as base64 on the WebSocket. Required headers:
+
+```text
+Authorization: Bearer <device credential>
+X-Installation-ID: <paired installation UUID>
+X-Event-ID: <immutable clip UUID>
+X-Captured-At: <UTC RFC3339 day-end timestamp>
+Content-Type: video/mp4
+Content-Length: <bytes, at most the negotiated max_timelapse_bytes>
+```
+
+The camera must still have a live, consented v3 or v4 connection for that credential
+and installation. No browser session, client-selected channel, path, URL,
+filename, or arbitrary caption is accepted. The Hub authenticates before reading
+the body, permits at most two concurrent clips globally and one per device,
+bounds the read to 180 seconds and the request to 360 seconds, and rejects stale
+(over 24 hours), malformed, or oversized clips. It checks the ISO-BMFF envelope,
+not decoded pixels/codecs; Discord may still reject an unplayable attachment.
+The Hub hashes while spooling to a private temporary file, then streams that file
+to each route with independent read cursors and a 120-second Discord timeout.
+Temporary files are deleted on completion, error, or cancellation. Operators need
+free temporary-disk space for up to two configured maximum-size clips, and must
+set reverse-proxy body-size/time limits accordingly. There is no transcoder or
+persistent video store on the Hub.
+
+Clips are uploaded to the camera's current, owner-authorized Discord routes as
+`video/mp4` / `timelapse.mp4` attachments so Discord can show its video player.
+The shared cooldown, Discord backoff, and immutable per-route delivery receipts
+apply. The payload hash includes the movie bytes: a UUID reused for a different
+clip yields `event_conflict`, and retries do not resend successful destinations
+or backfill new routes. JSON returns `status` and `retry_after_seconds`; `retry`
+means retry the **same bytes, UUID, and timestamp** after at least 60 seconds.
+Unknown statuses, `media_rejected`, conflicts, and invalid uploads are terminal.
+Discord 400/413 responses are terminal, not an endless retry loop. Revocation,
+disconnect, or consent loss cancels pending transfers; an already accepted
+Discord post cannot be recalled. At-least-once crash caveats still apply.
+
+AutoPierCam offers only newly finalized daily movies, never a directory scan or
+historical backfill. It holds one bounded queued clip, retries an active clip at
+most three times, and drops pending bytes on settings, pause, shutdown, or capture
+session changes. Files exceeding the cap stay local and produce a visible
+diagnostic; the original movie is never resized, deleted, or overwritten.

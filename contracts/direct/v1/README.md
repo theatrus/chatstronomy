@@ -1,5 +1,12 @@
 # Direct protocol v1
 
+Optional capability `observation_state:true` permits the read-only
+`observation_state` query. Its response is a bounded, source-owned state snapshot,
+not a history or hardware operation. See the [camera v4 overlay contract](../../../docs/OBSERVATION_STATE_PROTOCOL.md)
+and `query-observation-state.json` / `query-result-observation-state.json` fixtures.
+Omission means unsupported: do not query an older plugin. This addition does not
+change the Direct envelope or payload negotiation version.
+
 Direct v1 carries N.I.N.A. identity, pairing/authentication, source-neutral
 queries, typed commands, results, and heartbeats. JSON frames use the tagged
 envelope described by `schema.json`.

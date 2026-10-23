@@ -29,6 +29,10 @@ pub fn routes() -> Router<HubState> {
         .route("/api/guilds/{guild}/devices", get(guild_devices))
         .route("/v1/devices/pair", post(pair))
         .route("/v1/devices", get(super::device_transport::upgrade))
+        .route(
+            "/v1/devices/timelapse",
+            post(super::device_transport::timelapse_upload),
+        )
         .route("/api/devices/{id}/snapshot", post(snapshot))
         .layer(DefaultBodyLimit::max(4096))
 }

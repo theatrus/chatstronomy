@@ -195,7 +195,26 @@ Edit `hub.json` after initialization to configure the public URL, Discord OAuth
 application, bot token, signing key, bind address, and SQLite database. See
 [docs/HOSTED_SERVICE.md](docs/HOSTED_SERVICE.md).
 
+AutoPierCam can share pier-camera images, opt-in target/action observations, and
+newly finalized daily MP4 timelapses through the Hub. Timelapses have a separate
+local permission and a Hub-advertised limit (128 MiB by default, configurable up
+to 512 MiB with `max_timelapse_bytes`). Clips are temporarily spooled to disk and
+streamed to Discord, which may reject files above a destination's own limit.
+Older image-only cameras remain compatible.
+See the [device protocol](docs/DEVICE_PROTOCOL.md).
+
+An optional [v4 overlay state feed](docs/OBSERVATION_STATE_PROTOCOL.md) supplies
+target visits, permitted focuser/external temperatures, and source-owned
+saved-LIGHT-frame counts without triggering image posts on reconnect.
+
 ## Build and test
+
+Linux builds need `pkg-config` and OpenSSL development headers (`libssl-dev`
+on Debian/Ubuntu). Linux executables also need the OpenSSL 3 runtime and
+`ca-certificates`. The Discord gateway and HTTP clients use platform TLS
+(Schannel on Windows, OpenSSL on Linux) instead of Serenity's obsolete Rustls
+dependency. The separate Direct WebSocket client uses current Rustls. Certificate
+and hostname verification stay enabled for both TLS backends.
 
 ```bash
 cargo build --release
