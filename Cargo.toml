@@ -42,7 +42,7 @@ png = "0.18"
 # (Schannel on Windows; OpenSSL and the system CA store on Linux). Keep
 # Poise's normal non-TLS defaults without re-enabling Serenity's old Rustls.
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "native_tls_backend", "model", "cache", "http", "builder", "utils"] }
-poise = { version = "0.6", default-features = false, features = ["cache", "chrono", "handle_panics"] }
+poise = { version = "0.7", default-features = false, features = ["cache", "chrono", "handle_panics"] }
 # SQLite bundled to avoid libsqlite3 dependency issues on Windows CI/releases
 libsqlite3-sys = { version = "0", features = ["bundled"] }
 # Hub service (feature = "hub"). rusqlite is pinned to the same line
